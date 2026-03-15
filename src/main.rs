@@ -2,13 +2,10 @@
 // Copyright (C) 2015-2021  Dennis Schwerdel
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate serde;
+#[macro_use] extern crate log;
+#[macro_use] extern crate serde;
 
-#[cfg(test)]
-extern crate tempfile;
+#[cfg(test)] extern crate tempfile;
 
 #[macro_use]
 pub mod util;
@@ -21,8 +18,7 @@ pub mod config;
 pub mod crypto;
 pub mod device;
 pub mod error;
-#[cfg(feature = "installer")]
-pub mod installer;
+#[cfg(feature = "installer")] pub mod installer;
 pub mod messages;
 pub mod net;
 pub mod oldconfig;
@@ -32,10 +28,8 @@ pub mod port_forwarding;
 pub mod table;
 pub mod traffic;
 pub mod types;
-#[cfg(feature = "wizard")]
-pub mod wizard;
-#[cfg(feature = "websocket")]
-pub mod wsproxy;
+#[cfg(feature = "wizard")] pub mod wizard;
+#[cfg(feature = "websocket")] pub mod wsproxy;
 
 use structopt::StructOpt;
 
@@ -47,7 +41,7 @@ use std::{
     path::Path,
     process,
     str::FromStr,
-    sync::Mutex,
+    sync::Mutex
 };
 
 use crate::{
@@ -58,14 +52,14 @@ use crate::{
     net::Socket,
     oldconfig::OldConfigFile,
     payload::Protocol,
-    util::SystemTimeSource,
+    util::SystemTimeSource
 };
 
 #[cfg(feature = "websocket")]
 use crate::wsproxy::ProxyConnection;
 
 struct DualLogger {
-    file: Option<Mutex<File>>,
+    file: Option<Mutex<File>>
 }
 
 impl DualLogger {
@@ -121,14 +115,14 @@ fn run_script(script: &str, ifname: &str) {
                 error!("Script returned with error: {:?}", status.code())
             }
         }
-        Err(e) => error!("Failed to execute script {:?}: {}", script, e),
+        Err(e) => error!("Failed to execute script {:?}: {}", script, e)
     }
 }
 
 fn parse_ip_netmask(addr: &str) -> Result<(Ipv4Addr, Ipv4Addr), String> {
     let (ip_str, len_str) = match addr.find('/') {
         Some(pos) => (&addr[..pos], &addr[pos + 1..]),
-        None => (addr, "24"),
+        None => (addr, "24")
     };
     let prefix_len = u8::from_str(len_str).map_err(|_| format!("Invalid prefix length: {}", len_str))?;
     if prefix_len > 32 {
@@ -140,7 +134,7 @@ fn parse_ip_netmask(addr: &str) -> Result<(Ipv4Addr, Ipv4Addr), String> {
 }
 
 fn setup_device(config: &Config) -> TunTapDevice {
-    let device = try_fail!(
+    let mut device = try_fail!(
         TunTapDevice::new(&config.device_name, config.device_type, config.device_path.as_ref().map(|s| s as &str)),
         "Failed to open virtual {} interface {}: {}",
         config.device_type,
@@ -283,8 +277,8 @@ fn main() {
                 try_fail!(wsproxy::run_proxy(&listen), "Failed to run websocket proxy: {:?}");
             }
             #[cfg(feature = "wizard")]
-            Command::Config { name } => {
-                try_fail!(wizard::configure(name), "Wizard failed: {}");
+            Command::Config { name, config_file } => {
+                try_fail!(wizard::configure(name, config_file), "Wizard failed: {}");
             }
             #[cfg(feature = "installer")]
             Command::Install { uninstall } => {
@@ -327,13 +321,13 @@ fn main() {
         let socket = try_fail!(ProxyConnection::listen(&config.listen), "Failed to open socket {}: {}", config.listen);
         match config.device_type {
             Type::Tap => run::<payload::Frame, _>(config, socket),
-            Type::Tun => run::<payload::Packet, _>(config, socket),
+            Type::Tun => run::<payload::Packet, _>(config, socket)
         }
         return;
     }
     let socket = try_fail!(UdpSocket::listen(&config.listen), "Failed to open socket {}: {}", config.listen);
     match config.device_type {
         Type::Tap => run::<payload::Frame, _>(config, socket),
-        Type::Tun => run::<payload::Packet, _>(config, socket),
+        Type::Tun => run::<payload::Packet, _>(config, socket)
     }
 }

@@ -32,7 +32,7 @@ fn configure_connectivity(config: &mut Config, mode: usize, theme: &ColorfulThem
         Input::with_theme(theme)
             .with_prompt("Peer addresses (comma separated)")
             .default(config.peers.join(","))
-            .interact_text()?,
+            .interact_text()?
     );
     if mode >= MODE_ADVANCED {
         config.port_forwarding = Confirm::with_theme(theme)
@@ -45,7 +45,7 @@ fn configure_connectivity(config: &mut Config, mode: usize, theme: &ColorfulThem
             Input::with_theme(theme)
                 .with_prompt("Advertise addresses (comma separated)")
                 .default(config.advertise_addresses.join(","))
-                .interact_text()?,
+                .interact_text()?
         );
         config.peer_timeout = Input::with_theme(theme)
             .with_prompt("Peer timeout (in seconds)")
@@ -80,7 +80,7 @@ fn configure_crypto(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
             Password::with_theme(theme)
                 .with_prompt("Password")
                 .with_confirmation("Confirm password", "Passwords do not match")
-                .interact()?,
+                .interact()?
         );
         config.crypto.private_key = None;
         config.crypto.public_key = None;
@@ -118,13 +118,13 @@ fn configure_crypto(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
                 info!("Public key: {}", pub_key);
                 (priv_key, pub_key)
             }
-            _ => unreachable!(),
+            _ => unreachable!()
         };
         config.crypto.trusted_keys = str_list(
             Input::with_theme(theme)
                 .with_prompt("Trusted keys (public keys, comma separated)")
                 .default(pub_key.clone())
-                .interact_text()?,
+                .interact_text()?
         );
         config.crypto.private_key = Some(priv_key);
         config.crypto.public_key = Some(pub_key);
@@ -138,7 +138,7 @@ fn configure_crypto(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
                 ("Unencrypted (dangerous)", unencrypted),
                 ("AES-128 in GCM mode", allowed_algos.contains(&&aead::AES_128_GCM)),
                 ("AES-256 in GCM mode", allowed_algos.contains(&&aead::AES_256_GCM)),
-                ("ChaCha20-Poly1305 (RFC 7539)", allowed_algos.contains(&&aead::CHACHA20_POLY1305)),
+                ("ChaCha20-Poly1305 (RFC 7539)", allowed_algos.contains(&&aead::CHACHA20_POLY1305))
             ])
             .interact()?;
         config.crypto.algorithms = vec![];
@@ -161,7 +161,7 @@ fn configure_device(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
         {
             0 => device::Type::Tun,
             1 => device::Type::Tap,
-            _ => unreachable!(),
+            _ => unreachable!()
         }
     }
     if mode == MODE_EXPERT {
@@ -171,7 +171,7 @@ fn configure_device(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
             Input::with_theme(theme)
                 .with_prompt("Device path (empty for default)")
                 .default(config.device_path.as_ref().cloned().unwrap_or_default())
-                .interact_text()?,
+                .interact_text()?
         );
         config.fix_rp_filter = Confirm::with_theme(theme)
             .with_prompt("Automatically fix insecure rp_filter settings")
@@ -184,7 +184,7 @@ fn configure_device(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
                 Mode::Normal => 0,
                 Mode::Router => 1,
                 Mode::Switch => 2,
-                Mode::Hub => 3,
+                Mode::Hub => 3
             })
             .interact()?
         {
@@ -192,7 +192,7 @@ fn configure_device(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
             1 => Mode::Router,
             2 => Mode::Switch,
             3 => Mode::Hub,
-            _ => unreachable!(),
+            _ => unreachable!()
         };
         if config.mode == Mode::Switch {
             config.switch_timeout = Input::with_theme(theme)
@@ -210,7 +210,7 @@ fn configure_addresses(config: &mut Config, mode: usize, theme: &ColorfulTheme) 
             .with_prompt("Virtual IP address (e.g. 10.0.0.1, leave empty for none)")
             .allow_empty(true)
             .default(config.ip.as_ref().cloned().unwrap_or_default())
-            .interact_text()?,
+            .interact_text()?
     );
     if config.device_type == device::Type::Tun {
         if mode >= MODE_ADVANCED {
@@ -225,7 +225,7 @@ fn configure_addresses(config: &mut Config, mode: usize, theme: &ColorfulTheme) 
                     .with_prompt("Claim additional addresses (e.g. 10.0.0.0/24, comma separated, leave empty for none)")
                     .allow_empty(true)
                     .default(config.claims.join(","))
-                    .interact_text()?,
+                    .interact_text()?
             );
         }
     } else {
@@ -237,14 +237,14 @@ fn configure_addresses(config: &mut Config, mode: usize, theme: &ColorfulTheme) 
                 .with_prompt("Interface setup command (leave empty for none)")
                 .allow_empty(true)
                 .default(config.ifup.as_ref().cloned().unwrap_or_default())
-                .interact_text()?,
+                .interact_text()?
         );
         config.ifdown = str_opt(
             Input::with_theme(theme)
                 .with_prompt("Interface tear down command (leave empty for none)")
                 .allow_empty(true)
                 .default(config.ifdown.as_ref().cloned().unwrap_or_default())
-                .interact_text()?,
+                .interact_text()?
         );
     }
     Ok(())
@@ -272,20 +272,24 @@ fn configure_beacon(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
             .interact()?
         {
             0 => None,
-            1 => Some(
-                Input::with_theme(theme)
-                    .with_prompt("File path")
-                    .default(config.beacon_store.clone().unwrap_or_default())
-                    .interact_text()?,
-            ),
-            2 => Some(format!(
-                "|{}",
-                Input::<String>::with_theme(theme)
-                    .with_prompt("Command")
-                    .default(config.beacon_store.clone().unwrap_or_default().trim_start_matches('|').to_string())
-                    .interact_text()?
-            )),
-            _ => unreachable!(),
+            1 => {
+                Some(
+                    Input::with_theme(theme)
+                        .with_prompt("File path")
+                        .default(config.beacon_store.clone().unwrap_or_default())
+                        .interact_text()?
+                )
+            }
+            2 => {
+                Some(format!(
+                    "|{}",
+                    Input::<String>::with_theme(theme)
+                        .with_prompt("Command")
+                        .default(config.beacon_store.clone().unwrap_or_default().trim_start_matches('|').to_string())
+                        .interact_text()?
+                ))
+            }
+            _ => unreachable!()
         };
         config.beacon_load = match Select::with_theme(theme)
             .with_prompt("How to load beacons")
@@ -302,20 +306,24 @@ fn configure_beacon(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
             .interact()?
         {
             0 => None,
-            1 => Some(
-                Input::with_theme(theme)
-                    .with_prompt("File path")
-                    .default(config.beacon_load.clone().unwrap_or_default())
-                    .interact_text()?,
-            ),
-            2 => Some(format!(
-                "|{}",
-                Input::<String>::with_theme(theme)
-                    .with_prompt("Command")
-                    .default(config.beacon_load.clone().unwrap_or_default().trim_start_matches('|').to_string())
-                    .interact_text()?
-            )),
-            _ => unreachable!(),
+            1 => {
+                Some(
+                    Input::with_theme(theme)
+                        .with_prompt("File path")
+                        .default(config.beacon_load.clone().unwrap_or_default())
+                        .interact_text()?
+                )
+            }
+            2 => {
+                Some(format!(
+                    "|{}",
+                    Input::<String>::with_theme(theme)
+                        .with_prompt("Command")
+                        .default(config.beacon_load.clone().unwrap_or_default().trim_start_matches('|').to_string())
+                        .interact_text()?
+                ))
+            }
+            _ => unreachable!()
         };
         config.beacon_interval = Input::with_theme(theme)
             .with_prompt("Beacon interval (in seconds)")
@@ -326,7 +334,7 @@ fn configure_beacon(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
                 .with_prompt("Beacon password (leave empty for none)")
                 .with_confirmation("Confirm password", "Passwords do not match")
                 .allow_empty_password(true)
-                .interact()?,
+                .interact()?
         );
     }
     Ok(())
@@ -339,7 +347,7 @@ fn configure_stats(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> R
                 .with_prompt("Write stats to file (empty to disable)")
                 .default(config.stats_file.clone().unwrap_or_default())
                 .allow_empty(true)
-                .interact_text()?,
+                .interact_text()?
         );
     }
     if mode == MODE_EXPERT {
@@ -353,14 +361,14 @@ fn configure_stats(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> R
                     .with_prompt("Statsd server URL")
                     .default(config.statsd_server.clone().unwrap_or_default())
                     .allow_empty(true)
-                    .interact_text()?,
+                    .interact_text()?
             );
             config.statsd_prefix = str_opt(
                 Input::with_theme(theme)
                     .with_prompt("Statsd prefix")
                     .default(config.statsd_prefix.clone().unwrap_or_default())
                     .allow_empty(true)
-                    .interact_text()?,
+                    .interact_text()?
             );
         } else {
             config.statsd_server = None;
@@ -376,21 +384,21 @@ fn configure_process(config: &mut Config, mode: usize, theme: &ColorfulTheme) ->
                 .with_prompt("Run as different user (empty to disable)")
                 .default(config.user.clone().unwrap_or_default())
                 .allow_empty(true)
-                .interact_text()?,
+                .interact_text()?
         );
         config.group = str_opt(
             Input::with_theme(theme)
                 .with_prompt("Run as different group (empty to disable)")
                 .default(config.group.clone().unwrap_or_default())
                 .allow_empty(true)
-                .interact_text()?,
+                .interact_text()?
         );
         config.pid_file = str_opt(
             Input::with_theme(theme)
                 .with_prompt("Write process id to file (empty to disable)")
                 .default(config.pid_file.clone().unwrap_or_default())
                 .allow_empty(true)
-                .interact_text()?,
+                .interact_text()?
         );
     }
     Ok(())
@@ -408,7 +416,7 @@ fn configure_hooks(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> R
                     .with_prompt("Command to execute for all events (empty to disable)")
                     .default(config.hook.clone().unwrap_or_default())
                     .allow_empty(true)
-                    .interact_text()?,
+                    .interact_text()?
             );
             let mut hooks: HashMap<String, String> = Default::default();
             for event in &[
@@ -418,14 +426,14 @@ fn configure_hooks(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> R
                 "device_setup",
                 "device_configured",
                 "vpn_started",
-                "vpn_shutdown",
+                "vpn_shutdown"
             ] {
                 if let Some(cmd) = str_opt(
                     Input::with_theme(theme)
                         .with_prompt(format!("Command to execute for event '{}' (empty to disable)", event))
                         .default(config.hooks.get(*event).cloned().unwrap_or_default())
                         .allow_empty(true)
-                        .interact_text()?,
+                        .interact_text()?
                 ) {
                     hooks.insert(event.to_string(), cmd);
                 }
@@ -439,15 +447,23 @@ fn configure_hooks(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> R
     Ok(())
 }
 
-pub fn configure(name: Option<String>) -> Result<(), dialoguer::Error> {
+pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<(), dialoguer::Error> {
     let theme = ColorfulTheme::default();
 
+    // Determine network name
     let name = if let Some(name) = name {
         name
     } else {
+        // Try to list existing networks from /etc/vpncloud; if directory doesn't exist treat as empty
         let mut names = vec![];
-        for file in fs::read_dir("/etc/vpncloud")? {
-            names.push(file?.path().file_stem().unwrap().to_str().unwrap().to_string());
+        if let Ok(entries) = fs::read_dir("/etc/vpncloud") {
+            for file in entries {
+                if let Ok(entry) = file {
+                    if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
         }
         let selection =
             Select::with_theme(&theme).with_prompt("Which network?").item("New network").items(&names).interact()?;
@@ -459,17 +475,29 @@ pub fn configure(name: Option<String>) -> Result<(), dialoguer::Error> {
     };
 
     let mut config = Config::default();
-    let file = Path::new("/etc/vpncloud").join(format!("{}.net", name));
+
+    // Resolve target path for config file:
+    // - If user provided --config, use that path
+    // - Otherwise default to /etc/vpncloud/<name>.net
+    use std::path::PathBuf;
+    let mut file: PathBuf = if let Some(p) = config_path {
+        PathBuf::from(p)
+    } else {
+        Path::new("/etc/vpncloud").join(format!("{}.net", name))
+    };
+
+    // If file exists, attempt to read and merge it
     if file.exists() {
-        let f = fs::File::open(&file)?;
-        let config_file = serde_yaml::from_reader(f)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Failed to parse config file"))?;
+        let f = fs::File::open(&file).map_err(|e| {
+            io::Error::new(e.kind(), format!("Failed to open existing config file '{}': {}", file.display(), e))
+        })?;
+        let config_file = serde_yaml::from_reader(f).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse config file '{}'", file.display()))
+        })?;
         config.merge_file(config_file);
     }
-    if file.parent().unwrap().metadata()?.permissions().readonly() {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Config file not writable").into());
-    }
 
+    // Interactive configuration loop
     loop {
         let mode = Select::with_theme(&theme)
             .with_prompt("Configuration mode")
@@ -490,19 +518,160 @@ pub fn configure(name: Option<String>) -> Result<(), dialoguer::Error> {
         }
     }
 
+    // Saving phase
     if Confirm::with_theme(&theme).with_prompt("Save config?").default(true).interact()? {
         let config_file = config.into_config_file();
-        let f = fs::File::create(&file)?;
-        serde_yaml::to_writer(f, &config_file)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Failed to parse config file"))?;
-        fs::set_permissions(file, fs::Permissions::from_mode(0o600))?;
-        println!();
-        println!("Use the following commands to control your VPN:");
-        println!("  start the VPN:   sudo service vpncloud@{0} start", name);
-        println!("  stop the VPN:    sudo service vpncloud@{0} stop", name);
-        println!("  get the status:  sudo service vpncloud@{0} status", name);
-        println!("  add VPN to autostart:       sudo systemctl enable vpncloud@{0}", name);
-        println!("  remove VPN from autostart:  sudo systemctl disable vpncloud@{0}", name);
+
+        // Ensure parent directory exists (try to create it if missing)
+        if let Some(parent) = file.parent() {
+            if !parent.exists() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    // Could not create parent dir; show helpful message and offer alternatives
+                    eprintln!("ERROR: Could not create directory '{}': {}", parent.display(), e);
+                    // Offer per-user or temp file locations to the user
+                    let mut choices = vec![];
+                    // per-user config: $HOME/.config/vpncloud/<name>.net
+                    let per_user = match std::env::var("HOME") {
+                        Ok(home) => PathBuf::from(home).join(".config").join("vpncloud").join(format!("{}.net", name)),
+                        Err(_) => std::env::temp_dir().join(format!("{}.net", name))
+                    };
+                    let temp = std::env::temp_dir().join(format!("{}.net", name));
+                    choices.push(format!("Try per-user location: {}", per_user.display()));
+                    choices.push(format!("Try temp location: {}", temp.display()));
+                    choices.push("Abort".to_string());
+                    let sel = Select::with_theme(&theme)
+                        .with_prompt(format!("Cannot write to '{}'. Choose an alternative:", file.display()))
+                        .items(&choices)
+                        .default(0)
+                        .interact()?;
+                    match sel {
+                        0 => {
+                            file = per_user;
+                            // ensure parent exists
+                            if let Some(p) = file.parent() {
+                                fs::create_dir_all(p).map_err(|e| {
+                                    io::Error::new(
+                                        e.kind(),
+                                        format!("Failed to create per-user directory '{}': {}", p.display(), e)
+                                    )
+                                })?;
+                            }
+                        }
+                        1 => {
+                            file = temp;
+                        }
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                format!("User aborted because cannot write to '{}'", file.display())
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try to create the file; provide detailed error messages including path on failure
+        match fs::File::create(&file) {
+            Ok(fh) => {
+                serde_yaml::to_writer(fh, &config_file).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Failed to write config to '{}'", file.display())
+                    )
+                })?;
+                // set safe permissions where possible
+                if let Err(e) = fs::set_permissions(&file, fs::Permissions::from_mode(0o600)) {
+                    eprintln!("Warning: failed to set permissions on '{}': {}", file.display(), e);
+                }
+                println!();
+                println!("Configuration written to '{}'", file.display());
+                println!("Use the following commands to control your VPN:");
+                println!("  start the VPN:   sudo service vpncloud@{0} start", name);
+                println!("  stop the VPN:    sudo service vpncloud@{0} stop", name);
+                println!("  get the status:  sudo service vpncloud@{0} status", name);
+                println!("  add VPN to autostart:       sudo systemctl enable vpncloud@{0}", name);
+                println!("  remove VPN from autostart:  sudo systemctl disable vpncloud@{0}", name);
+            }
+            Err(e) => {
+                // If permission denied, offer alternatives interactively
+                if e.kind() == io::ErrorKind::PermissionDenied {
+                    eprintln!("ERROR: Permission denied when creating '{}': {}", file.display(), e);
+                    let per_user = match std::env::var("HOME") {
+                        Ok(home) => PathBuf::from(home).join(".config").join("vpncloud").join(format!("{}.net", name)),
+                        Err(_) => std::env::temp_dir().join(format!("{}.net", name))
+                    };
+                    let temp = std::env::temp_dir().join(format!("{}.net", name));
+                    let choices = vec![
+                        format!("Try per-user location: {}", per_user.display()),
+                        format!("Try temp location: {}", temp.display()),
+                        "Abort".to_string(),
+                    ];
+                    let sel = Select::with_theme(&theme)
+                        .with_prompt(format!("Failed to write to '{}'. Choose an alternative:", file.display()))
+                        .items(&choices)
+                        .default(0)
+                        .interact()?;
+                    match sel {
+                        0 => {
+                            file = per_user;
+                            if let Some(p) = file.parent() {
+                                fs::create_dir_all(p).map_err(|e| {
+                                    io::Error::new(
+                                        e.kind(),
+                                        format!("Failed to create per-user directory '{}': {}", p.display(), e)
+                                    )
+                                })?;
+                            }
+                            let fh = fs::File::create(&file).map_err(|e| {
+                                io::Error::new(
+                                    e.kind(),
+                                    format!("Failed to create per-user file '{}': {}", file.display(), e)
+                                )
+                            })?;
+                            serde_yaml::to_writer(fh, &config_file).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("Failed to write config to '{}'", file.display())
+                                )
+                            })?;
+                            println!("Configuration written to '{}'", file.display());
+                        }
+                        1 => {
+                            file = temp;
+                            let fh = fs::File::create(&file).map_err(|e| {
+                                io::Error::new(
+                                    e.kind(),
+                                    format!("Failed to create temp file '{}': {}", file.display(), e)
+                                )
+                            })?;
+                            serde_yaml::to_writer(fh, &config_file).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("Failed to write config to '{}'", file.display())
+                                )
+                            })?;
+                            println!("Configuration written to temporary file '{}'", file.display());
+                        }
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                format!("Cannot write config file to '{}'", file.display())
+                            )
+                            .into());
+                        }
+                    }
+                } else {
+                    // Other I/O errors: include the path in the error
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("Failed to create config file '{}': {}", file.display(), e)
+                    )
+                    .into());
+                }
+            }
+        }
     }
 
     Ok(())

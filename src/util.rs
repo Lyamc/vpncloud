@@ -2,17 +2,15 @@
 // Copyright (C) 2015-2021  Dennis Schwerdel
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
-use std::process::Command;
 use std::{
     fmt,
     net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
-    sync::atomic::{AtomicIsize, Ordering},
+    process::Command,
+    sync::atomic::{AtomicIsize, Ordering}
 };
 
 use crate::error::Error;
-
-#[cfg(not(target_os = "linux"))]
-use time;
+use chrono::Utc;
 
 use signal::{trap::Trap, Signal};
 use smallvec::SmallVec;
@@ -26,7 +24,7 @@ pub struct MsgBuffer {
     space_before: usize,
     buffer: [u8; 65535],
     start: usize,
-    end: usize,
+    end: usize
 }
 
 impl MsgBuffer {
@@ -217,9 +215,11 @@ pub fn resolve<Addr: ToSocketAddrs + fmt::Debug>(addr: Addr) -> Result<SmallVec<
     let mut addrs =
         addr.to_socket_addrs().map_err(|_| Error::NameUnresolvable(format!("{:?}", addr)))?.collect::<SmallVec<_>>();
     // Try IPv4 first as it usually is faster
-    addrs.sort_by_key(|addr| match *addr {
-        SocketAddr::V4(_) => 4,
-        SocketAddr::V6(_) => 6,
+    addrs.sort_by_key(|addr| {
+        match *addr {
+            SocketAddr::V4(_) => 4,
+            SocketAddr::V6(_) => 6
+        }
     });
     // Remove duplicates in addrs (why are there duplicates???)
     addrs.dedup();
@@ -264,7 +264,7 @@ impl fmt::Display for Bytes {
 
 pub struct CtrlC {
     dummy_time: Instant,
-    trap: Trap,
+    trap: Trap
 }
 
 impl CtrlC {
@@ -272,8 +272,11 @@ impl CtrlC {
         Default::default()
     }
 
-    pub fn was_pressed(&self) -> bool {
-        self.trap.wait(self.dummy_time).is_some()
+    // Use the Trap iterator interface. `next()` requires a mutable reference,
+    // so make this method take `&mut self` and check whether any signal is
+    // available by calling `next()`. This avoids relying on `wait(...)`.
+    pub fn was_pressed(&mut self) -> bool {
+        self.trap.next().is_some()
     }
 }
 
@@ -304,7 +307,7 @@ impl TimeSource for SystemTimeSource {
 
     #[cfg(not(target_os = "linux"))]
     fn now() -> Time {
-        time::get_time().sec
+        chrono::Utc::now().timestamp()
     }
 }
 
@@ -346,7 +349,7 @@ fn base62_add_mult_16(buf: &mut [u8], mut buflen: usize, m: u8) -> usize {
 const BASE62: [char; 62] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
     'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
-    'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'
 ];
 
 pub fn to_base62(data: &[u8]) -> String {
@@ -372,7 +375,7 @@ pub fn from_base62(data: &str) -> Result<Vec<u8>, char> {
             '0'..='9' => (c as usize) % ('0' as usize),
             'A'..='Z' => ((c as usize) % ('A' as usize)) + 10,
             'a'..='z' => ((c as usize) % ('a' as usize)) + 36,
-            _ => return Err(c),
+            _ => return Err(c)
         };
         for item in &mut buf {
             val += *item as usize * 62;
@@ -390,7 +393,7 @@ pub fn from_base62(data: &str) -> Result<Vec<u8>, char> {
 #[derive(Default)]
 pub struct StatsdMsg {
     entries: Vec<String>,
-    key: Vec<String>,
+    key: Vec<String>
 }
 
 impl StatsdMsg {
@@ -422,7 +425,7 @@ pub fn run_cmd(mut cmd: Command) {
                 error!("Command returned error: {:?}", status.code())
             }
         }
-        Err(e) => error!("Failed to execute command {:?}: {}", cmd, e),
+        Err(e) => error!("Failed to execute command {:?}: {}", cmd, e)
     }
 }
 
