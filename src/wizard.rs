@@ -582,6 +582,7 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
                     )
                 })?;
                 // set safe permissions where possible
+                #[cfg(unix)]
                 if let Err(e) = fs::set_permissions(&file, fs::Permissions::from_mode(0o600)) {
                     eprintln!("Warning: failed to set permissions on '{}': {}", file.display(), e);
                 }

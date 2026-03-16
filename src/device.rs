@@ -8,12 +8,19 @@ use std::{
     fmt,
     io::{self},
     net::Ipv4Addr,
-    os::unix::io::{AsRawFd, RawFd},
     str::FromStr
 };
 
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, RawHandle};
+
 use getifaddrs::getifaddrs;
-use log::info;
+use log::{debug, error, info, warn};
+#[cfg(target_os = "linux")]
+use libc;
 use serde::{Deserialize, Serialize};
 use tun_rs::{DeviceBuilder, Layer, SyncDevice};
 
@@ -93,6 +100,12 @@ impl TunTapDevice {
     pub fn set_mtu(&mut self, value: Option<usize>) -> io::Result<()> {
         let value = match value {
             Some(value) => value,
+            #[cfg(target_os = "linux")]
+            None => {
+                let default_device = get_default_device().unwrap_or_else(|_| "eth0".to_string());
+                get_device_mtu(&default_device).unwrap_or(1500) - 100 // Subtract overhead
+            }
+            #[cfg(not(target_os = "linux"))]
             None => 1500 // Placeholder
         };
 
@@ -111,12 +124,31 @@ impl TunTapDevice {
         Ok(())
     }
 
-    // Stubs for rp_filter manipulation (kept no-op on macOS / non-linux, but present for compatibility)
+    #[cfg(target_os = "linux")]
     pub fn fix_rp_filter(&self) -> io::Result<()> {
-        // On macOS we don't change kernel rp_filter here; return Ok for compatibility
+        if get_rp_filter("all")? > 1 {
+            info!("Setting net.ipv4.conf.all.rp_filter=1");
+            set_rp_filter("all", 1)?
+        }
+        if get_rp_filter(&self.ifname)? != 1 {
+            info!("Setting net.ipv4.conf.{}.rp_filter=1", self.ifname);
+            set_rp_filter(&self.ifname, 1)?
+        }
         Ok(())
     }
 
+    #[cfg(not(target_os = "linux"))]
+    pub fn fix_rp_filter(&self) -> io::Result<()> {
+        // On non-linux platforms we don't change kernel rp_filter here; return Ok for compatibility
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn get_rp_filter(&self) -> io::Result<i32> {
+        Ok(cmp::max(get_rp_filter("all")?, get_rp_filter(&self.ifname)?) as i32)
+    }
+
+    #[cfg(not(target_os = "linux"))]
     pub fn get_rp_filter(&self) -> io::Result<i32> {
         // Return a conservative default (1). Callers only read this for informational purposes.
         Ok(1)
@@ -189,10 +221,18 @@ impl io::Write for TunTapDevice {
     }
 }
 
-// Allow the runtime to obtain the underlying raw fd for polling
+// Allow the runtime to obtain the underlying raw fd/handle for polling
+#[cfg(unix)]
 impl AsRawFd for TunTapDevice {
     fn as_raw_fd(&self) -> RawFd {
         self.device.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl AsRawHandle for TunTapDevice {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.device.as_raw_handle()
     }
 }
 
@@ -287,9 +327,18 @@ impl Default for MockDevice {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for MockDevice {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawHandle for MockDevice {
+    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+        use std::os::windows::io::AsRawHandle;
+        self.fd.as_raw_handle()
     }
 }
 
@@ -297,6 +346,81 @@ impl AsRawFd for MockDevice {
 impl From<Ipv4Addr> for crate::types::Address {
     fn from(ip: Ipv4Addr) -> Self {
         crate::types::Address::from_ipv4(ip)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_rp_filter(device: &str) -> io::Result<u8> {
+    use std::io::Read;
+    let mut fd = std::fs::File::open(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", device))?;
+    let mut contents = String::with_capacity(10);
+    fd.read_to_string(&mut contents)?;
+    contents.trim().parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid rp_filter value"))
+}
+
+#[cfg(target_os = "linux")]
+fn set_rp_filter(device: &str, val: u8) -> io::Result<()> {
+    use std::io::Write;
+    let mut fd = std::fs::File::create(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", device))?;
+    writeln!(fd, "{}", val)
+}
+
+#[cfg(target_os = "linux")]
+fn get_default_device() -> io::Result<String> {
+    use std::io::BufRead;
+    let fd = std::io::BufReader::new(std::fs::File::open("/proc/net/route")?);
+    let mut best = None;
+    for line in fd.lines() {
+        let line = line?;
+        let parts = line.split('\t').collect::<Vec<_>>();
+        if parts.len() < 3 { continue; }
+        if parts[1] == "00000000" {
+            best = Some(parts[0].to_string());
+            break
+        }
+        if parts[2] != "00000000" {
+            best = Some(parts[0].to_string())
+        }
+    }
+    if let Some(ifname) = best {
+        Ok(ifname)
+    } else {
+        Err(io::Error::new(io::ErrorKind::NotFound, "No default interface found".to_string()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_device_mtu(ifname: &str) -> io::Result<usize> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let mut ifreq = IfReq::new(ifname);
+    let res = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU, &mut ifreq) };
+    match res {
+        0 => Ok(unsafe { ifreq.data.value as usize }),
+        _ => Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+union IfReqData {
+    value: libc::c_int,
+    _dummy: [u8; 24]
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct IfReq {
+    ifr_name: [u8; libc::IF_NAMESIZE],
+    data: IfReqData
+}
+
+#[cfg(target_os = "linux")]
+impl IfReq {
+    fn new(name: &str) -> Self {
+        assert!(name.len() < libc::IF_NAMESIZE);
+        let mut ifr_name = [0 as u8; libc::IF_NAMESIZE];
+        ifr_name[..name.len()].clone_from_slice(name.as_bytes());
+        Self { ifr_name, data: IfReqData { _dummy: [0; 24] } }
     }
 }
 

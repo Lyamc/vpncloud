@@ -18,7 +18,8 @@ pub mod config;
 pub mod crypto;
 pub mod device;
 pub mod error;
-#[cfg(feature = "installer")] pub mod installer;
+#[cfg(feature = "installer")]
+pub mod installer;
 pub mod messages;
 pub mod net;
 pub mod oldconfig;
@@ -28,8 +29,10 @@ pub mod port_forwarding;
 pub mod table;
 pub mod traffic;
 pub mod types;
-#[cfg(feature = "wizard")] pub mod wizard;
-#[cfg(feature = "websocket")] pub mod wsproxy;
+#[cfg(feature = "wizard")]
+pub mod wizard;
+#[cfg(feature = "websocket")]
+pub mod wsproxy;
 
 use structopt::StructOpt;
 
@@ -37,12 +40,14 @@ use std::{
     fs::{self, File, Permissions},
     io::{self, Write},
     net::{Ipv4Addr, UdpSocket},
-    os::unix::fs::PermissionsExt,
     path::Path,
     process,
     str::FromStr,
     sync::Mutex
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::{
     cloud::GenericCloud,
@@ -106,8 +111,13 @@ impl log::Log for DualLogger {
 }
 
 fn run_script(script: &str, ifname: &str) {
-    let mut cmd = process::Command::new("sh");
-    cmd.arg("-c").arg(script).env("IFNAME", ifname);
+    #[cfg(unix)]
+    let (cmd_name, cmd_arg) = ("sh", "-c");
+    #[cfg(windows)]
+    let (cmd_name, cmd_arg) = ("cmd", "/C");
+
+    let mut cmd = process::Command::new(cmd_name);
+    cmd.arg(cmd_arg).arg(script).env("IFNAME", ifname);
     debug!("Running script: {:?}", cmd);
     match cmd.status() {
         Ok(status) => {
@@ -177,6 +187,7 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
                 try_fail!(fs::remove_file(path), "Failed to remove file {}: {}", name);
             }
             let file = try_fail!(File::create(name), "Failed to create stats file: {}");
+            #[cfg(unix)]
             try_fail!(
                 fs::set_permissions(name, Permissions::from_mode(0o644)),
                 "Failed to set permissions on stats file: {}"
@@ -194,6 +205,7 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
         try_fail!(cloud.connect(&addr as &str), "Failed to send message to {}: {}", &addr);
         cloud.add_reconnect_peer(addr);
     }
+    #[cfg(unix)]
     if config.daemonize {
         info!("Running process as daemon");
         let mut daemonize = daemonize::Daemonize::new();
@@ -217,6 +229,11 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
             pd = pd.group(group);
         }
         try_fail!(pd.apply(), "Failed to drop privileges: {}");
+    }
+    
+    #[cfg(not(unix))]
+    if config.daemonize || config.user.is_some() || config.group.is_some() {
+        warn!("Daemonizing and privilege dropping are not supported on this platform.");
     }
     cloud.run();
     if let Some(script) = config.ifdown {
@@ -263,6 +280,7 @@ fn main() {
                 );
                 info!("Writing new config back into {}", config_file);
                 let f = try_fail!(File::create(&config_file), "Failed to open config file: {:?}");
+                #[cfg(unix)]
                 try_fail!(
                     fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600)),
                     "Failed to set permissions on file: {:?}"

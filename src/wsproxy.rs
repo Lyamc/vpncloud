@@ -12,9 +12,15 @@ use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use std::{
     io::{self, Cursor, Read, Write},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener, TcpStream, UdpSocket},
-    os::unix::io::{AsRawFd, RawFd},
     thread::spawn,
 };
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket};
+
 use tungstenite::{connect, protocol::WebSocket, Message, accept, stream::{MaybeTlsStream, NoDelay}};
 use url::Url;
 
@@ -59,8 +65,8 @@ fn serve_proxy_connection(stream: TcpStream) -> Result<(), io::Error> {
     addr.set_ip(get_ip());
     write_addr(addr, &mut msg)?;
     io_error!(websocket.send(Message::Binary(msg)), "Failed to write to ws connection: {}")?;
-    let websocketfd = websocket.get_ref().as_raw_fd();
-    let poll = WaitImpl::new(websocketfd, udpsocket.as_raw_fd(), 60 * 1000)?;
+    
+    let poll = WaitImpl::new(websocket.get_ref(), &udpsocket, 60 * 1000)?;
     let mut buffer = [0; 65535];
     for evt in poll {
         match evt {
@@ -122,10 +128,21 @@ impl ProxyConnection {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for ProxyConnection {
     fn as_raw_fd(&self) -> RawFd {
         match self.socket.get_ref() {
             MaybeTlsStream::Plain(stream) => stream.as_raw_fd(),
+            _ => unimplemented!()
+        }
+    }
+}
+
+#[cfg(windows)]
+impl AsRawSocket for ProxyConnection {
+    fn as_raw_socket(&self) -> RawSocket {
+        match self.socket.get_ref() {
+            MaybeTlsStream::Plain(stream) => stream.as_raw_socket(),
             _ => unimplemented!()
         }
     }

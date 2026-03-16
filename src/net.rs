@@ -6,9 +6,14 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{self, ErrorKind},
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
-    os::unix::io::{AsRawFd, RawFd},
     sync::atomic::{AtomicBool, Ordering}
 };
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket};
 
 use super::util::{MockTimeSource, MsgBuffer, Time, TimeSource};
 use crate::{config::DEFAULT_PORT, port_forwarding::PortForwarding};
@@ -27,7 +32,17 @@ pub fn get_ip() -> IpAddr {
     s.local_addr().unwrap().ip()
 }
 
+#[cfg(unix)]
 pub trait Socket: AsRawFd + Sized {
+    fn listen(addr: &str) -> Result<Self, io::Error>;
+    fn receive(&mut self, buffer: &mut MsgBuffer) -> Result<SocketAddr, io::Error>;
+    fn send(&mut self, data: &[u8], addr: SocketAddr) -> Result<usize, io::Error>;
+    fn address(&self) -> Result<SocketAddr, io::Error>;
+    fn create_port_forwarding(&self) -> Option<PortForwarding>;
+}
+
+#[cfg(windows)]
+pub trait Socket: AsRawSocket + Sized {
     fn listen(addr: &str) -> Result<Self, io::Error>;
     fn receive(&mut self, buffer: &mut MsgBuffer) -> Result<SocketAddr, io::Error>;
     fn send(&mut self, data: &[u8], addr: SocketAddr) -> Result<usize, io::Error>;
@@ -128,8 +143,16 @@ impl MockSocket {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for MockSocket {
     fn as_raw_fd(&self) -> RawFd {
+        unimplemented!()
+    }
+}
+
+#[cfg(windows)]
+impl AsRawSocket for MockSocket {
+    fn as_raw_socket(&self) -> RawSocket {
         unimplemented!()
     }
 }

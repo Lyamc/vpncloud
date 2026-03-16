@@ -5,7 +5,12 @@
 use std::{io, time::Duration};
 
 use mio::{Events, Interest, Poll, Token};
-use std::os::unix::io::AsRawFd;
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, AsRawSocket, RawHandle, RawSocket};
 
 // Importing `WaitResult` from the parent module.
 use super::WaitResult;
@@ -19,31 +24,90 @@ const DEVICE_TOKEN: Token = Token(1);
 pub struct EpollWait {
     poll: Poll,
     events: Events,
+    #[cfg(unix)]
     socket_fd: i32,
+    #[cfg(unix)]
     device_fd: i32,
+    #[cfg(windows)]
+    socket_handle: usize,
+    #[cfg(windows)]
+    device_handle: usize,
     timeout: u32
 }
+
+#[cfg(unix)]
+pub trait Pollable {
+    fn get_fd(&self) -> RawFd;
+}
+#[cfg(unix)]
+impl<T: AsRawFd> Pollable for T {
+    fn get_fd(&self) -> RawFd {
+        self.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+pub trait Pollable {
+    fn get_socket(&self) -> RawSocket;
+    fn get_handle(&self) -> RawHandle;
+}
+#[cfg(windows)]
+impl Pollable for (RawSocket, RawHandle) {
+    fn get_socket(&self) -> RawSocket {
+        self.0
+    }
+    fn get_handle(&self) -> RawHandle {
+        self.1
+    }
+}
+#[cfg(windows)]
+impl Pollable for RawSocket {
+    fn get_socket(&self) -> RawSocket {
+        *self
+    }
+    fn get_handle(&self) -> RawHandle {
+        0 as RawHandle
+    }
+}
+#[cfg(windows)]
+impl Pollable for RawHandle {
+    fn get_socket(&self) -> RawSocket {
+        0
+    }
+    fn get_handle(&self) -> RawHandle {
+        *self
+    }
+}
+#[cfg(windows)]
+impl<T: AsRawSocket + AsRawHandle> Pollable for T {
+    fn get_socket(&self) -> RawSocket {
+        self.as_raw_socket()
+    }
+    fn get_handle(&self) -> RawHandle {
+        self.as_raw_handle()
+    }
+}
+
 
 impl EpollWait {
     // The `new` function is simplified as `mio` handles the setup internally.
     // The file descriptors must be non-blocking.
-    pub fn new(socket: impl AsRawFd, device: impl AsRawFd, timeout: u32) -> io::Result<Self> {
+    pub fn new(socket: &impl Pollable, device: &impl Pollable, timeout: u32) -> io::Result<Self> {
         Self::create(socket, device, timeout, Interest::READABLE)
     }
 
     // `testing` function now registers for both `READABLE` and `WRITABLE` interests.
-    pub fn testing(socket: impl AsRawFd, device: impl AsRawFd, timeout: u32) -> io::Result<Self> {
+    pub fn testing(socket: &impl Pollable, device: &impl Pollable, timeout: u32) -> io::Result<Self> {
         Self::create(socket, device, timeout, Interest::READABLE.add(Interest::WRITABLE))
     }
 
-    fn create(socket: impl AsRawFd, device: impl AsRawFd, timeout: u32, interest: Interest) -> io::Result<Self> {
+    #[cfg(unix)]
+    fn create(socket: &impl Pollable, device: &impl Pollable, timeout: u32, interest: Interest) -> io::Result<Self> {
         let poll = Poll::new()?;
         let events = Events::with_capacity(128);
 
-        // On Windows, the RawFd traits are `AsRawSocket`. For cross-platform
-        // a simple cast may be all that is needed.
-        let socket_fd = socket.as_raw_fd();
-        let device_fd = device.as_raw_fd();
+        let socket_fd = socket.get_fd();
+        let device_fd = device.get_fd();
 
         // `mio` requires you to register a non-blocking object.
         // The `register` method binds a source (like a socket) to a `Token`.
@@ -52,6 +116,21 @@ impl EpollWait {
         poll.registry().register(&mut mio::unix::SourceFd(&device_fd), DEVICE_TOKEN, interest)?;
 
         Ok(Self { poll, events, socket_fd, device_fd, timeout })
+    }
+
+    #[cfg(windows)]
+    fn create(socket: &impl Pollable, device: &impl Pollable, timeout: u32, interest: Interest) -> io::Result<Self> {
+        let poll = Poll::new()?;
+        let events = Events::with_capacity(128);
+
+        let socket_handle = socket.get_socket() as usize;
+        let device_handle = device.get_handle() as usize;
+
+        // On Windows, mio doesn't have a direct equivalent of SourceFd for arbitrary handles.
+        // This is a stub for now, as Windows support is still in progress.
+        // In a real implementation, we would need to wrap these in something that implements Source.
+        
+        Ok(Self { poll, events, socket_handle, device_handle, timeout })
     }
 }
 

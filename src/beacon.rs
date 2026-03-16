@@ -217,6 +217,7 @@ impl<TS: TimeSource> BeaconSerializer<TS> {
         }
         let mut f = File::create(path)?;
         writeln!(&mut f, "{}", beacon)?;
+        #[cfg(unix)]
         fs::set_permissions(path, Permissions::from_mode(0o444))?;
         Ok(())
     }
