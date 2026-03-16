@@ -18,9 +18,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::windows::io::{AsRawHandle, RawHandle};
 
 use getifaddrs::getifaddrs;
-use log::{debug, error, info, warn};
-#[cfg(target_os = "linux")]
-use rustix;
+use log::info;
 use serde::{Deserialize, Serialize};
 use tun_rs::{DeviceBuilder, Layer, SyncDevice};
 
@@ -102,8 +100,7 @@ impl TunTapDevice {
             Some(value) => value,
             #[cfg(target_os = "linux")]
             None => {
-                let default_device = get_default_device().unwrap_or_else(|_| "eth0".to_string());
-                get_device_mtu(&default_device).unwrap_or(1500) - 100 // Subtract overhead
+                self.device.mtu().map(|m| m as usize - 100).unwrap_or(1400)
             }
             #[cfg(not(target_os = "linux"))]
             None => 1500 // Placeholder
@@ -391,7 +388,9 @@ fn get_default_device() -> io::Result<String> {
 
 #[cfg(target_os = "linux")]
 fn get_device_mtu(ifname: &str) -> io::Result<usize> {
-    use rustix::net::ioctl_gifmtu;
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    ioctl_gifmtu(&sock, ifname).map(|mtu| mtu as usize).map_err(io::Error::from)
+    use std::io::Read;
+    let mut fd = std::fs::File::open(format!("/sys/class/net/{}/mtu", ifname))?;
+    let mut contents = String::with_capacity(10);
+    fd.read_to_string(&mut contents)?;
+    contents.trim().parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid MTU value"))
 }

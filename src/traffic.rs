@@ -153,7 +153,7 @@ impl TrafficStats {
     pub fn write_out<W: Write>(&self, out: &mut W) -> Result<(), io::Error> {
         writeln!(out, "peer_traffic:")?;
         let mut peers: Vec<_> = self.get_peer_traffic().collect();
-        peers.sort_unstable_by_key(|(_, data)| (data.out_bytes + data.in_bytes));
+        peers.sort_unstable_by_key(|(_, data)| data.out_bytes + data.in_bytes);
         for (addr, data) in peers.iter().rev() {
             writeln!(
                 out,
@@ -170,7 +170,7 @@ impl TrafficStats {
         writeln!(out)?;
         writeln!(out, "payload_traffic:")?;
         let mut payload: Vec<_> = self.get_payload_traffic().collect();
-        payload.sort_unstable_by_key(|(_, data)| (data.out_bytes + data.in_bytes));
+        payload.sort_unstable_by_key(|(_, data)| data.out_bytes + data.in_bytes);
         for ((remote, local), data) in payload.iter().rev() {
             writeln!(
                 out,

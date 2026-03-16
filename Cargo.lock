@@ -1860,7 +1860,6 @@ dependencies = [
  "privdrop",
  "rand",
  "ring",
- "rustix",
  "serde",
  "serde_yaml",
  "signal",

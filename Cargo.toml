@@ -35,9 +35,7 @@ byteorder = "1.4"
 thiserror = "1.0"
 smallvec = "1.7"
 lazy_static = "1.4"
-rustix = { version = "1.0.8", features = ["net"] }
 dialoguer = { version = "0.11", optional = true }
-
 tungstenite = { version = "0.21", optional = true }
 url = { version = "2.2", optional = true }
 igd = { version = "0.12", optional = true }
