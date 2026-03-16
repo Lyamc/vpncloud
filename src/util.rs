@@ -295,18 +295,11 @@ pub trait TimeSource: Sync + Copy + Send + 'static {
 pub struct SystemTimeSource;
 
 impl TimeSource for SystemTimeSource {
-    #[cfg(target_os = "linux")]
     fn now() -> Time {
-        let mut tv = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        unsafe {
-            libc::clock_gettime(6, &mut tv);
+        lazy_static::lazy_static! {
+            static ref BOOT_INSTANT: Instant = Instant::now();
         }
-        tv.tv_sec as Time
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn now() -> Time {
-        chrono::Utc::now().timestamp()
+        BOOT_INSTANT.elapsed().as_secs() as Time
     }
 }
 

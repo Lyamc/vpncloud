@@ -20,7 +20,7 @@ use std::os::windows::io::{AsRawHandle, RawHandle};
 use getifaddrs::getifaddrs;
 use log::{debug, error, info, warn};
 #[cfg(target_os = "linux")]
-use libc;
+use rustix;
 use serde::{Deserialize, Serialize};
 use tun_rs::{DeviceBuilder, Layer, SyncDevice};
 
@@ -391,37 +391,7 @@ fn get_default_device() -> io::Result<String> {
 
 #[cfg(target_os = "linux")]
 fn get_device_mtu(ifname: &str) -> io::Result<usize> {
+    use rustix::net::ioctl_gifmtu;
     let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
-    let mut ifreq = IfReq::new(ifname);
-    let res = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU, &mut ifreq) };
-    match res {
-        0 => Ok(unsafe { ifreq.data.value as usize }),
-        _ => Err(io::Error::last_os_error())
-    }
+    ioctl_gifmtu(&sock, ifname).map(|mtu| mtu as usize).map_err(io::Error::from)
 }
-
-#[cfg(target_os = "linux")]
-#[repr(C)]
-union IfReqData {
-    value: libc::c_int,
-    _dummy: [u8; 24]
-}
-
-#[cfg(target_os = "linux")]
-#[repr(C)]
-struct IfReq {
-    ifr_name: [u8; libc::IF_NAMESIZE],
-    data: IfReqData
-}
-
-#[cfg(target_os = "linux")]
-impl IfReq {
-    fn new(name: &str) -> Self {
-        assert!(name.len() < libc::IF_NAMESIZE);
-        let mut ifr_name = [0 as u8; libc::IF_NAMESIZE];
-        ifr_name[..name.len()].clone_from_slice(name.as_bytes());
-        Self { ifr_name, data: IfReqData { _dummy: [0; 24] } }
-    }
-}
-
-// Provide From<Ipv4Addr> -> Address to match call sites that use Address::from(ip)
