@@ -1,0 +1,81 @@
+#[cfg(target_os = "linux")]
+fn get_rp_filter(device: &str) -> io::Result<u8> {
+    use std::io::Read;
+    let mut fd = std::fs::File::open(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", device))?;
+    let mut contents = String::with_capacity(10);
+    fd.read_to_string(&mut contents)?;
+    contents.trim().parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid rp_filter value"))
+}
+
+#[cfg(target_os = "linux")]
+fn set_rp_filter(device: &str, val: u8) -> io::Result<()> {
+    use std::io::Write;
+    let mut fd = std::fs::File::create(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", device))?;
+    writeln!(fd, "{}", val)
+}
+
+#[cfg(target_os = "linux")]
+fn get_default_device() -> io::Result<String> {
+    use std::io::BufRead;
+    let fd = std::io::BufReader::new(std::fs::File::open("/proc/net/route")?);
+    let mut best = None;
+    for line in fd.lines() {
+        let line = line?;
+        let parts = line.split('\t').collect::<Vec<_>>();
+        if parts.len() < 3 { continue; }
+        if parts[1] == "00000000" {
+            best = Some(parts[0].to_string());
+            break
+        }
+        if parts[2] != "00000000" {
+            best = Some(parts[0].to_string())
+        }
+    }
+    if let Some(ifname) = best {
+        Ok(ifname)
+    } else {
+        Err(io::Error::new(io::ErrorKind::NotFound, "No default interface found".to_string()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_device_mtu(ifname: &str) -> io::Result<usize> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    let mut ifreq = IfReq::new(ifname);
+    let res = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU, &mut ifreq) };
+    match res {
+        0 => Ok(unsafe { ifreq.data.value as usize }),
+        _ => Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+union IfReqData {
+    value: libc::c_int,
+    _dummy: [u8; 24]
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct IfReq {
+    ifr_name: [u8; libc::IF_NAMESIZE],
+    data: IfReqData
+}
+
+#[cfg(target_os = "linux")]
+impl IfReq {
+    fn new(name: &str) -> Self {
+        assert!(name.len() < libc::IF_NAMESIZE);
+        let mut ifr_name = [0 as u8; libc::IF_NAMESIZE];
+        ifr_name[..name.len()].clone_from_slice(name.as_bytes());
+        Self { ifr_name, data: IfReqData { _dummy: [0; 24] } }
+    }
+}
+
+// Provide From<Ipv4Addr> -> Address to match call sites that use Address::from(ip)
+impl From<Ipv4Addr> for crate::types::Address {
+    fn from(ip: Ipv4Addr) -> Self {
+        crate::types::Address::from_ipv4(ip)
+    }
+}
