@@ -7,7 +7,7 @@ use std::{
     io::{self, ErrorKind},
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
     os::unix::io::{AsRawFd, RawFd},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, Ordering}
 };
 
 use super::util::{MockTimeSource, MsgBuffer, Time, TimeSource};
@@ -17,13 +17,13 @@ pub fn mapped_addr(addr: SocketAddr) -> SocketAddr {
     // HOT PATH
     match addr {
         SocketAddr::V4(addr4) => SocketAddr::new(IpAddr::V6(addr4.ip().to_ipv6_mapped()), addr4.port()),
-        _ => addr,
+        _ => addr
     }
 }
 
 pub fn get_ip() -> IpAddr {
     let s = UdpSocket::bind("0.0.0.0:0").unwrap();
-    s.connect("8.8.8.8:0").unwrap();
+    s.connect("8.8.8.8:53").unwrap();
     s.local_addr().unwrap().ip()
 }
 
@@ -86,7 +86,7 @@ pub struct MockSocket {
     nat_peers: HashMap<SocketAddr, Time>,
     address: SocketAddr,
     outbound: VecDeque<(SocketAddr, Vec<u8>)>,
-    inbound: VecDeque<(SocketAddr, Vec<u8>)>,
+    inbound: VecDeque<(SocketAddr, Vec<u8>)>
 }
 
 impl MockSocket {
@@ -96,7 +96,7 @@ impl MockSocket {
             nat_peers: HashMap::new(),
             address,
             outbound: VecDeque::with_capacity(10),
-            inbound: VecDeque::with_capacity(10),
+            inbound: VecDeque::with_capacity(10)
         }
     }
 

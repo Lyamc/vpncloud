@@ -39,8 +39,9 @@ tungstenite = { version = "0.21", optional = true }
 url = { version = "2.2", optional = true }
 igd = { version = "0.12", optional = true }
 mio = { version = "1.0.4", features = ["os-poll", "net"] }
-tun = { version = "0.8.3", features = ["async"] }
+tun-rs = { version = "2.8.2", features = ["async"] }
 ipnet = "2.11.0"
+getifaddrs = "0.6"
 
 
 [dev-dependencies]

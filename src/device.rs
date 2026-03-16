@@ -6,15 +6,16 @@ use std::{
     cmp,
     collections::VecDeque,
     fmt,
-    io::{self, Read, Write},
-    net::{IpAddr, Ipv4Addr},
+    io::{self},
+    net::Ipv4Addr,
     os::unix::io::{AsRawFd, RawFd},
     str::FromStr
 };
 
+use getifaddrs::getifaddrs;
 use log::info;
 use serde::{Deserialize, Serialize};
-use tun::{AbstractDevice, Configuration};
+use tun_rs::{DeviceBuilder, Layer, SyncDevice};
 
 use crate::error::Error;
 
@@ -65,7 +66,7 @@ pub trait Device: io::Read + io::Write {
 }
 
 pub struct TunTapDevice {
-    device: tun::Device,
+    device: SyncDevice,
     ifname: String,
     type_: Type
 }
@@ -74,19 +75,18 @@ impl TunTapDevice {
     // Keep the third parameter for compatibility with callers that pass an optional device path.
     // We currently ignore `device_path` on macOS, but keep the parameter so callers don't need changes.
     pub fn new(ifname: &str, type_: Type, _device_path: Option<&str>) -> io::Result<Self> {
-        let mut config = Configuration::default();
-        config.tun_name(ifname);
+        let mut builder = DeviceBuilder::new().name(ifname);
 
         // Set the OSI layer based on the device type.
         match type_ {
-            Type::Tun => config.layer(tun::Layer::L3),
-            Type::Tap => config.layer(tun::Layer::L2)
+            Type::Tun => builder = builder.layer(Layer::L3),
+            Type::Tap => builder = builder.layer(Layer::L2)
         };
 
-        let device: tun::Device = tun::create(&config)?;
-        let ifname = device.tun_name()?.to_string();
+        let device = builder.build_sync()?;
+        let actual_ifname = device.name()?.to_string();
 
-        Ok(Self { device, ifname, type_ })
+        Ok(Self { device, ifname: actual_ifname, type_ })
     }
 
     // Set MTU (delegates to tun device).
@@ -103,14 +103,11 @@ impl TunTapDevice {
     }
 
     pub fn configure(&mut self, addr: Ipv4Addr, netmask: Ipv4Addr) -> io::Result<()> {
-        // enable interface and set address/netmask; convert tun errors into io::Error
+        // enable interface and set address/netmask
         self.device.enabled(true).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Enable failed: {}", e)))?;
         self.device
-            .set_address(addr.into())
+            .set_network_address(addr, netmask, None)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Set address failed: {}", e)))?;
-        self.device
-            .set_netmask(netmask.into())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Set netmask failed: {}", e)))?;
         Ok(())
     }
 
@@ -141,12 +138,16 @@ impl Device for TunTapDevice {
     }
 
     fn address(&self) -> Result<Ipv4Addr, Error> {
-        match self.device.address() {
-            Ok(IpAddr::V4(v4)) => Ok(v4),
-            Ok(IpAddr::V6(_)) => Err(Error::Device("IPv6 not supported")),
-            Err(tun::Error::Io(io_err)) => Err(Error::DeviceIo("Error getting IP address", io_err)),
-            _ => Err(Error::Device("Failed to query device address"))
+        // Use getifaddrs to find the IPv4 address of the interface
+        let if_name = self.ifname();
+        for iface in getifaddrs().map_err(|e| Error::DeviceIo("Failed to get interface addresses", e))? {
+            if iface.name == if_name {
+                if let Some(std::net::IpAddr::V4(v4)) = iface.address.ip_addr() {
+                    return Ok(v4);
+                }
+            }
         }
+        Err(Error::Device("No IPv4 address found for interface"))
     }
 
     fn write_msg(&mut self, data: &mut crate::util::MsgBuffer) -> Result<(), Error> {
@@ -172,19 +173,19 @@ impl Device for TunTapDevice {
 
 impl io::Read for TunTapDevice {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // Delegate to underlying tun device Read impl
-        self.device.read(buf)
+        // Delegate to underlying tun device recv impl
+        self.device.recv(buf)
     }
 }
 
 impl io::Write for TunTapDevice {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // Delegate to underlying tun device Write impl
-        self.device.write(buf)
+        // Delegate to underlying tun device send impl
+        self.device.send(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.device.flush()
+        Ok(())
     }
 }
 
@@ -198,12 +199,15 @@ impl AsRawFd for TunTapDevice {
 // MockDevice remains the same but implements the MsgBuffer read/write used by the cloud.
 pub struct MockDevice {
     inbound: VecDeque<Vec<u8>>,
-    outbound: VecDeque<Vec<u8>>
+    outbound: VecDeque<Vec<u8>>,
+    fd: std::fs::File
 }
 
 impl MockDevice {
     pub fn new() -> Self {
-        Default::default()
+        // Open /dev/null to get a valid file descriptor for polling
+        let fd = std::fs::File::open("/dev/null").expect("Failed to open /dev/null");
+        Self { inbound: VecDeque::with_capacity(10), outbound: VecDeque::with_capacity(10), fd }
     }
 
     pub fn put_inbound(&mut self, data: Vec<u8>) {
@@ -275,7 +279,17 @@ impl io::Write for MockDevice {
 
 impl Default for MockDevice {
     fn default() -> Self {
-        Self { outbound: VecDeque::with_capacity(10), inbound: VecDeque::with_capacity(10) }
+        Self {
+            inbound: VecDeque::with_capacity(10),
+            outbound: VecDeque::with_capacity(10),
+            fd: std::fs::File::open("/dev/null").expect("Failed to open /dev/null")
+        }
+    }
+}
+
+impl AsRawFd for MockDevice {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
 }
 

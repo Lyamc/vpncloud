@@ -10,7 +10,6 @@ use std::{
 };
 
 use crate::error::Error;
-use chrono::Utc;
 
 use signal::{trap::Trap, Signal};
 use smallvec::SmallVec;
