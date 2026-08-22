@@ -149,7 +149,7 @@ fn setup_device(config: &Config) -> TunTapDevice {
     );
     info!("Opened device {}", device.ifname());
     config.call_hook("device_setup", vec![("IFNAME", device.ifname())], true);
-    if let Err(err) = device.set_mtu(None) {
+    if let Err(err) = device.set_mtu(config.mtu) {
         error!("Error setting optimal MTU on {}: {}", device.ifname(), err);
     }
     if let Some(ip) = &config.ip {

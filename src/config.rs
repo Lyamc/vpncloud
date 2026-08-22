@@ -22,6 +22,7 @@ pub struct Config {
     pub device_name: String,
     pub device_path: Option<String>,
     pub fix_rp_filter: bool,
+    pub mtu: Option<usize>,
 
     pub ip: Option<String>,
     pub advertise_addresses: Vec<String>,
@@ -61,6 +62,7 @@ impl Default for Config {
             device_name: "vpncloud%d".to_string(),
             device_path: None,
             fix_rp_filter: false,
+            mtu: None,
             ip: None,
             advertise_addresses: vec![],
             ifup: None,
@@ -107,6 +109,9 @@ impl Config {
             }
             if let Some(val) = device.fix_rp_filter {
                 self.fix_rp_filter = val;
+            }
+            if let Some(val) = device.mtu {
+                self.mtu = Some(val);
             }
         }
         if let Some(val) = file.ip {
@@ -216,6 +221,9 @@ impl Config {
         if args.fix_rp_filter {
             self.fix_rp_filter = true;
         }
+        if let Some(val) = args.mtu {
+            self.mtu = Some(val);
+        }
         if let Some(val) = args.ip {
             self.ip = Some(val);
         }
@@ -321,7 +329,8 @@ impl Config {
                 name: Some(self.device_name),
                 path: self.device_path,
                 type_: Some(self.device_type),
-                fix_rp_filter: Some(self.fix_rp_filter)
+                fix_rp_filter: Some(self.fix_rp_filter),
+                mtu: self.mtu
             }),
             crypto: self.crypto,
             group: self.group,
@@ -391,6 +400,10 @@ pub struct Args {
     /// Set the path of the base device
     #[arg(long)]
     pub device_path: Option<String>,
+
+    /// MTU of the virtual device (default: auto)
+    #[arg(long)]
+    pub mtu: Option<usize>,
 
     /// Fix the rp_filter settings on the host
     #[arg(long)]
@@ -603,7 +616,8 @@ pub struct ConfigFileDevice {
     pub type_: Option<Type>,
     pub name: Option<String>,
     pub path: Option<String>,
-    pub fix_rp_filter: Option<bool>
+    pub fix_rp_filter: Option<bool>,
+    pub mtu: Option<usize>
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
@@ -694,7 +708,8 @@ statsd:
             type_: Some(Type::Tun),
             name: Some("vpncloud%d".to_string()),
             path: Some("/dev/net/tun".to_string()),
-            fix_rp_filter: None
+            fix_rp_filter: None,
+            mtu: None
         }),
         ip: Some("10.0.1.1/16".to_string()),
         advertise_addresses: Some(vec!["192.168.0.1".to_string(), "192.168.1.1".to_string()]),
@@ -742,7 +757,8 @@ fn config_merge() {
             type_: Some(Type::Tun),
             name: Some("vpncloud%d".to_string()),
             path: None,
-            fix_rp_filter: None
+            fix_rp_filter: None,
+            mtu: None
         }),
         ip: None,
         advertise_addresses: Some(vec![]),
@@ -836,6 +852,7 @@ fn config_merge() {
         device_name: "vpncloud0".to_string(),
         device_path: Some("/dev/null".to_string()),
         fix_rp_filter: false,
+        mtu: None,
         ip: None,
         advertise_addresses: vec![],
 

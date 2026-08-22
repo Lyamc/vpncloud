@@ -43,6 +43,7 @@ device:                     # Device settings
                             # Ethernet frames **tun** devices process IP packets. [default: `tun`]
   path: "/dev/net/tun"      # Path of the tun device
   fix-rp-filter: false      # Whether to fix detected rp-filter problems
+  mtu: ~                    # MTU of the virtual device (empty = auto)
 
 mode: normal                # Mode to run in, "normal", "hub", "switch", or "router" (see manpage)
 
