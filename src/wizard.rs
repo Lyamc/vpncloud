@@ -493,7 +493,7 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
         let f = fs::File::open(&file).map_err(|e| {
             io::Error::new(e.kind(), format!("Failed to open existing config file '{}': {}", file.display(), e))
         })?;
-        let config_file = serde_yaml::from_reader(f).map_err(|_| {
+        let config_file = serde_norway::from_reader(f).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse config file '{}'", file.display()))
         })?;
         config.merge_file(config_file);
@@ -577,7 +577,7 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
         // Try to create the file; provide detailed error messages including path on failure
         match fs::File::create(&file) {
             Ok(fh) => {
-                serde_yaml::to_writer(fh, &config_file).map_err(|_| {
+                serde_norway::to_writer(fh, &config_file).map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("Failed to write config to '{}'", file.display())
@@ -633,7 +633,7 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
                                     format!("Failed to create per-user file '{}': {}", file.display(), e)
                                 )
                             })?;
-                            serde_yaml::to_writer(fh, &config_file).map_err(|_| {
+                            serde_norway::to_writer(fh, &config_file).map_err(|_| {
                                 io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     format!("Failed to write config to '{}'", file.display())
@@ -649,7 +649,7 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
                                     format!("Failed to create temp file '{}': {}", file.display(), e)
                                 )
                             })?;
-                            serde_yaml::to_writer(fh, &config_file).map_err(|_| {
+                            serde_norway::to_writer(fh, &config_file).map_err(|_| {
                                 io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     format!("Failed to write config to '{}'", file.display())

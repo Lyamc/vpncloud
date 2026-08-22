@@ -292,7 +292,7 @@ fn main() {
                 info!("Trying to convert from old config format");
                 let f = try_fail!(File::open(&config_file), "Failed to open config file: {:?}");
                 let config_file_old: OldConfigFile =
-                    try_fail!(serde_yaml::from_reader(f), "Config file not valid for version 1: {:?}");
+                    try_fail!(serde_norway::from_reader(f), "Config file not valid for version 1: {:?}");
                 let new_config = config_file_old.convert();
                 info!("Successfully converted from old format");
                 info!("Renaming original file to {}.orig", config_file);
@@ -307,7 +307,7 @@ fn main() {
                     fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600)),
                     "Failed to set permissions on file: {:?}"
                 );
-                try_fail!(serde_yaml::to_writer(f, &new_config), "Failed to write converted config: {:?}");
+                try_fail!(serde_norway::to_writer(f, &new_config), "Failed to write converted config: {:?}");
             }
             Command::Completion { shell } => {
                 let mut cmd = Args::command();
@@ -336,14 +336,14 @@ fn main() {
     if let Some(ref file) = args.config {
         info!("Reading config file '{}'", file);
         let f = try_fail!(File::open(file), "Failed to open config file: {:?}");
-        let config_file = match serde_yaml::from_reader(f) {
+        let config_file = match serde_norway::from_reader(f) {
             Ok(config) => config,
             Err(err) => {
                 error!("Failed to read config file: {}", err);
                 info!("Trying to convert from old config format");
                 let f = try_fail!(File::open(file), "Failed to open config file: {:?}");
                 let config_file_old: OldConfigFile =
-                    try_fail!(serde_yaml::from_reader(f), "Config file is neither version 2 nor version 1: {:?}");
+                    try_fail!(serde_norway::from_reader(f), "Config file is neither version 2 nor version 1: {:?}");
                 let new_config = config_file_old.convert();
                 info!("Successfully converted from old format, please migrate your config using migrate-config");
                 new_config

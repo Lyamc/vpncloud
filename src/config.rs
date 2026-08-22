@@ -703,7 +703,7 @@ statsd:
   server: example.com:1234
   prefix: prefix
     ";
-    assert_eq!(serde_yaml::from_str::<ConfigFile>(config_file).unwrap(), ConfigFile {
+    assert_eq!(serde_norway::from_str::<ConfigFile>(config_file).unwrap(), ConfigFile {
         device: Some(ConfigFileDevice {
             type_: Some(Type::Tun),
             name: Some("vpncloud%d".to_string()),
@@ -746,7 +746,7 @@ statsd:
 
 #[test]
 fn parse_example_config() {
-    serde_yaml::from_str::<ConfigFile>(include_str!("../assets/example.net.disabled")).unwrap();
+    serde_norway::from_str::<ConfigFile>(include_str!("../assets/example.net.disabled")).unwrap();
 }
 
 #[test]
