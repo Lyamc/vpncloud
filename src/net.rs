@@ -45,9 +45,17 @@ pub fn send_addr(addr: SocketAddr) -> SocketAddr {
 }
 
 pub fn get_ip() -> IpAddr {
-    let s = UdpSocket::bind("0.0.0.0:0").unwrap();
-    s.connect("8.8.8.8:53").unwrap();
-    s.local_addr().unwrap().ip()
+    // Prefer IPv4, but IPv6-only hosts have no route to 8.8.8.8 (#309).
+    if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
+        if s.connect("8.8.8.8:53").is_ok() {
+            if let Ok(addr) = s.local_addr() {
+                return addr.ip();
+            }
+        }
+    }
+    let s = UdpSocket::bind("[::]:0").expect("Failed to bind a UDP socket");
+    s.connect("[2001:4860:4860::8888]:53").expect("Failed to connect");
+    s.local_addr().expect("Failed to get local address").ip()
 }
 
 #[cfg(unix)]
