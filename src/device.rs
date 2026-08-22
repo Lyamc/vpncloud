@@ -74,7 +74,18 @@ fn platform_device_name(ifname: &str, type_: Type) -> Option<String> {
         }
         Some(ifname.to_string())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = type_;
+        // wintun / tap-windows6 adapter names cannot contain `%d`.
+        let name = ifname.replace("%d", "0");
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = type_;
         Some(ifname.to_string())
@@ -98,9 +109,11 @@ pub trait Device: io::Read + io::Write {
 }
 
 pub struct TunTapDevice {
-    device: SyncDevice,
+    device: std::sync::Arc<SyncDevice>,
     ifname: String,
-    type_: Type
+    type_: Type,
+    #[cfg(windows)]
+    incoming: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>
 }
 
 impl TunTapDevice {
@@ -142,20 +155,27 @@ impl TunTapDevice {
 
         let device = builder.build_sync().map_err(|e| {
             if e.kind() == io::ErrorKind::PermissionDenied {
-                io::Error::new(
-                    e.kind(),
-                    format!("Permission denied creating {} device (try running as root/sudo): {}", type_, e)
-                )
+                #[cfg(windows)]
+                let hint = "try running as Administrator; TUN needs wintun.dll, TAP needs tap-windows6";
+                #[cfg(not(windows))]
+                let hint = "try running as root/sudo";
+                io::Error::new(e.kind(), format!("Permission denied creating {} device ({}): {}", type_, hint, e))
             } else {
                 e
             }
         })?;
-        // mio requires non-blocking file descriptors.
+        // mio requires non-blocking file descriptors. wintun/tap-windows6 are waited separately.
         #[cfg(unix)]
         device.set_nonblocking(true)?;
         let actual_ifname = device.name()?.to_string();
 
-        Ok(Self { device, ifname: actual_ifname, type_ })
+        Ok(Self {
+            device: std::sync::Arc::new(device),
+            ifname: actual_ifname,
+            type_,
+            #[cfg(windows)]
+            incoming: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
+        })
     }
 
     // Set MTU (delegates to tun device).
@@ -255,7 +275,24 @@ impl Device for TunTapDevice {
     }
 
     fn read_msg(&mut self, buffer: &mut crate::util::MsgBuffer) -> Result<(), Error> {
+        #[cfg(windows)]
+        {
+            if let Some(data) = self.incoming.lock().expect("device queue").pop_front() {
+                buffer.clone_from(&data);
+                match self.type_ {
+                    Type::Tap => crate::payload::fix_ethernet_ipv4_checksums(buffer.message_mut()),
+                    Type::Tun => crate::payload::fix_ipv4_checksums(buffer.message_mut())
+                }
+                return Ok(());
+            }
+            return Err(Error::DeviceIo(
+                "IO error when reading from device",
+                io::Error::new(io::ErrorKind::WouldBlock, "no TAP/TUN packet queued")
+            ));
+        }
+        #[cfg(not(windows))]
         let buf = buffer.buffer();
+        #[cfg(not(windows))]
         match self.device.recv(buf) {
             Ok(len) => {
                 buffer.set_length(len);
@@ -309,11 +346,18 @@ impl AsRawFd for TunTapDevice {
 }
 
 #[cfg(windows)]
-impl AsRawHandle for TunTapDevice {
-    fn as_raw_handle(&self) -> RawHandle {
-        self.device.as_raw_handle()
+impl crate::poll::Pollable for TunTapDevice {
+    fn wait_device(&self) -> Option<crate::poll::WindowsDeviceSource> {
+        let device = self.device.clone();
+        Some(crate::poll::WindowsDeviceSource {
+            recv: std::sync::Arc::new(move |buf| device.recv(buf)),
+            queue: self.incoming.clone()
+        })
     }
 }
+
+#[cfg(windows)]
+impl crate::poll::Pollable for MockDevice {}
 
 // MockDevice remains the same but implements the MsgBuffer read/write used by the cloud.
 pub struct MockDevice {
@@ -322,11 +366,20 @@ pub struct MockDevice {
     fd: std::fs::File
 }
 
+fn null_file() -> std::fs::File {
+    #[cfg(unix)]
+    {
+        std::fs::File::open("/dev/null").expect("Failed to open /dev/null")
+    }
+    #[cfg(windows)]
+    {
+        std::fs::File::open("NUL").expect("Failed to open NUL")
+    }
+}
+
 impl MockDevice {
     pub fn new() -> Self {
-        // Open /dev/null to get a valid file descriptor for polling
-        let fd = std::fs::File::open("/dev/null").expect("Failed to open /dev/null");
-        Self { inbound: VecDeque::with_capacity(10), outbound: VecDeque::with_capacity(10), fd }
+        Self { inbound: VecDeque::with_capacity(10), outbound: VecDeque::with_capacity(10), fd: null_file() }
     }
 
     pub fn put_inbound(&mut self, data: Vec<u8>) {
@@ -398,11 +451,7 @@ impl io::Write for MockDevice {
 
 impl Default for MockDevice {
     fn default() -> Self {
-        Self {
-            inbound: VecDeque::with_capacity(10),
-            outbound: VecDeque::with_capacity(10),
-            fd: std::fs::File::open("/dev/null").expect("Failed to open /dev/null")
-        }
+        Self { inbound: VecDeque::with_capacity(10), outbound: VecDeque::with_capacity(10), fd: null_file() }
     }
 }
 
@@ -458,7 +507,9 @@ mod tests {
         let name = platform_device_name("vpncloud%d", Type::Tun);
         #[cfg(target_os = "macos")]
         assert_eq!(name, None);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        assert_eq!(name.as_deref(), Some("vpncloud0"));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert_eq!(name.as_deref(), Some("vpncloud%d"));
     }
 

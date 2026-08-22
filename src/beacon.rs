@@ -4,13 +4,14 @@
 
 use ring::digest;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
-    fs::{self, File, Permissions},
+    fs::{self, File},
     io::{self, Read, Write},
     marker::PhantomData,
     mem,
     num::Wrapping,
-    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, Stdio},
     sync::{
@@ -218,7 +219,7 @@ impl<TS: TimeSource> BeaconSerializer<TS> {
         let mut f = File::create(path)?;
         writeln!(&mut f, "{}", beacon)?;
         #[cfg(unix)]
-        fs::set_permissions(path, Permissions::from_mode(0o444))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o444))?;
         Ok(())
     }
 

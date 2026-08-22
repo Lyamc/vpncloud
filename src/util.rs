@@ -15,10 +15,9 @@ use std::{
 
 use crate::error::Error;
 
-use signal_hook::{
-    consts::{SIGINT, SIGQUIT, SIGTERM},
-    flag
-};
+#[cfg(unix)]
+use signal_hook::consts::{SIGQUIT, SIGTERM};
+use signal_hook::{consts::SIGINT, flag};
 use smallvec::SmallVec;
 
 pub type Duration = u32;
@@ -284,8 +283,11 @@ impl CtrlC {
 impl Default for CtrlC {
     fn default() -> Self {
         let flag = Arc::new(AtomicBool::new(false));
-        for sig in [SIGINT, SIGTERM, SIGQUIT] {
-            let _ = flag::register(sig, Arc::clone(&flag));
+        let _ = flag::register(SIGINT, Arc::clone(&flag));
+        #[cfg(unix)]
+        {
+            let _ = flag::register(SIGTERM, Arc::clone(&flag));
+            let _ = flag::register(SIGQUIT, Arc::clone(&flag));
         }
         Self { flag }
     }

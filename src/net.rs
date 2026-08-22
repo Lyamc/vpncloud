@@ -187,6 +187,9 @@ impl AsRawSocket for MockSocket {
     }
 }
 
+#[cfg(windows)]
+impl crate::poll::Pollable for MockSocket {}
+
 impl Socket for MockSocket {
     fn listen(addr: &str) -> Result<Self, io::Error> {
         Ok(Self::new(mapped_addr(parse_listen(addr, DEFAULT_PORT))))

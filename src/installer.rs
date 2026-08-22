@@ -1,9 +1,10 @@
 use crate::{error::Error, util::run_cmd};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     env,
     fs::{self, File},
     io::Write,
-    os::unix::fs::PermissionsExt,
     process::Command
 };
 
@@ -23,9 +24,11 @@ pub fn install() -> Result<(), Error> {
     env::current_exe()
         .and_then(|p| fs::copy(p, "/usr/bin/vpncloud"))
         .map_err(|e| Error::FileIo("Failed to copy binary", e))?;
+    #[cfg(unix)]
     fs::set_permissions("/usr/bin/vpncloud", fs::Permissions::from_mode(0o755))
         .map_err(|e| Error::FileIo("Failed to set permissions for binary", e))?;
     fs::create_dir_all("/etc/vpncloud").map_err(|e| Error::FileIo("Failed to create config folder", e))?;
+    #[cfg(unix)]
     fs::set_permissions("/etc/vpncloud", fs::Permissions::from_mode(0o700))
         .map_err(|e| Error::FileIo("Failed to set permissions for config folder", e))?;
     File::create("/etc/vpncloud/example.net.disabled")

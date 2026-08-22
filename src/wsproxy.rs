@@ -153,6 +153,13 @@ impl AsRawSocket for ProxyConnection {
     }
 }
 
+#[cfg(windows)]
+impl crate::poll::Pollable for ProxyConnection {
+    fn wait_socket(&self) -> Option<std::os::windows::io::RawSocket> {
+        Some(self.as_raw_socket())
+    }
+}
+
 impl Socket for ProxyConnection {
     fn listen(url: &str) -> Result<Self, io::Error> {
         io_error!(Url::parse(url), "Invalid URL {}: {}", url)?;

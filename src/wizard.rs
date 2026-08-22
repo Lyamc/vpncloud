@@ -1,7 +1,9 @@
 use crate::{config::Config, crypto::Crypto, device, types::Mode};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
 use ring::aead;
-use std::{collections::HashMap, fs, io, os::unix::fs::PermissionsExt, path::Path};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{collections::HashMap, fs, io, path::Path};
 
 const MODE_SIMPLE: usize = 0;
 const MODE_ADVANCED: usize = 1;
