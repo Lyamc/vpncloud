@@ -26,6 +26,24 @@ pub fn mapped_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Alternate IPv4 encoding for `send_to` on a dual-stack socket.
+///
+/// VpnCloud stores IPv4 peers as IPv6-mapped (`::ffff:x.x.x.x`). `send_to` with that form works
+/// on an AF_INET6 socket on Linux and macOS; native IPv4 does not on macOS (EINVAL). If a send
+/// fails with InvalidInput, retry with the other encoding.
+pub fn send_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => {
+            if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                SocketAddr::new(IpAddr::V4(v4), v6.port())
+            } else {
+                addr
+            }
+        }
+        v4 => mapped_addr(v4)
+    }
+}
+
 pub fn get_ip() -> IpAddr {
     let s = UdpSocket::bind("0.0.0.0:0").unwrap();
     s.connect("8.8.8.8:53").unwrap();
@@ -70,6 +88,7 @@ impl Socket for UdpSocket {
         let domain = if addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
         let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
         sock.set_nonblocking(true)?;
+        sock.set_reuse_address(true)?;
         // macOS defaults IPV6_V6ONLY to true, which would drop IPv4 peers on an `[::]` bind.
         if addr.is_ipv6() {
             sock.set_only_v6(false)?;
@@ -86,7 +105,10 @@ impl Socket for UdpSocket {
     }
 
     fn send(&mut self, data: &[u8], addr: SocketAddr) -> Result<usize, io::Error> {
-        self.send_to(data, addr)
+        match self.send_to(data, addr) {
+            Err(e) if e.kind() == ErrorKind::InvalidInput => self.send_to(data, send_addr(addr)),
+            other => other
+        }
     }
 
     fn address(&self) -> Result<SocketAddr, io::Error> {
@@ -224,6 +246,51 @@ mod tests {
             }
         }
         panic!("did not receive IPv4 datagram on dual-stack socket");
+    }
+
+    #[test]
+    fn send_addr_unmaps_ipv4_mapped() {
+        let v4: SocketAddr = "1.2.3.4:3210".parse().unwrap();
+        let mapped = mapped_addr(v4);
+        assert_eq!(mapped, "[::ffff:1.2.3.4]:3210".parse().unwrap());
+        assert_eq!(send_addr(mapped), v4);
+        assert_eq!(send_addr(v4), mapped);
+        let v6: SocketAddr = "[2001:db8::1]:3210".parse().unwrap();
+        assert_eq!(send_addr(v6), v6);
+    }
+
+    #[test]
+    fn dual_stack_send_to_ipv4_peer() {
+        let mut server = UdpSocket::listen("0").expect("listen");
+        let port = server.local_addr().expect("local_addr").port();
+        let mut client = UdpSocket::listen("0").expect("client listen");
+        let dest = mapped_addr(SocketAddr::from(([127, 0, 0, 1], port)));
+        // Dual-stack (AF_INET6) sockets on macOS must send to IPv6-mapped destinations,
+        // not native IPv4. send_addr() keeps mapped form for that reason; this send uses
+        // the stored mapped address directly to assert the kernel accepts it.
+        Socket::send(&mut client, b"mapped", dest).expect("send to ipv6-mapped dest");
+        recv_one(&mut server, b"mapped");
+
+        let native = SocketAddr::from(([127, 0, 0, 1], port));
+        Socket::send(&mut client, b"native", native).expect("send native ipv4 via fallback");
+        recv_one(&mut server, b"native");
+    }
+
+    fn recv_one(server: &mut UdpSocket, expect: &[u8]) {
+        let mut buf = MsgBuffer::new(0);
+        for _ in 0..50 {
+            match server.receive(&mut buf) {
+                Ok(_) => {
+                    assert_eq!(buf.message(), expect);
+                    return;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("receive failed: {}", e)
+            }
+        }
+        panic!("did not receive {:?}", std::str::from_utf8(expect));
     }
 }
 

@@ -115,7 +115,16 @@ impl TunTapDevice {
 
         match type_ {
             Type::Tun => builder = builder.layer(Layer::L3),
-            Type::Tap => builder = builder.layer(Layer::L2)
+            Type::Tap => {
+                builder = builder.layer(Layer::L2);
+                // tun-rs default TAP MAC is the ASCII for "feth"; give the interface a real LAA.
+                #[cfg(target_os = "macos")]
+                {
+                    let mut mac = rand::random::<[u8; 6]>();
+                    mac[0] = (mac[0] & 0xfe) | 0x02;
+                    builder = builder.mac_addr(mac);
+                }
+            }
         };
 
         // vpncloud speaks raw IP / Ethernet frames. On macOS utun, tun-rs will strip the
@@ -233,6 +242,10 @@ impl Device for TunTapDevice {
     }
 
     fn write_msg(&mut self, data: &mut crate::util::MsgBuffer) -> Result<(), Error> {
+        match self.type_ {
+            Type::Tap => crate::payload::fix_ethernet_ipv4_checksums(data.message_mut()),
+            Type::Tun => crate::payload::fix_ipv4_checksums(data.message_mut())
+        }
         let slice = data.message();
         match self.device.send(slice) {
             Ok(written) if written == slice.len() => Ok(()),
@@ -246,7 +259,23 @@ impl Device for TunTapDevice {
         match self.device.recv(buf) {
             Ok(len) => {
                 buffer.set_length(len);
+                match self.type_ {
+                    Type::Tap => crate::payload::fix_ethernet_ipv4_checksums(buffer.message_mut()),
+                    Type::Tun => crate::payload::fix_ipv4_checksums(buffer.message_mut())
+                }
                 Ok(())
+            }
+            // tun-rs TAP on macOS returns UnexpectedEof when a BPF wakeup has no frames.
+            Err(io_err)
+                if matches!(
+                    io_err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                Err(Error::DeviceIo(
+                    "IO error when reading from device",
+                    io::Error::new(io::ErrorKind::WouldBlock, io_err)
+                ))
             }
             Err(io_err) => Err(Error::DeviceIo("IO error when reading from device", io_err))
         }

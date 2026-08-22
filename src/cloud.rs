@@ -300,8 +300,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
         // Send a message to each resolved address
         for a in addrs {
-            // Ignore error this time
-            self.connect_sock(a).ok();
+            if let Err(e) = self.connect_sock(a) {
+                warn!("Failed to connect to {}: {}", addr_nice(a), e);
+            }
         }
         Ok(())
     }
