@@ -644,6 +644,35 @@ set), configure a static UDP port forward to the listen port, or use the
 websocket proxy (see *WEBSOCKET PROXY*).
 
 
+== CONTAINERS (LXC / PROXMOX)
+
+VpnCloud needs a TUN or TAP device node (*/dev/net/tun*). Unprivileged LXC
+containers (including Proxmox CT) do not expose that device by default, which
+fails with: *Failed to open virtual tap interface ... No such device*.
+
+On the Proxmox/LXC host, append the following to the container config
+(*/etc/pve/lxc/<id>.conf* on Proxmox) and reboot the container:
+
+----
+lxc.mount.entry: /dev/net dev/net none bind,create=dir
+lxc.cgroup2.devices.allow: c 10:200 rwm
+----
+
+Example on a Proxmox host (replace *123* with the CT ID):
+
+----
+id=123
+tee -a "/etc/pve/lxc/$id.conf" << EOF
+lxc.mount.entry: /dev/net dev/net none bind,create=dir
+lxc.cgroup2.devices.allow: c 10:200 rwm
+EOF
+pct reboot "$id"
+----
+
+Docker and other runtimes need equivalent access: *--device /dev/net/tun*
+and often *--cap-add NET_ADMIN*.
+
+
 == DEVICE SETUP
 
 The device is setup using the following steps:
