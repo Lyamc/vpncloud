@@ -458,7 +458,8 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             self.broadcast_msg(MESSAGE_TYPE_NODE_INFO, &mut buffer)?;
             // Reschedule for next update
             let min_peer_timeout = self.peers.iter().map(|p| p.1.peer_timeout).min().unwrap_or(DEFAULT_PEER_TIMEOUT);
-            let interval = min(self.update_freq, max(min_peer_timeout / 2 - 60, 1));
+            // peer_timeout/2 - 60 underflows on u16 when a peer publishes a timeout < 120s (#384).
+            let interval = min(self.update_freq, max((min_peer_timeout / 2).saturating_sub(60), 1));
             self.next_peers = now + Time::from(interval);
         }
         self.reconnect_to_peers()?;
