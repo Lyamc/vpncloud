@@ -46,8 +46,10 @@ vpncloud - Peer-to-peer VPN
   or a full address in form IP:PORT. If the IP is specified as \'\*' or only
   a port number is given, then the socket will listen on all IPs (v4 and v6),
   otherwise the socket will only listen on the given IP.
-  Alternatively, a websocket proxy URL (starting with ws://) can be given 
-  here. Please see the section *WEBSOCKET PROXY* for more info.
+  Alternatively, a websocket URL can be given here. *ws://host:port* still
+  connects to a remote websocket proxy. *ws://0.0.0.0:port*, *ws://[::]:port*,
+  *ws://*:port*, or *ws-listen://IP:port* bind a native websocket server on
+  this node (no separate proxy). Please see *WEBSOCKET PROXY* for more info.
   [default: **3210**]
 
 *-c <addr>*, *--peer <addr>*, *--connect <addr>*::
@@ -560,6 +562,43 @@ A VpnCloud instance can use a websocket proxy instead of opening a local port by
 specifying the websocket proxy via its *--listen* parameter 
 (e.g. *--listen ws://example.com:3210*). Note that the websocket URL must start with
 *ws:\/\/*, not *http:\/\/*.
+
+=== Direct websocket mode
+
+A node can listen for websocket peers itself, so nginx, Caddy, or cloudflared
+can terminate TLS and pass the websocket through. No central *ws-proxy*
+process is required.
+
+On the listening node:
+
+----
+vpncloud --listen ws-listen://0.0.0.0:8080 --ip 10.0.0.1/24 --password PASSWORD
+----
+
+*ws://0.0.0.0:8080*, *ws://[::]:8080*, and *ws://*:8080* are equivalent bind
+forms. *ws://hostname:port* is still the proxy-client form above.
+
+A peer connects with the websocket URL of that node:
+
+----
+vpncloud --listen ws-listen://0.0.0.0:8081 -c ws://listener.example.com:8080 --ip 10.0.0.2/24 --password PASSWORD
+----
+
+VpnCloud messages stay end-to-end encrypted. The websocket layer is plain
+TCP; put TLS on the reverse proxy. Example nginx snippet:
+
+----
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+}
+----
+
+When using a native websocket listen address, allow TCP (not UDP) on that
+port in the host firewall.
 
 
 == HOOK SCRIPTS

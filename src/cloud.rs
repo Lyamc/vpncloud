@@ -81,6 +81,7 @@ pub struct ReconnectEntry {
 }
 
 fn ensure_peer_port(addr: &str) -> String {
+    let addr = addr.strip_prefix("ws://").or_else(|| addr.strip_prefix("wss://")).unwrap_or(addr);
     if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
         format!("{}:{}", addr, DEFAULT_PORT)
     } else {

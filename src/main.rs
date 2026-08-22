@@ -58,7 +58,7 @@ use crate::{
 };
 
 #[cfg(feature = "websocket")]
-use crate::wsproxy::ProxyConnection;
+use crate::wsproxy::{native_ws_bind, ProxyConnection, WsNativeSocket};
 
 struct DualLogger {
     file: Option<Mutex<File>>
@@ -247,6 +247,9 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
     for addr in config.peers {
         let group: Vec<&str> = addr.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
         if let Some(mut first) = group.first().map(|s| (*s).to_string()) {
+            if let Some(rest) = first.strip_prefix("ws://").or_else(|| first.strip_prefix("wss://")) {
+                first = rest.to_string();
+            }
             if first.find(':').unwrap_or(0) <= first.find(']').unwrap_or(0) {
                 first = format!("{}:{}", first, DEFAULT_PORT);
             }
@@ -378,6 +381,16 @@ fn main() {
     debug!("Config: {:?}", config);
     if config.crypto.password.is_none() && config.crypto.private_key.is_none() {
         error!("Either password or private key must be set in config or given as parameter");
+        return;
+    }
+    #[cfg(feature = "websocket")]
+    if native_ws_bind(&config.listen).is_some() {
+        let socket =
+            try_fail!(WsNativeSocket::listen(&config.listen), "Failed to open websocket listen socket {}: {}", config.listen);
+        match config.device_type {
+            Type::Tap => run::<payload::Frame, _>(config, socket),
+            Type::Tun => run::<payload::Packet, _>(config, socket)
+        }
         return;
     }
     #[cfg(feature = "websocket")]
