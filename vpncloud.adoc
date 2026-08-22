@@ -595,6 +595,55 @@ The following event types
     Variables: *IFNAME*
 
 
+== FIREWALLS
+
+VpnCloud nodes speak UDP (default port *3210*) unless a websocket proxy is
+used. Allow that port between peers, and allow traffic on the virtual TUN/TAP
+interface.
+
+*nftables*::
+  ----
+  udp dport 3210 accept
+  iifname "vpncloud*" accept
+  oifname "vpncloud*" accept
+  ----
+
+*iptables*::
+  ----
+  iptables -A INPUT -p udp --dport 3210 -j ACCEPT
+  iptables -A INPUT -i vpncloud+ -j ACCEPT
+  iptables -A OUTPUT -o vpncloud+ -j ACCEPT
+  ----
+
+*firewalld* (permanent)::
+  ----
+  firewall-cmd --permanent --add-port=3210/udp
+  firewall-cmd --permanent --add-interface=vpncloud0
+  firewall-cmd --reload
+  ----
+
+*ufw*::
+  ----
+  ufw allow 3210/udp
+  ufw allow in on vpncloud0
+  ufw allow out on vpncloud0
+  ----
+
+*macOS / pf*::
+  If the default packet filter is enabled, allow UDP 3210 and the *utun* or
+  *feth* interface VpnCloud creates. On a typical workstation pf is off and
+  no extra rule is needed.
+
+*Windows Firewall*::
+  Allow UDP 3210 inbound for *vpncloud.exe*. The Wintun / TAP adapter should
+  be treated as a private network; allow the overlay subnet if a third-party
+  firewall filters it.
+
+If the node is behind NAT, either enable UPnP (*--no-port-forwarding* not
+set), configure a static UDP port forward to the listen port, or use the
+websocket proxy (see *WEBSOCKET PROXY*).
+
+
 == DEVICE SETUP
 
 The device is setup using the following steps:
