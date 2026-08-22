@@ -130,13 +130,10 @@ impl TunTapDevice {
             Type::Tun => builder = builder.layer(Layer::L3),
             Type::Tap => {
                 builder = builder.layer(Layer::L2);
-                // tun-rs default TAP MAC is the ASCII for "feth"; give the interface a real LAA.
-                #[cfg(target_os = "macos")]
-                {
-                    let mut mac = rand::random::<[u8; 6]>();
-                    mac[0] = (mac[0] & 0xfe) | 0x02;
-                    builder = builder.mac_addr(mac);
-                }
+                // Kernel/tun-rs defaults can collide across nodes (#381). Assign a unique LAA.
+                let mut mac = rand::random::<[u8; 6]>();
+                mac[0] = (mac[0] & 0xfe) | 0x02;
+                builder = builder.mac_addr(mac);
             }
         };
 
