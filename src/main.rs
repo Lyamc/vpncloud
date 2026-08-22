@@ -136,8 +136,33 @@ fn parse_ip_netmask(addr: &str) -> Result<(Ipv4Addr, Ipv4Addr), String> {
         return Err(format!("Invalid prefix length: {}", prefix_len));
     }
     let ip = Ipv4Addr::from_str(ip_str).map_err(|_| format!("Invalid ip address: {}", ip_str))?;
-    let netmask = Ipv4Addr::from(u32::max_value().checked_shl(32 - prefix_len as u32).unwrap());
+    let netmask = if prefix_len == 0 {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        Ipv4Addr::from(u32::MAX << (32 - prefix_len as u32))
+    };
     Ok((ip, netmask))
+}
+
+#[cfg(test)]
+mod parse_ip_tests {
+    use super::parse_ip_netmask;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn bare_ipv4_defaults_to_slash_24() {
+        // #357: a source-built binary used to program 89.1.0.0/8 for 10.67.89.1
+        let (ip, mask) = parse_ip_netmask("10.67.89.1").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(10, 67, 89, 1));
+        assert_eq!(mask, Ipv4Addr::new(255, 255, 255, 0));
+    }
+
+    #[test]
+    fn explicit_prefix() {
+        let (ip, mask) = parse_ip_netmask("10.67.89.1/16").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(10, 67, 89, 1));
+        assert_eq!(mask, Ipv4Addr::new(255, 255, 0, 0));
+    }
 }
 
 fn setup_device(config: &Config) -> TunTapDevice {
