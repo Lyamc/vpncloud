@@ -10,7 +10,7 @@ use std::{
     hash::BuildHasherDefault,
     io::{self, Cursor, Seek, SeekFrom, Write},
     marker::PhantomData,
-    net::{SocketAddr, ToSocketAddrs},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::Path,
     str::FromStr
 };
@@ -41,6 +41,13 @@ use crate::{
     types::{Address, Mode, NodeId, Range, RangeList},
     util::{addr_nice, bytes_to_hex, resolve, CtrlC, Duration, MsgBuffer, StatsdMsg, Time, TimeSource}
 };
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().map(|v4| v4.is_loopback()).unwrap_or(false)
+    }
+}
 
 pub type Hash = BuildHasherDefault<FnvHasher>;
 
@@ -827,6 +834,12 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     pub fn handle_net_message(&mut self, src: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
         let src = mapped_addr(src);
+        if is_loopback_ip(src.ip()) {
+            // Peers (or this process) hitting the listen port via 127.0.0.1 spam crypto-init
+            // failures (#313). Loopback is never a real remote node.
+            debug!("Ignoring packet from loopback {}", addr_nice(src));
+            return Ok(());
+        }
         debug!("Received {} bytes from {}", data.len(), src);
         let msg_result = if let Some(init) = self.pending_inits.get_mut(&src) {
             // COLD PATH
