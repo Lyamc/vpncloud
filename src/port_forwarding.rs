@@ -5,9 +5,12 @@
 #[cfg(feature = "nat")]
 mod internal {
 
-    use std::{io, net::SocketAddrV4};
+    use std::{
+        io,
+        net::{IpAddr, SocketAddr, SocketAddrV4}
+    };
 
-    use igd::{search_gateway, AddAnyPortError, AddPortError, Gateway, PortMappingProtocol, SearchError};
+    use igd_next::{search_gateway, AddAnyPortError, AddPortError, Gateway, PortMappingProtocol, SearchError};
 
     use crate::util::{get_internal_ip, SystemTimeSource, Time, TimeSource};
 
@@ -43,7 +46,11 @@ mod internal {
             let internal_addr = SocketAddrV4::new(get_internal_ip(), port);
             // Query the external address
             let external_ip = match gateway.get_external_ip() {
-                Ok(ip) => ip,
+                Ok(IpAddr::V4(ip)) => ip,
+                Ok(IpAddr::V6(ip)) => {
+                    error!("Port-forwarding: router reported IPv6 external IP {}, IPv4 mapping required", ip);
+                    return None;
+                }
                 Err(err) => {
                     error!("Port-forwarding: failed to obtain external IP: {}", err);
                     return None;
@@ -86,10 +93,10 @@ mod internal {
         fn get_forwarding(gateway: &Gateway, addr: SocketAddrV4, port: u16) -> Result<(u16, u32), ()> {
             debug!("Trying external port {}", port);
             if port == 0 {
-                match gateway.add_any_port(PortMappingProtocol::UDP, addr, LEASE_TIME, DESCRIPTION) {
+                match gateway.add_any_port(PortMappingProtocol::UDP, SocketAddr::V4(addr), LEASE_TIME, DESCRIPTION) {
                     Ok(port) => Ok((port, LEASE_TIME)),
                     Err(AddAnyPortError::OnlyPermanentLeasesSupported) => {
-                        match gateway.add_any_port(PortMappingProtocol::UDP, addr, 0, DESCRIPTION) {
+                        match gateway.add_any_port(PortMappingProtocol::UDP, SocketAddr::V4(addr), 0, DESCRIPTION) {
                             Ok(port) => Ok((port, 0)),
                             Err(err) => {
                                 debug!("Port-forwarding: failed to activate port forwarding: {}", err);
@@ -103,10 +110,10 @@ mod internal {
                     }
                 }
             } else {
-                match gateway.add_port(PortMappingProtocol::UDP, port, addr, LEASE_TIME, DESCRIPTION) {
+                match gateway.add_port(PortMappingProtocol::UDP, port, SocketAddr::V4(addr), LEASE_TIME, DESCRIPTION) {
                     Ok(()) => Ok((port, LEASE_TIME)),
                     Err(AddPortError::OnlyPermanentLeasesSupported) => {
-                        match gateway.add_port(PortMappingProtocol::UDP, port, addr, 0, DESCRIPTION) {
+                        match gateway.add_port(PortMappingProtocol::UDP, port, SocketAddr::V4(addr), 0, DESCRIPTION) {
                             Ok(()) => Ok((port, 0)),
                             Err(err) => {
                                 debug!("Port-forwarding: failed to activate port forwarding: {}", err);
@@ -133,7 +140,7 @@ mod internal {
             match self.gateway.add_port(
                 PortMappingProtocol::UDP,
                 self.external_addr.port(),
-                self.internal_addr,
+                SocketAddr::V4(self.internal_addr),
                 LEASE_TIME,
                 DESCRIPTION
             ) {
