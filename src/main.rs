@@ -36,7 +36,7 @@ use clap::{CommandFactory, Parser};
 use std::{
     fs::{self, File, Permissions},
     io::{self, Write},
-    net::{Ipv4Addr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket},
     path::Path,
     process,
     str::FromStr,
@@ -126,42 +126,67 @@ fn run_script(script: &str, ifname: &str) {
     }
 }
 
-fn parse_ip_netmask(addr: &str) -> Result<(Ipv4Addr, Ipv4Addr), String> {
-    let (ip_str, len_str) = match addr.find('/') {
-        Some(pos) => (&addr[..pos], &addr[pos + 1..]),
-        None => (addr, "24")
+fn parse_ip_netmask(addr: &str) -> Result<(IpAddr, Option<Ipv4Addr>, Option<u8>), String> {
+    let (ip_str, prefix_opt) = match addr.find('/') {
+        Some(pos) => (&addr[..pos], Some(&addr[pos + 1..])),
+        None => (addr, None)
     };
-    let prefix_len = u8::from_str(len_str).map_err(|_| format!("Invalid prefix length: {}", len_str))?;
-    if prefix_len > 32 {
-        return Err(format!("Invalid prefix length: {}", prefix_len));
+    if let Ok(ip) = Ipv4Addr::from_str(ip_str) {
+        let prefix_len = match prefix_opt {
+            Some(s) => u8::from_str(s).map_err(|_| format!("Invalid prefix length: {}", s))?,
+            None => 24
+        };
+        if prefix_len > 32 {
+            return Err(format!("Invalid prefix length: {}", prefix_len));
+        }
+        let netmask = if prefix_len == 0 {
+            Ipv4Addr::UNSPECIFIED
+        } else {
+            Ipv4Addr::from(u32::MAX << (32 - prefix_len as u32))
+        };
+        return Ok((IpAddr::V4(ip), Some(netmask), Some(prefix_len)));
     }
-    let ip = Ipv4Addr::from_str(ip_str).map_err(|_| format!("Invalid ip address: {}", ip_str))?;
-    let netmask = if prefix_len == 0 {
-        Ipv4Addr::UNSPECIFIED
-    } else {
-        Ipv4Addr::from(u32::MAX << (32 - prefix_len as u32))
-    };
-    Ok((ip, netmask))
+    if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
+        let prefix_len = match prefix_opt {
+            Some(s) => u8::from_str(s).map_err(|_| format!("Invalid prefix length: {}", s))?,
+            None => 64
+        };
+        if prefix_len > 128 {
+            return Err(format!("Invalid prefix length: {}", prefix_len));
+        }
+        return Ok((IpAddr::V6(ip), None, Some(prefix_len)));
+    }
+    Err(format!("Invalid ip address: {}", ip_str))
 }
 
 #[cfg(test)]
 mod parse_ip_tests {
     use super::parse_ip_netmask;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn bare_ipv4_defaults_to_slash_24() {
         // #357: a source-built binary used to program 89.1.0.0/8 for 10.67.89.1
-        let (ip, mask) = parse_ip_netmask("10.67.89.1").unwrap();
-        assert_eq!(ip, Ipv4Addr::new(10, 67, 89, 1));
-        assert_eq!(mask, Ipv4Addr::new(255, 255, 255, 0));
+        let (ip, mask, prefix) = parse_ip_netmask("10.67.89.1").unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(10, 67, 89, 1)));
+        assert_eq!(mask, Some(Ipv4Addr::new(255, 255, 255, 0)));
+        assert_eq!(prefix, Some(24));
     }
 
     #[test]
     fn explicit_prefix() {
-        let (ip, mask) = parse_ip_netmask("10.67.89.1/16").unwrap();
-        assert_eq!(ip, Ipv4Addr::new(10, 67, 89, 1));
-        assert_eq!(mask, Ipv4Addr::new(255, 255, 0, 0));
+        let (ip, mask, prefix) = parse_ip_netmask("10.67.89.1/16").unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(10, 67, 89, 1)));
+        assert_eq!(mask, Some(Ipv4Addr::new(255, 255, 0, 0)));
+        assert_eq!(prefix, Some(16));
+    }
+
+    #[test]
+    fn ipv6_unique_local() {
+        let (ip, mask, prefix) = parse_ip_netmask("fd00:1::1/64").unwrap();
+        assert_eq!(ip, IpAddr::V6(Ipv6Addr::new(0xfd00, 1, 0, 0, 0, 0, 0, 1)));
+        assert_eq!(mask, None);
+        assert_eq!(prefix, Some(64));
     }
 }
 
@@ -178,9 +203,9 @@ fn setup_device(config: &Config) -> TunTapDevice {
         error!("Error setting optimal MTU on {}: {}", device.ifname(), err);
     }
     if let Some(ip) = &config.ip {
-        let (ip, netmask) = try_fail!(parse_ip_netmask(ip), "Invalid ip address given: {}");
-        info!("Configuring device with ip {}, netmask {}", ip, netmask);
-        try_fail!(device.configure(ip, netmask), "Failed to configure device: {}");
+        let (addr, netmask, prefix) = try_fail!(parse_ip_netmask(ip), "Invalid ip address given: {}");
+        info!("Configuring device with ip {}", ip);
+        try_fail!(device.configure_ip(addr, netmask, prefix), "Failed to configure device: {}");
     }
     if let Some(script) = &config.ifup {
         run_script(script, device.ifname());

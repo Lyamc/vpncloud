@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     fmt,
     io::{self},
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     str::FromStr
 };
 
@@ -192,11 +192,25 @@ impl TunTapDevice {
     }
 
     pub fn configure(&mut self, addr: Ipv4Addr, netmask: Ipv4Addr) -> io::Result<()> {
-        // enable interface and set address/netmask
+        self.configure_ip(IpAddr::V4(addr), Some(netmask), None)
+    }
+
+    pub fn configure_ip(&mut self, addr: IpAddr, netmask: Option<Ipv4Addr>, prefix_len: Option<u8>) -> io::Result<()> {
         self.device.enabled(true).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Enable failed: {}", e)))?;
-        self.device
-            .set_network_address(addr, netmask, None)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Set address failed: {}", e)))?;
+        match addr {
+            IpAddr::V4(ip) => {
+                let netmask = netmask.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "IPv4 netmask required"))?;
+                self.device
+                    .set_network_address(ip, netmask, None)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Set address failed: {}", e)))?;
+            }
+            IpAddr::V6(ip) => {
+                let prefix = prefix_len.unwrap_or(64);
+                self.device
+                    .add_address_v6(ip, prefix)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Set IPv6 address failed: {}", e)))?;
+            }
+        }
         Ok(())
     }
 

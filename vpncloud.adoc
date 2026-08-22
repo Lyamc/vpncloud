@@ -58,6 +58,7 @@ vpncloud - Peer-to-peer VPN
   with a WAN fallback), list them comma-separated in priority order:
   *--peer 192.168.0.3:3210,172.16.0.3:3210*. VpnCloud tries the first address
   first and only moves to the next if that peer is not connected.
+  IPv6 peer addresses must be written in brackets: *--peer [2001:db8::1]:3210*.
 
 *--claim <subnet>*::
   The local subnets to claim. This parameter should be in the form
@@ -139,7 +140,8 @@ vpncloud - Peer-to-peer VPN
   *BEACONS* for more information.
 
 *--ip <address>*::
-  An IP address (plus optional prefix length) for the interface. If this 
+  An IP address (plus optional prefix length) for the interface. IPv4 and
+  IPv6 are both accepted (e.g. *10.0.0.1/24* or *fd00:1::1/64*). If this
   argument is given, the address (and if a prefix length is given, also the
   netmask) is configured on the device and the device is activated.
   If also *--ifup* is given, the interface is configured before the ifup 
@@ -328,6 +330,28 @@ are used, the interface needs to be configured as 10.0.1.1/16.
 For TUN devices, this means that the prefix length of the subnets
 (/24 in this example) must be different than the prefix length that the
 interface is configured with (/16 in this example).
+
+=== IPv6
+
+VpnCloud already transports packets over IPv6 UDP. A port-only listen address
+(the default *3210*) binds dual-stack. To listen on IPv6 only, or to connect
+to an IPv6 peer:
+
+----
+vpncloud -l '[::]:3210' -c '[2001:db8::1]:3210' --ip 10.0.0.1/24 --password PASSWORD
+----
+
+The overlay can also be IPv6 (TUN devices parse IPv6 payloads). Unique-local
+addresses are typical:
+
+----
+# node A
+vpncloud -c '[2001:db8::2]:3210' --ip fd00:1::1/64 --claim fd00:1::/64 --password PASSWORD
+# node B
+vpncloud -c '[2001:db8::1]:3210' --ip fd00:1::2/64 --claim fd00:1::/64 --password PASSWORD
+----
+
+Afterwards *ping6 fd00:1::2* from node A should reach node B over the VPN.
 
 === Important notes
 
