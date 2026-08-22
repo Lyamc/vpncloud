@@ -54,7 +54,7 @@ pub type Hash = BuildHasherDefault<FnvHasher>;
 const MAX_RECONNECT_INTERVAL: u16 = 3600;
 const RESOLVE_INTERVAL: Time = 300;
 pub const STATS_INTERVAL: Time = 60;
-const OWN_ADDRESS_RESET_INTERVAL: Time = 300;
+const OWN_ADDRESS_RESET_INTERVAL: Time = 30;
 const SPACE_BEFORE: usize = 100;
 
 struct PeerData {
@@ -488,9 +488,17 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             self.load_beacon()?;
             self.next_beacon = now + Time::from(self.config.beacon_interval);
         }
-        // Periodically reset own peers
+        // Periodically re-detect local/public addresses (dynamic WAN IP, #326).
         if self.next_own_address_reset <= now {
+            let prev = self.own_addresses.clone();
             self.reset_own_addresses().map_err(|err| Error::SocketIo("Failed to get own addresses", err))?;
+            if self.own_addresses != prev {
+                info!("Local addresses changed, publishing update: {:?}", self.own_addresses);
+                let info = self.create_node_info();
+                info.encode(&mut buffer);
+                self.broadcast_msg(MESSAGE_TYPE_NODE_INFO, &mut buffer)?;
+                self.reconnect_to_peers()?;
+            }
             self.next_own_address_reset = now + OWN_ADDRESS_RESET_INTERVAL;
         }
         Ok(())
