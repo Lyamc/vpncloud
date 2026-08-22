@@ -112,7 +112,9 @@ impl Protocol for Packet {
                 let dst = Address::read_from_fixed(&data[24..], 16)?;
                 Ok((src, dst))
             }
-            _ => Err(Error::Parse("Invalid IP protocol version"))
+            _ => Err(Error::Parse(
+                "Invalid IP protocol version (check that every node uses the same device type: tun vs tap)"
+            ))
         }
     }
 }
