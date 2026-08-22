@@ -4,6 +4,7 @@
 
 use std::{
     fmt,
+    io,
     net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     process::Command,
     sync::{
@@ -212,6 +213,20 @@ pub fn get_internal_ip() -> Ipv4Addr {
         }
     }
     Ipv4Addr::UNSPECIFIED
+}
+
+/// Detach from the controlling terminal (Unix `--daemon`).
+///
+/// Uses `libc::daemon` instead of the unmaintained `daemonize` crate (#394).
+#[cfg(unix)]
+pub fn unix_daemonize() -> io::Result<()> {
+    // nochdir=0: chdir to /; noclose=0: redirect stdin/stdout/stderr to /dev/null.
+    let rc = unsafe { libc::daemon(0, 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 #[allow(unknown_lints, clippy::needless_pass_by_value)]

@@ -228,29 +228,25 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
         cloud.add_reconnect_peer(addr);
     }
     #[cfg(unix)]
-    if config.daemonize {
-        info!("Running process as daemon");
-        let mut daemonize = daemonize::Daemonize::new();
-        if let Some(user) = config.user {
-            daemonize = daemonize.user(&user as &str);
+    {
+        if config.daemonize {
+            info!("Running process as daemon");
+            try_fail!(crate::util::unix_daemonize(), "Failed to daemonize: {}");
+            if let Some(ref pid_file) = config.pid_file {
+                try_fail!(fs::write(pid_file, format!("{}\n", process::id())), "Failed to write pid file {}: {}", pid_file);
+            }
         }
-        if let Some(group) = config.group {
-            daemonize = daemonize.group(&group as &str);
+        if config.user.is_some() || config.group.is_some() {
+            info!("Dropping privileges");
+            let mut pd = privdrop::PrivDrop::default();
+            if let Some(ref user) = config.user {
+                pd = pd.user(user);
+            }
+            if let Some(ref group) = config.group {
+                pd = pd.group(group);
+            }
+            try_fail!(pd.apply(), "Failed to drop privileges: {}");
         }
-        if let Some(pid_file) = config.pid_file {
-            daemonize = daemonize.pid_file(pid_file).chown_pid_file(true);
-        }
-        try_fail!(daemonize.start(), "Failed to daemonize: {}");
-    } else if config.user.is_some() || config.group.is_some() {
-        info!("Dropping privileges");
-        let mut pd = privdrop::PrivDrop::default();
-        if let Some(user) = config.user {
-            pd = pd.user(user);
-        }
-        if let Some(group) = config.group {
-            pd = pd.group(group);
-        }
-        try_fail!(pd.apply(), "Failed to drop privileges: {}");
     }
 
     #[cfg(not(unix))]

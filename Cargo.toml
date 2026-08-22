@@ -44,7 +44,7 @@ ipnet = "2.12.1"
 getifaddrs = "0.6.2"
 
 [target.'cfg(unix)'.dependencies]
-daemonize = "0.5.0"
+libc = "0.2"
 privdrop = "0.5.6"
 
 [target.'cfg(windows)'.dependencies]
