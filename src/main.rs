@@ -219,12 +219,14 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
     };
     let mut cloud =
         GenericCloud::<TunTapDevice, P, S, SystemTimeSource>::new(&config, socket, device, port_forwarding, stats_file);
-    for mut addr in config.peers {
-        if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
-            // : not present or only in IPv6 address
-            addr = format!("{}:{}", addr, DEFAULT_PORT)
+    for addr in config.peers {
+        let group: Vec<&str> = addr.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if let Some(mut first) = group.first().map(|s| (*s).to_string()) {
+            if first.find(':').unwrap_or(0) <= first.find(']').unwrap_or(0) {
+                first = format!("{}:{}", first, DEFAULT_PORT);
+            }
+            try_fail!(cloud.connect(&first as &str), "Failed to send message to {}: {}", &first);
         }
-        try_fail!(cloud.connect(&addr as &str), "Failed to send message to {}: {}", &addr);
         cloud.add_reconnect_peer(addr);
     }
     #[cfg(unix)]

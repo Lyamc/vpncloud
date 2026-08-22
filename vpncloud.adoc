@@ -54,6 +54,10 @@ vpncloud - Peer-to-peer VPN
   Address of a peer to connect to. The address should be in the form
   *addr:port*. If the node is not started, the connection will be retried
   periodically. This parameter can be repeated to connect to multiple peers.
+  To give several addresses for the *same* peer (for example a LAN address
+  with a WAN fallback), list them comma-separated in priority order:
+  *--peer 192.168.0.3:3210,172.16.0.3:3210*. VpnCloud tries the first address
+  first and only moves to the next if that peer is not connected.
 
 *--claim <subnet>*::
   The local subnets to claim. This parameter should be in the form
@@ -358,7 +362,9 @@ detailed descriptions of the options.
   *public-key*::: The public key to use. Same as *--public-key*
   *trusted-keys*::: Other public keys to trust. See *--trusted-key*
 *listen*:: The address on which to listen for data. Same as *--listen*
-*peers*:: A list of addresses to connect to. See *--connect*
+*peers*:: A list of addresses to connect to. See *--connect*.
+  Each list item is either a single *addr:port* string or a nested list of
+  alternative addresses for one peer, highest priority first.
 *peer_timeout*:: Peer timeout in seconds. Same as *--peer-timeout*
 *keepalive*:: Periodically send message to keep connections alive. Same as *--keepalive*
 *beacon*:: A key-value map with beacon settings

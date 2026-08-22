@@ -115,7 +115,7 @@ impl OldConfigFile {
             listen: self.listen.or(self.port.map(|p| format!("{}", p))),
             mode: self.mode,
             peer_timeout: self.peer_timeout,
-            peers: self.peers,
+            peers: self.peers.map(|p| p.into_iter().map(crate::config::PeerAddr::from_config_string).collect()),
             pid_file: self.pid_file,
             port_forwarding: self.port_forwarding,
             stats_file: self.stats_file,

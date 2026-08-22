@@ -7,9 +7,13 @@
 
 listen: 3210                # The port number or ip:port on which to listen for data.
 
-peers:                      # Address of a peer to connect to. 
+peers:                      # Address of a peer to connect to.
                             # The address should be in the form `addr:port`.
-                            # Put [] for an empty list
+                            # Put [] for an empty list.
+                            # Nested lists are alternative addresses for one peer
+                            # (first = highest priority), e.g.:
+                            # - - 192.168.0.3:3210
+                            #   - 172.16.0.3:3210
   - node2.example.com:3210
   - node3.example.com:3210
 

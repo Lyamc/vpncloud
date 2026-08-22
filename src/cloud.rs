@@ -69,12 +69,38 @@ struct PeerData {
 
 #[derive(Clone)]
 pub struct ReconnectEntry {
-    address: Option<(String, Time)>,
+    address: Option<(Vec<String>, Time)>,
     resolved: AddrList,
     tries: u16,
     timeout: u16,
     next: Time,
-    final_timeout: Option<Time>
+    final_timeout: Option<Time>,
+    /// When true, `resolved` is a priority list: try one address per interval, highest first.
+    prefer_order: bool,
+    try_index: usize
+}
+
+fn ensure_peer_port(addr: &str) -> String {
+    if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
+        format!("{}:{}", addr, DEFAULT_PORT)
+    } else {
+        addr.to_string()
+    }
+}
+
+fn split_peer_group(add: &str) -> Vec<String> {
+    add.split(',').map(str::trim).filter(|s| !s.is_empty()).map(ensure_peer_port).collect()
+}
+
+fn resolve_peer_group(names: &[String]) -> AddrList {
+    let mut resolved = smallvec![];
+    for name in names {
+        match resolve(name as &str) {
+            Ok(addrs) => resolved.extend(addrs),
+            Err(err) => warn!("Failed to resolve {}: {:?}", name, err)
+        }
+    }
+    resolved
 }
 
 pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
@@ -263,20 +289,17 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     /// connect to the peer if it is not already connected.
     pub fn add_reconnect_peer(&mut self, add: String) {
         let now = TS::now();
-        let resolved = match resolve(&add as &str) {
-            Ok(addrs) => addrs,
-            Err(err) => {
-                warn!("Failed to resolve {}: {:?}", add, err);
-                smallvec![]
-            }
-        };
+        let names = split_peer_group(&add);
+        let resolved = resolve_peer_group(&names);
         self.reconnect_peers.push(ReconnectEntry {
-            address: Some((add, now)),
+            prefer_order: names.len() > 1,
+            address: Some((names, now)),
             tries: 0,
             timeout: 1,
             resolved,
             next: now,
-            final_timeout: None
+            final_timeout: None,
+            try_index: 0
         })
     }
 
@@ -387,36 +410,45 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             if entry.next > now {
                 continue;
             }
-            self.connect(&entry.resolved as &[SocketAddr])?;
-        }
-        for entry in &mut self.reconnect_peers {
-            // Schedule for next second if node is connected
-            for addr in &entry.resolved {
-                if self.peers.contains_key(addr) {
-                    entry.tries = 0;
-                    entry.timeout = 1;
-                    entry.next = now + 1;
+            if entry.prefer_order {
+                if entry.resolved.iter().any(|a| self.peers.contains_key(a) || self.pending_inits.contains_key(a)) {
                     continue;
                 }
+                if !entry.resolved.is_empty() {
+                    let addr = entry.resolved[entry.try_index % entry.resolved.len()];
+                    self.connect_sock(addr)?;
+                }
+            } else {
+                self.connect(&entry.resolved as &[SocketAddr])?;
+            }
+        }
+        for entry in &mut self.reconnect_peers {
+            // Wait out an in-flight handshake before rotating to a fallback address
+            if entry.resolved.iter().any(|addr| self.pending_inits.contains_key(addr)) {
+                entry.next = now + 1;
+                continue;
+            }
+            // Schedule for next second if node is connected via any grouped address
+            if entry.resolved.iter().any(|addr| self.peers.contains_key(addr)) {
+                entry.tries = 0;
+                entry.timeout = 1;
+                entry.try_index = 0;
+                entry.next = now + 1;
+                continue;
             }
             // Resolve entries anew
-            if let Some((ref address, ref mut next_resolve)) = entry.address {
+            if let Some((ref names, ref mut next_resolve)) = entry.address {
                 if *next_resolve <= now {
-                    match resolve(address as &str) {
-                        Ok(addrs) => entry.resolved = addrs,
-                        Err(_) => {
-                            match resolve(&format!("{}:{}", address, DEFAULT_PORT)) {
-                                Ok(addrs) => entry.resolved = addrs,
-                                Err(err) => warn!("Failed to resolve {}: {}", address, err)
-                            }
-                        }
-                    }
+                    entry.resolved = resolve_peer_group(names);
                     *next_resolve = now + RESOLVE_INTERVAL;
                 }
             }
             // Ignore if next attempt is already in the future
             if entry.next > now {
                 continue;
+            }
+            if entry.prefer_order && !entry.resolved.is_empty() {
+                entry.try_index = (entry.try_index + 1) % entry.resolved.len();
             }
             // Exponential back-off: every 10 tries, the interval doubles
             entry.tries += 1;

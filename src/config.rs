@@ -16,6 +16,45 @@ use std::{cmp::max, collections::HashMap, ffi::OsStr, process, thread};
 pub const DEFAULT_PEER_TIMEOUT: u16 = 300;
 pub const DEFAULT_PORT: u16 = 3210;
 
+/// One configured peer: a single address, or several alternatives in priority order.
+///
+/// YAML accepts either a string or a nested list (first address is tried first):
+///
+/// ```yaml
+/// peers:
+///   - 172.16.0.1:3210
+///   - - 192.168.0.3:3210
+///     - 172.16.0.3:3210
+/// ```
+///
+/// On the command line, alternatives are comma-separated:
+/// `--peer 192.168.0.3:3210,172.16.0.3:3210`
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(untagged)]
+pub enum PeerAddr {
+    Single(String),
+    Group(Vec<String>)
+}
+
+impl PeerAddr {
+    pub fn into_config_string(self) -> String {
+        match self {
+            PeerAddr::Single(s) => s,
+            PeerAddr::Group(v) => v.join(",")
+        }
+    }
+
+    pub fn from_config_string(s: String) -> Self {
+        let parts: Vec<String> =
+            s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+        if parts.len() > 1 {
+            PeerAddr::Group(parts)
+        } else {
+            PeerAddr::Single(s)
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, PartialEq, Clone)]
 pub struct Config {
     pub device_type: Type,
@@ -129,8 +168,8 @@ impl Config {
         if let Some(val) = file.listen {
             self.listen = val;
         }
-        if let Some(mut val) = file.peers {
-            self.peers.append(&mut val);
+        if let Some(val) = file.peers {
+            self.peers.extend(val.into_iter().map(PeerAddr::into_config_string));
         }
         if let Some(val) = file.peer_timeout {
             self.peer_timeout = val;
@@ -343,7 +382,7 @@ impl Config {
             listen: Some(self.listen),
             mode: Some(self.mode),
             peer_timeout: Some(self.peer_timeout),
-            peers: Some(self.peers),
+            peers: Some(self.peers.into_iter().map(PeerAddr::from_config_string).collect()),
             pid_file: self.pid_file,
             port_forwarding: Some(self.port_forwarding),
             stats_file: self.stats_file,
@@ -449,7 +488,7 @@ pub struct Args {
     #[arg(short, long)]
     pub listen: Option<String>,
 
-    /// Address of a peer to connect to
+    /// Address of a peer to connect to. Comma-separated addresses are tried in order as alternatives for the same peer.
     #[arg(short = 'c', long = "peer", alias = "connect")]
     pub peers: Vec<String>,
 
@@ -648,7 +687,7 @@ pub struct ConfigFile {
 
     pub crypto: CryptoConfig,
     pub listen: Option<String>,
-    pub peers: Option<Vec<String>>,
+    pub peers: Option<Vec<PeerAddr>>,
     pub peer_timeout: Option<Duration>,
     pub keepalive: Option<Duration>,
 
@@ -717,7 +756,10 @@ statsd:
         ifdown: Some("true".to_string()),
         crypto: CryptoConfig::default(),
         listen: None,
-        peers: Some(vec!["remote.machine.foo:3210".to_string(), "remote.machine.bar:3210".to_string()]),
+        peers: Some(vec![
+            PeerAddr::Single("remote.machine.foo:3210".to_string()),
+            PeerAddr::Single("remote.machine.bar:3210".to_string())
+        ]),
         peer_timeout: Some(600),
         keepalive: Some(840),
         beacon: Some(ConfigFileBeacon {
@@ -766,7 +808,10 @@ fn config_merge() {
         ifdown: Some("true".to_string()),
         crypto: CryptoConfig::default(),
         listen: None,
-        peers: Some(vec!["remote.machine.foo:3210".to_string(), "remote.machine.bar:3210".to_string()]),
+        peers: Some(vec![
+            PeerAddr::Single("remote.machine.foo:3210".to_string()),
+            PeerAddr::Single("remote.machine.bar:3210".to_string())
+        ]),
         peer_timeout: Some(600),
         keepalive: Some(840),
         beacon: Some(ConfigFileBeacon {
@@ -886,4 +931,28 @@ fn config_merge() {
         hook: None,
         hooks: HashMap::new()
     });
+}
+
+#[test]
+fn peer_group_yaml() {
+    let yaml = "
+peers:
+  - 172.16.0.1:3210
+  - - 192.168.0.3:3210
+    - 172.16.0.3:3210
+";
+    let file: ConfigFile = serde_norway::from_str(yaml).unwrap();
+    assert_eq!(
+        file.peers,
+        Some(vec![
+            PeerAddr::Single("172.16.0.1:3210".to_string()),
+            PeerAddr::Group(vec!["192.168.0.3:3210".to_string(), "172.16.0.3:3210".to_string()])
+        ])
+    );
+    let mut config = Config::default();
+    config.merge_file(file);
+    assert_eq!(
+        config.peers,
+        vec!["172.16.0.1:3210".to_string(), "192.168.0.3:3210,172.16.0.3:3210".to_string()]
+    );
 }
