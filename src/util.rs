@@ -6,14 +6,20 @@ use std::{
     fmt,
     net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     process::Command,
-    sync::atomic::{AtomicIsize, Ordering}
+    sync::{
+        atomic::{AtomicBool, AtomicIsize, Ordering},
+        Arc
+    },
+    time::Instant
 };
 
 use crate::error::Error;
 
-use signal::{trap::Trap, Signal};
+use signal_hook::{
+    consts::{SIGINT, SIGQUIT, SIGTERM},
+    flag
+};
 use smallvec::SmallVec;
-use std::time::Instant;
 
 pub type Duration = u32;
 pub type Time = i64;
@@ -262,8 +268,7 @@ impl fmt::Display for Bytes {
 }
 
 pub struct CtrlC {
-    dummy_time: Instant,
-    trap: Trap
+    flag: Arc<AtomicBool>
 }
 
 impl CtrlC {
@@ -271,19 +276,18 @@ impl CtrlC {
         Default::default()
     }
 
-    // Use the Trap iterator interface. `next()` requires a mutable reference,
-    // so make this method take `&mut self` and check whether any signal is
-    // available by calling `next()`. This avoids relying on `wait(...)`.
     pub fn was_pressed(&mut self) -> bool {
-        self.trap.next().is_some()
+        self.flag.swap(false, Ordering::Relaxed)
     }
 }
 
 impl Default for CtrlC {
     fn default() -> Self {
-        let dummy_time = Instant::now();
-        let trap = Trap::trap(&[Signal::SIGINT, Signal::SIGTERM, Signal::SIGQUIT]);
-        Self { dummy_time, trap }
+        let flag = Arc::new(AtomicBool::new(false));
+        for sig in [SIGINT, SIGTERM, SIGQUIT] {
+            let _ = flag::register(sig, Arc::clone(&flag));
+        }
+        Self { flag }
     }
 }
 

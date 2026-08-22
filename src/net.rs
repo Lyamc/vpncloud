@@ -6,8 +6,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{self, ErrorKind},
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration
+    sync::atomic::{AtomicBool, Ordering}
 };
 
 #[cfg(unix)]
@@ -219,7 +218,7 @@ mod tests {
                     return;
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(e) => panic!("receive failed: {}", e)
             }

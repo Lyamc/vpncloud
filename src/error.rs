@@ -51,5 +51,5 @@ pub enum Error {
     Parse(&'static str),
 
     #[error("Name can not be resolved: {0}")]
-    NameUnresolvable(String),
+    NameUnresolvable(String)
 }

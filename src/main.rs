@@ -18,8 +18,7 @@ pub mod config;
 pub mod crypto;
 pub mod device;
 pub mod error;
-#[cfg(feature = "installer")]
-pub mod installer;
+#[cfg(feature = "installer")] pub mod installer;
 pub mod messages;
 pub mod net;
 pub mod oldconfig;
@@ -29,12 +28,10 @@ pub mod port_forwarding;
 pub mod table;
 pub mod traffic;
 pub mod types;
-#[cfg(feature = "wizard")]
-pub mod wizard;
-#[cfg(feature = "websocket")]
-pub mod wsproxy;
+#[cfg(feature = "wizard")] pub mod wizard;
+#[cfg(feature = "websocket")] pub mod wsproxy;
 
-use structopt::StructOpt;
+use clap::{CommandFactory, Parser};
 
 use std::{
     fs::{self, File, Permissions},
@@ -230,7 +227,7 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
         }
         try_fail!(pd.apply(), "Failed to drop privileges: {}");
     }
-    
+
     #[cfg(not(unix))]
     if config.daemonize || config.user.is_some() || config.group.is_some() {
         warn!("Daemonizing and privilege dropping are not supported on this platform.");
@@ -242,7 +239,7 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
 }
 
 fn main() {
-    let args: Args = Args::from_args();
+    let args: Args = Args::parse();
     if args.version {
         println!("VpnCloud v{}", env!("CARGO_PKG_VERSION"));
         return;
@@ -288,7 +285,8 @@ fn main() {
                 try_fail!(serde_yaml::to_writer(f, &new_config), "Failed to write converted config: {:?}");
             }
             Command::Completion { shell } => {
-                Args::clap().gen_completions_to(env!("CARGO_PKG_NAME"), shell, &mut io::stdout());
+                let mut cmd = Args::command();
+                clap_complete::generate(shell, &mut cmd, env!("CARGO_PKG_NAME"), &mut io::stdout());
             }
             #[cfg(feature = "websocket")]
             Command::WsProxy { listen } => {

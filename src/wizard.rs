@@ -134,7 +134,7 @@ fn configure_crypto(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid crypto algorithms"))?;
         let algos = MultiSelect::with_theme(theme)
             .with_prompt("Allowed encryption algorithms (select multiple)")
-            .items_checked(&[
+            .items_checked([
                 ("Unencrypted (dangerous)", unencrypted),
                 ("AES-128 in GCM mode", allowed_algos.contains(&&aead::AES_128_GCM)),
                 ("AES-256 in GCM mode", allowed_algos.contains(&&aead::AES_256_GCM)),

@@ -44,13 +44,13 @@
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use ring::{
     aead::{self, LessSafeKey, UnboundKey},
-    rand::{SecureRandom, SystemRandom},
+    rand::{SecureRandom, SystemRandom}
 };
 
 use std::{
     io::{Cursor, Read, Write},
     mem,
-    time::{Duration, Instant},
+    time::{Duration, Instant}
 };
 
 use crate::{error::Error, util::MsgBuffer};
@@ -105,7 +105,7 @@ struct CryptoKey {
     send_nonce: Nonce,
     min_nonce: Nonce,
     next_min_nonce: Nonce,
-    seen_nonce: Nonce,
+    seen_nonce: Nonce
 }
 
 impl CryptoKey {
@@ -117,7 +117,7 @@ impl CryptoKey {
             send_nonce,
             min_nonce: Nonce::zero(),
             next_min_nonce: Nonce::zero(),
-            seen_nonce: Nonce::zero(),
+            seen_nonce: Nonce::zero()
         }
     }
 
@@ -132,7 +132,7 @@ pub struct CryptoCore {
     rand: SystemRandom,
     keys: [CryptoKey; 4],
     current_key: usize,
-    nonce_half: bool,
+    nonce_half: bool
 }
 
 impl CryptoCore {
@@ -147,11 +147,11 @@ impl CryptoCore {
                 CryptoKey::new(&rand, key, nonce_half),
                 CryptoKey::new(&rand, dummy_key1, nonce_half),
                 CryptoKey::new(&rand, dummy_key2, nonce_half),
-                CryptoKey::new(&rand, dummy_key3, nonce_half),
+                CryptoKey::new(&rand, dummy_key3, nonce_half)
             ],
             current_key: 0,
             nonce_half,
-            rand,
+            rand
         }
     }
 

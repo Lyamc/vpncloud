@@ -16,7 +16,10 @@ use std::{
 };
 
 use fnv::FnvHasher;
-use rand::{random, seq::SliceRandom, thread_rng};
+use rand::{
+    random, rng,
+    seq::{IndexedRandom, SliceRandom}
+};
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
@@ -309,8 +312,8 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             peers.push(PeerInfo { node_id: Some(peer.node_id), addrs: peer.addrs.clone() })
         }
         if peers.len() > 20 {
-            let mut rng = rand::thread_rng();
-            peers.partial_shuffle(&mut rng, 20);
+            let mut rng = rng();
+            let _ = peers.partial_shuffle(&mut rng, 20);
             peers.truncate(20);
         }
         NodeInfo {
@@ -487,8 +490,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     /// Stores the beacon
     fn store_beacon(&mut self) -> Result<(), Error> {
         if let Some(ref path) = self.config.beacon_store {
-            let peers: SmallVec<[SocketAddr; 3]> =
-                self.own_addresses.choose_multiple(&mut thread_rng(), 3).cloned().collect();
+            let peers: SmallVec<[SocketAddr; 3]> = self.own_addresses.sample(&mut rng(), 3).cloned().collect();
             if let Some(path) = path.strip_prefix('|') {
                 self.beacon_serializer
                     .write_to_cmd(&peers, path)

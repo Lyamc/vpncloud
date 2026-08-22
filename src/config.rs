@@ -9,8 +9,9 @@ use super::{
 };
 pub use crate::crypto::Config as CryptoConfig;
 
+use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 use std::{cmp::max, collections::HashMap, ffi::OsStr, process, thread};
-use structopt::{clap::Shell, StructOpt};
 
 pub const DEFAULT_PEER_TIMEOUT: u16 = 300;
 pub const DEFAULT_PORT: u16 = 3210;
@@ -376,199 +377,200 @@ impl Config {
     }
 }
 
-#[derive(StructOpt, Debug, Default)]
+#[derive(Parser, Debug, Default)]
+#[command(name = "vpncloud", disable_version_flag = true)]
 pub struct Args {
     /// Read configuration options from the specified file.
-    #[structopt(long)]
+    #[arg(long)]
     pub config: Option<String>,
 
-    /// Set the type of network
-    #[structopt(name = "type", short, long, possible_values=&["tun", "tap"])]
+    /// Set the type of network [possible values: tun, tap]
+    #[arg(short, long, value_name = "type")]
     pub type_: Option<Type>,
 
     /// Set the path of the base device
-    #[structopt(long)]
+    #[arg(long)]
     pub device_path: Option<String>,
 
     /// Fix the rp_filter settings on the host
-    #[structopt(long)]
+    #[arg(long)]
     pub fix_rp_filter: bool,
 
-    /// The mode of the VPN
-    #[structopt(short, long, possible_values=&["normal", "router", "switch", "hub"])]
+    /// The mode of the VPN [possible values: normal, router, switch, hub]
+    #[arg(short, long)]
     pub mode: Option<Mode>,
 
     /// The shared password to encrypt all traffic
-    #[structopt(short, long, env)]
+    #[arg(short, long, env = "PASSWORD")]
     pub password: Option<String>,
 
     /// The private key to use
-    #[structopt(long, alias = "key", conflicts_with = "password", env)]
+    #[arg(long, alias = "key", conflicts_with = "password", env = "PRIVATE_KEY")]
     pub private_key: Option<String>,
 
     /// The public key to use
-    #[structopt(long)]
+    #[arg(long)]
     pub public_key: Option<String>,
 
     /// Other public keys to trust
-    #[structopt(long = "trusted-key", alias = "trust", use_delimiter = true)]
+    #[arg(long = "trusted-key", alias = "trust", value_delimiter = ',')]
     pub trusted_keys: Vec<String>,
 
-    /// Algorithms to allow
-    #[structopt(long = "algorithm", alias = "algo", use_delimiter=true, case_insensitive = true, possible_values=&["plain", "aes128", "aes256", "chacha20"])]
+    /// Algorithms to allow [possible values: plain, aes128, aes256, chacha20]
+    #[arg(long = "algorithm", alias = "algo", value_delimiter = ',', ignore_case = true, value_parser = ["plain", "aes128", "aes256", "chacha20"])]
     pub algorithms: Vec<String>,
 
     /// The local subnets to claim (IP or IP/prefix)
-    #[structopt(long = "claim", use_delimiter = true)]
+    #[arg(long = "claim", value_delimiter = ',')]
     pub claims: Vec<String>,
 
     /// Do not automatically claim the device ip
-    #[structopt(long)]
+    #[arg(long)]
     pub no_auto_claim: bool,
 
     /// Name of the virtual device
-    #[structopt(short, long)]
+    #[arg(short, long)]
     pub device: Option<String>,
 
     /// The port number (or ip:port) on which to listen for data
-    #[structopt(short, long)]
+    #[arg(short, long)]
     pub listen: Option<String>,
 
     /// Address of a peer to connect to
-    #[structopt(short = "c", long = "peer", alias = "connect")]
+    #[arg(short = 'c', long = "peer", alias = "connect")]
     pub peers: Vec<String>,
 
     /// Peer timeout in seconds
-    #[structopt(long)]
+    #[arg(long)]
     pub peer_timeout: Option<Duration>,
 
     /// Periodically send message to keep connections alive
-    #[structopt(long)]
+    #[arg(long)]
     pub keepalive: Option<Duration>,
 
     /// Switch table entry timeout in seconds
-    #[structopt(long)]
+    #[arg(long)]
     pub switch_timeout: Option<Duration>,
 
     /// The file path or |command to store the beacon
-    #[structopt(long)]
+    #[arg(long)]
     pub beacon_store: Option<String>,
 
     /// The file path or |command to load the beacon
-    #[structopt(long)]
+    #[arg(long)]
     pub beacon_load: Option<String>,
 
     /// Beacon store/load interval in seconds
-    #[structopt(long)]
+    #[arg(long)]
     pub beacon_interval: Option<Duration>,
 
     /// Password to encrypt the beacon with
-    #[structopt(long)]
+    #[arg(long)]
     pub beacon_password: Option<String>,
 
     /// Print debug information
-    #[structopt(short, long, conflicts_with = "quiet")]
+    #[arg(short, long, conflicts_with = "quiet")]
     pub verbose: bool,
 
     /// Only print errors and warnings
-    #[structopt(short, long)]
+    #[arg(short, long)]
     pub quiet: bool,
 
     /// An IP address (plus optional prefix length) for the interface
-    #[structopt(long)]
+    #[arg(long)]
     pub ip: Option<String>,
 
     /// A list of IP Addresses to advertise as our external address(s)
-    #[structopt(long = "advertise_addresses", use_delimiter = true)]
+    #[arg(long = "advertise_addresses", value_delimiter = ',')]
     pub advertise_addresses: Vec<String>,
 
     /// A command to setup the network interface
-    #[structopt(long)]
+    #[arg(long)]
     pub ifup: Option<String>,
 
     /// A command to bring down the network interface
-    #[structopt(long)]
+    #[arg(long)]
     pub ifdown: Option<String>,
 
     /// Print the version and exit
-    #[structopt(long)]
+    #[arg(long)]
     pub version: bool,
 
     /// Disable automatic port forwarding
-    #[structopt(long)]
+    #[arg(long)]
     pub no_port_forwarding: bool,
 
     /// Run the process in the background
-    #[structopt(long)]
+    #[arg(long)]
     pub daemon: bool,
 
     /// Store the process id in this file when daemonizing
-    #[structopt(long)]
+    #[arg(long)]
     pub pid_file: Option<String>,
 
     /// Print statistics to this file
-    #[structopt(long)]
+    #[arg(long)]
     pub stats_file: Option<String>,
 
     /// Send statistics to this statsd server
-    #[structopt(long)]
+    #[arg(long)]
     pub statsd_server: Option<String>,
 
     /// Use the given prefix for statsd records
-    #[structopt(long, requires = "statsd-server")]
+    #[arg(long, requires = "statsd_server")]
     pub statsd_prefix: Option<String>,
 
     /// Run as other user
-    #[structopt(long)]
+    #[arg(long)]
     pub user: Option<String>,
 
     /// Run as other group
-    #[structopt(long)]
+    #[arg(long)]
     pub group: Option<String>,
 
     /// Print logs also to this file
-    #[structopt(long)]
+    #[arg(long)]
     pub log_file: Option<String>,
 
     /// Call script on event
-    #[structopt(long)]
+    #[arg(long)]
     pub hook: Vec<String>,
 
-    #[structopt(subcommand)]
+    #[command(subcommand)]
     pub cmd: Option<Command>
 }
 
-#[derive(StructOpt, Debug)]
+#[derive(Subcommand, Debug)]
 pub enum Command {
     /// Generate and print a key-pair and exit
-    #[structopt(name = "genkey", alias = "gen-key")]
+    #[command(name = "genkey", alias = "gen-key")]
     GenKey {
         /// The shared password to encrypt all traffic
-        #[structopt(short, long, env)]
+        #[arg(short, long, env = "PASSWORD")]
         password: Option<String>
     },
 
     /// Run a websocket proxy
     #[cfg(feature = "websocket")]
-    #[structopt(alias = "wsproxy")]
+    #[command(alias = "wsproxy")]
     WsProxy {
         /// Websocket listen address IP:PORT
-        #[structopt(long, short, default_value = "3210")]
+        #[arg(long, short, default_value = "3210")]
         listen: String
     },
 
     /// Migrate an old config file
-    #[structopt(alias = "migrate")]
+    #[command(alias = "migrate")]
     MigrateConfig {
         /// Config file
-        #[structopt(long)]
+        #[arg(long)]
         config_file: String
     },
 
     /// Generate shell completions
     Completion {
         /// Shell to create completions for
-        #[structopt(long, default_value = "bash")]
+        #[arg(long, default_value = "bash")]
         shell: Shell
     },
 
@@ -576,12 +578,12 @@ pub enum Command {
     #[cfg(feature = "wizard")]
     Config {
         /// Name of the network
-        #[structopt(short, long)]
+        #[arg(short, long)]
         name: Option<String>,
 
         /// Path where the configuration file will be written/installed (overrides default /etc/vpncloud/<name>.net)
         /// Example: --config /etc/vpncloud/myvpn.net
-        #[structopt(long = "config")]
+        #[arg(long = "config")]
         config_file: Option<String>
     },
 
@@ -589,7 +591,7 @@ pub enum Command {
     #[cfg(feature = "installer")]
     Install {
         /// Remove installed files again
-        #[structopt(long)]
+        #[arg(long)]
         uninstall: bool
     }
 }

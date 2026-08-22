@@ -6,13 +6,13 @@ use super::{
     net::{get_ip, mapped_addr, parse_listen, Socket},
     poll::{WaitImpl, WaitResult},
     port_forwarding::PortForwarding,
-    util::MsgBuffer,
+    util::MsgBuffer
 };
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use std::{
     io::{self, Cursor, Read, Write},
     net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener, TcpStream, UdpSocket},
-    thread::spawn,
+    thread::spawn
 };
 
 #[cfg(unix)]
@@ -21,7 +21,12 @@ use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, RawSocket};
 
-use tungstenite::{connect, protocol::WebSocket, Message, accept, stream::{MaybeTlsStream, NoDelay}};
+use tungstenite::{
+    accept, connect,
+    protocol::WebSocket,
+    stream::{MaybeTlsStream, NoDelay},
+    Message
+};
 use url::Url;
 
 macro_rules! io_error {
@@ -40,7 +45,7 @@ fn write_addr<W: Write>(addr: SocketAddr, mut out: W) -> Result<(), io::Error> {
             out.write_all(&addr.ip().octets())?;
             out.write_u16::<NetworkEndian>(addr.port())?;
         }
-        _ => unreachable!(),
+        _ => unreachable!()
     }
     Ok(())
 }
@@ -64,8 +69,8 @@ fn serve_proxy_connection(stream: TcpStream) -> Result<(), io::Error> {
     info!("Listening on {} for peer {}", addr, peer);
     addr.set_ip(get_ip());
     write_addr(addr, &mut msg)?;
-    io_error!(websocket.send(Message::Binary(msg)), "Failed to write to ws connection: {}")?;
-    
+    io_error!(websocket.send(Message::binary(msg)), "Failed to write to ws connection: {}")?;
+
     let poll = WaitImpl::new(websocket.get_ref(), &udpsocket, 60 * 1000)?;
     let mut buffer = [0; 65535];
     for evt in poll {
@@ -86,12 +91,12 @@ fn serve_proxy_connection(stream: TcpStream) -> Result<(), io::Error> {
                 let mut data = Vec::with_capacity(18 + size);
                 write_addr(addr, &mut data)?;
                 data.write_all(&buffer[..size])?;
-                io_error!(websocket.send(Message::Binary(data)), "Failed to write to {}: {}", peer)?;
+                io_error!(websocket.send(Message::binary(data)), "Failed to write to {}: {}", peer)?;
             }
             WaitResult::Timeout => {
-                io_error!(websocket.send(Message::Ping(vec![])), "Failed to send ping: {}")?;
+                io_error!(websocket.send(Message::Ping(Vec::<u8>::new().into())), "Failed to send ping: {}")?;
             }
-            WaitResult::Error(err) => return Err(err),
+            WaitResult::Error(err) => return Err(err)
         }
     }
     Ok(())
@@ -115,14 +120,14 @@ pub fn run_proxy(listen: &str) -> Result<(), io::Error> {
 
 pub struct ProxyConnection {
     addr: SocketAddr,
-    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    socket: WebSocket<MaybeTlsStream<TcpStream>>
 }
 
 impl ProxyConnection {
     fn read_message(&mut self) -> Result<Vec<u8>, io::Error> {
         loop {
             if let Message::Binary(data) = io_error!(self.socket.read(), "Failed to read from ws proxy: {}")? {
-                return Ok(data);
+                return Ok(data.to_vec());
             }
         }
     }
@@ -150,8 +155,8 @@ impl AsRawSocket for ProxyConnection {
 
 impl Socket for ProxyConnection {
     fn listen(url: &str) -> Result<Self, io::Error> {
-        let parsed_url = io_error!(Url::parse(url), "Invalid URL {}: {}", url)?;
-        let (mut socket, _) = io_error!(connect(parsed_url), "Failed to connect to URL {}: {}", url)?;
+        io_error!(Url::parse(url), "Invalid URL {}: {}", url)?;
+        let (mut socket, _) = io_error!(connect(url), "Failed to connect to URL {}: {}", url)?;
         socket.get_mut().set_nodelay(true)?;
         let addr = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
         let mut con = ProxyConnection { addr, socket };
@@ -172,7 +177,7 @@ impl Socket for ProxyConnection {
         let mut msg = Vec::with_capacity(data.len() + 18);
         write_addr(addr, &mut msg)?;
         msg.write_all(data)?;
-        io_error!(self.socket.send(Message::Binary(msg)), "Failed to write to ws proxy: {}")?;
+        io_error!(self.socket.send(Message::binary(msg)), "Failed to write to ws proxy: {}")?;
         Ok(data.len())
     }
 

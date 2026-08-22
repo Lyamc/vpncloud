@@ -15,41 +15,41 @@ toolchain = "1.75.0"
 upx_version = "4.2.2"
 
 [dependencies]
-chrono = { version = "0.4", features = [
+chrono = { version = "0.4.45", features = [
     "std",
     "clock",
 ], default-features = false }
-socket2 = "0.6"
-structopt = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
-log = { version = "0.4", features = ["std"] }
-signal = "0.7"
-rand = "0.8"
+socket2 = "0.6.5"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+clap_complete = "4.6.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_yaml = "0.9.34"
+log = { version = "0.4.34", features = ["std"] }
+signal-hook = "0.4.4"
+rand = "0.10.2"
 
-fnv = "1"
-yaml-rust = "0.4"
-daemonize = "0.5"
-ring = "0.17"
-privdrop = "0.5"
-byteorder = "1.4"
-thiserror = "1.0"
-smallvec = "1.7"
-lazy_static = "1.4"
-dialoguer = { version = "0.11", optional = true }
-tungstenite = { version = "0.21", optional = true }
-url = { version = "2.2", optional = true }
-igd = { version = "0.12", optional = true }
-mio = { version = "1.0.4", features = ["os-poll", "net"] }
-tun-rs = { version = "2.8.2", features = ["async"] }
-ipnet = "2.11.0"
-getifaddrs = "0.6"
+fnv = "1.0.7"
+daemonize = "0.5.0"
+ring = "0.17.14"
+privdrop = "0.5.6"
+byteorder = "1.5.0"
+thiserror = "2.0.20"
+smallvec = "1.15.2"
+lazy_static = "1.5.0"
+dialoguer = { version = "0.12.0", optional = true }
+tungstenite = { version = "0.30.0", optional = true }
+url = { version = "2.5.8", optional = true }
+igd = { version = "0.12.1", optional = true }
+mio = { version = "1.2.2", features = ["os-poll", "net"] }
+tun-rs = { version = "2.8.8", features = ["async"] }
+ipnet = "2.12.1"
+getifaddrs = "0.6.2"
 
 
 [dev-dependencies]
-tempfile = "3"
-criterion = { version = "0.5", features = ["html_reports"] }
-iai = "0.1"
+tempfile = "3.27.0"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+iai = "0.1.1"
 
 [features]
 default = ["nat", "websocket", "wizard"]

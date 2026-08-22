@@ -19,7 +19,7 @@ mod internal {
         pub internal_addr: SocketAddrV4,
         pub external_addr: SocketAddrV4,
         gateway: Gateway,
-        pub next_extension: Option<Time>,
+        pub next_extension: Option<Time>
     }
 
     impl PortForwarding {
@@ -135,10 +135,10 @@ mod internal {
                 self.external_addr.port(),
                 self.internal_addr,
                 LEASE_TIME,
-                DESCRIPTION,
+                DESCRIPTION
             ) {
                 Ok(()) => debug!("Port-forwarding: extended port forwarding"),
-                Err(err) => debug!("Port-forwarding: failed to extend port forwarding: {}", err),
+                Err(err) => debug!("Port-forwarding: failed to extend port forwarding: {}", err)
             };
             self.next_extension = Some(SystemTimeSource::now() + Time::from(LEASE_TIME) - 60);
         }
@@ -146,7 +146,7 @@ mod internal {
         fn deactivate(&self) {
             match self.gateway.remove_port(PortMappingProtocol::UDP, self.external_addr.port()) {
                 Ok(()) => info!("Port-forwarding: successfully deactivated port forwarding"),
-                Err(err) => debug!("Port-forwarding: failed to deactivate port forwarding: {}", err),
+                Err(err) => debug!("Port-forwarding: failed to deactivate port forwarding: {}", err)
             }
         }
 

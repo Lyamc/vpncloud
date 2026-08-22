@@ -6,13 +6,13 @@ use crate::{
     crypto::Payload,
     error::Error,
     types::{NodeId, Range, RangeList, NODE_ID_BYTES},
-    util::MsgBuffer,
+    util::MsgBuffer
 };
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use smallvec::{smallvec, SmallVec};
 use std::{
     io::{self, Cursor, Read, Seek, SeekFrom, Take, Write},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6}
 };
 
 pub const MESSAGE_TYPE_DATA: u8 = 0;
@@ -26,7 +26,7 @@ pub type PeerList = SmallVec<[PeerInfo; 16]>;
 #[derive(Debug, PartialEq)]
 pub struct PeerInfo {
     pub node_id: Option<NodeId>,
-    pub addrs: AddrList,
+    pub addrs: AddrList
 }
 
 #[derive(Debug, PartialEq)]
@@ -35,16 +35,16 @@ pub struct NodeInfo {
     pub peers: PeerList,
     pub claims: RangeList,
     pub peer_timeout: Option<u16>,
-    pub addrs: AddrList,
+    pub addrs: AddrList
 }
 
 impl NodeInfo {
+    const PART_ADDRS: u8 = 5;
     const PART_CLAIMS: u8 = 2;
     const PART_END: u8 = 0;
     const PART_NODEID: u8 = 4;
     const PART_PEERS: u8 = 1;
     const PART_PEER_TIMEOUT: u8 = 3;
-    const PART_ADDRS: u8 = 5;
 
     fn read_addr_list<R: Read>(r: &mut Take<R>) -> Result<AddrList, io::Error> {
         let flags = r.read_u8()?;
@@ -136,7 +136,7 @@ impl NodeInfo {
         }
         let node_id = match node_id {
             Some(node_id) => node_id,
-            None => return Err(Error::Message("Payload without node_id")),
+            None => return Err(Error::Message("Payload without node_id"))
         };
         Ok(Self { node_id, peers, claims, peer_timeout, addrs })
     }
@@ -152,7 +152,7 @@ impl NodeInfo {
             for a in &p.addrs {
                 match a {
                     SocketAddr::V4(addr) => addr_ipv4.push(*addr),
-                    SocketAddr::V6(addr) => addr_ipv6.push(*addr),
+                    SocketAddr::V6(addr) => addr_ipv6.push(*addr)
                 }
             }
             while addr_ipv4.len() >= 8 {
@@ -187,7 +187,7 @@ impl NodeInfo {
         for a in &self.addrs {
             match a {
                 SocketAddr::V4(addr) => addr_ipv4.push(*addr),
-                SocketAddr::V6(addr) => addr_ipv6.push(*addr),
+                SocketAddr::V6(addr) => addr_ipv6.push(*addr)
             }
         }
         while addr_ipv4.len() >= 8 {
@@ -210,7 +210,7 @@ impl NodeInfo {
     }
 
     fn encode_part<F: FnOnce(&mut Cursor<&mut [u8]>) -> Result<(), io::Error>>(
-        cursor: &mut Cursor<&mut [u8]>, part: u8, f: F,
+        cursor: &mut Cursor<&mut [u8]>, part: u8, f: F
     ) -> Result<(), io::Error> {
         cursor.write_u8(part)?;
         cursor.write_u16::<NetworkEndian>(0)?;

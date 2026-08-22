@@ -15,9 +15,9 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex
     },
-    thread,
+    thread
 };
 
 use super::util::{from_base62, to_base62, Encoder, TimeSource};
@@ -39,14 +39,14 @@ fn sha512(data: &[u8]) -> SmallVec<[u8; 64]> {
 
 struct FutureResult<T> {
     has_result: AtomicBool,
-    result: Mutex<T>,
+    result: Mutex<T>
 }
 
 #[derive(Clone)]
 pub struct BeaconSerializer<TS> {
     shared_key: Vec<u8>,
     future_peers: Arc<FutureResult<Vec<SocketAddr>>>,
-    _dummy_ts: PhantomData<TS>,
+    _dummy_ts: PhantomData<TS>
 }
 
 impl<TS: TimeSource> BeaconSerializer<TS> {
@@ -54,7 +54,7 @@ impl<TS: TimeSource> BeaconSerializer<TS> {
         Self {
             shared_key: shared_key.to_owned(),
             future_peers: Arc::new(FutureResult { has_result: AtomicBool::new(false), result: Mutex::new(Vec::new()) }),
-            _dummy_ts: PhantomData,
+            _dummy_ts: PhantomData
         }
     }
 
@@ -121,7 +121,7 @@ impl<TS: TimeSource> BeaconSerializer<TS> {
         for p in peers {
             match *p {
                 SocketAddr::V4(addr) => v4addrs.push(addr),
-                SocketAddr::V6(addr) => v6addrs.push(addr),
+                SocketAddr::V6(addr) => v6addrs.push(addr)
             }
         }
         // Add count of v4 addresses
@@ -197,7 +197,7 @@ impl<TS: TimeSource> BeaconSerializer<TS> {
                 Ipv6Addr::new(ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]),
                 port,
                 0,
-                0,
+                0
             ));
             peers.push(addr);
         }
@@ -269,7 +269,7 @@ impl<TS: TimeSource> BeaconSerializer<TS> {
     }
 
     pub fn read_from_file<P: AsRef<Path>>(
-        &self, path: P, ttl_hours: Option<u16>,
+        &self, path: P, ttl_hours: Option<u16>
     ) -> Result<Vec<SocketAddr>, io::Error> {
         let mut f = File::open(&path)?;
         let mut contents = String::new();
@@ -316,12 +316,9 @@ impl<TS: TimeSource> BeaconSerializer<TS> {
     }
 }
 
-#[cfg(test)]
-use crate::util::MockTimeSource;
-#[cfg(test)]
-use std::str::FromStr;
-#[cfg(test)]
-use std::time::Duration;
+#[cfg(test)] use crate::util::MockTimeSource;
+#[cfg(test)] use std::str::FromStr;
+#[cfg(test)] use std::time::Duration;
 
 #[test]
 fn encode() {

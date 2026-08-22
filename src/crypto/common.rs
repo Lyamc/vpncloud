@@ -1,19 +1,19 @@
 use super::{
     core::{test_speed, CryptoCore},
     init::{self, InitResult, InitState, CLOSING},
-    rotate::RotationState,
+    rotate::RotationState
 };
 use crate::{
     error::Error,
     types::NodeId,
-    util::{from_base62, to_base62, MsgBuffer},
+    util::{from_base62, to_base62, MsgBuffer}
 };
 use ring::{
     aead::{self, Algorithm, LessSafeKey, UnboundKey},
     agreement::{EphemeralPrivateKey, UnparsedPublicKey},
     pbkdf2,
     rand::{SecureRandom, SystemRandom},
-    signature::{Ed25519KeyPair, KeyPair, ED25519_PUBLIC_KEY_LEN},
+    signature::{Ed25519KeyPair, KeyPair, ED25519_PUBLIC_KEY_LEN}
 };
 use smallvec::{smallvec, SmallVec};
 use std::{fmt::Debug, io::Read, num::NonZeroU32, sync::Arc, time::Duration};
@@ -44,7 +44,7 @@ pub trait Payload: Debug + PartialEq + Sized {
 #[derive(Clone)]
 pub struct Algorithms {
     pub algorithm_speeds: SmallVec<[(&'static Algorithm, f32); 3]>,
-    pub allow_unencrypted: bool,
+    pub allow_unencrypted: bool
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
@@ -54,14 +54,14 @@ pub struct Config {
     pub private_key: Option<String>,
     pub public_key: Option<String>,
     pub trusted_keys: Vec<String>,
-    pub algorithms: Vec<String>,
+    pub algorithms: Vec<String>
 }
 
 pub struct Crypto {
     node_id: NodeId,
     key_pair: Arc<Ed25519KeyPair>,
     trusted_keys: Arc<[Ed25519PublicKey]>,
-    algorithms: Algorithms,
+    algorithms: Algorithms
 }
 
 impl Crypto {
@@ -79,7 +79,7 @@ impl Crypto {
                 "AES128" | "AES128_GCM" | "AES_128" | "AES_128_GCM" => &aead::AES_128_GCM,
                 "AES256" | "AES256_GCM" | "AES_256" | "AES_256_GCM" => &aead::AES_256_GCM,
                 "CHACHA" | "CHACHA20" | "CHACHA20_POLY1305" => &aead::CHACHA20_POLY1305,
-                _ => return Err(Error::InvalidConfig("Unknown crypto method")),
+                _ => return Err(Error::InvalidConfig("Unknown crypto method"))
             };
             algos.push(algo)
         }
@@ -130,7 +130,7 @@ impl Crypto {
             node_id,
             key_pair: Arc::new(key_pair),
             trusted_keys: trusted_keys.into_boxed_slice().into(),
-            algorithms: algos,
+            algorithms: algos
         })
     }
 
@@ -147,7 +147,7 @@ impl Crypto {
                     NonZeroU32::new(4096).unwrap(),
                     SALT,
                     password.as_bytes(),
-                    &mut bytes,
+                    &mut bytes
                 );
             }
         }
@@ -199,7 +199,7 @@ impl Crypto {
             payload,
             self.key_pair.clone(),
             self.trusted_keys.clone(),
-            self.algorithms.clone(),
+            self.algorithms.clone()
         )
     }
 }
@@ -210,7 +210,7 @@ pub enum MessageResult<P: Payload> {
     Initialized(P),
     InitializedWithReply(P),
     Reply,
-    None,
+    None
 }
 
 pub struct PeerCrypto<P: Payload> {
@@ -220,13 +220,13 @@ pub struct PeerCrypto<P: Payload> {
     rotation: Option<RotationState>,
     unencrypted: bool,
     core: Option<CryptoCore>,
-    rotate_counter: usize,
+    rotate_counter: usize
 }
 
 impl<P: Payload> PeerCrypto<P> {
     pub fn new(
         node_id: NodeId, init_payload: P, key_pair: Arc<Ed25519KeyPair>, trusted_keys: Arc<[Ed25519PublicKey]>,
-        algorithms: Algorithms,
+        algorithms: Algorithms
     ) -> Self {
         Self {
             node_id,
@@ -234,7 +234,7 @@ impl<P: Payload> PeerCrypto<P> {
             rotation: None,
             unencrypted: false,
             core: None,
-            rotate_counter: 0,
+            rotate_counter: 0
         }
     }
 
@@ -492,7 +492,7 @@ mod tests {
                     let res = node2.handle_message(&mut msg).unwrap();
                     assert_eq!(res, MessageResult::None);
                 }
-                other => assert_eq!(other, MessageResult::None),
+                other => assert_eq!(other, MessageResult::None)
             }
             match node2.every_second(&mut msg).unwrap() {
                 MessageResult::None => (),
@@ -500,7 +500,7 @@ mod tests {
                     let res = node1.handle_message(&mut msg).unwrap();
                     assert_eq!(res, MessageResult::None);
                 }
-                other => assert_eq!(other, MessageResult::None),
+                other => assert_eq!(other, MessageResult::None)
             }
         }
     }

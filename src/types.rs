@@ -4,7 +4,7 @@
 
 use crate::{
     error::Error,
-    util::{bytes_to_hex, Encoder},
+    util::{bytes_to_hex, Encoder}
 };
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use smallvec::SmallVec;
@@ -13,7 +13,7 @@ use std::{
     hash::{Hash, Hasher},
     io::{Read, Write},
     net::{Ipv4Addr, Ipv6Addr},
-    str::FromStr,
+    str::FromStr
 };
 
 pub const NODE_ID_BYTES: usize = 16;
@@ -23,7 +23,7 @@ pub type NodeId = [u8; NODE_ID_BYTES];
 #[derive(Eq, Clone, Copy)]
 pub struct Address {
     pub data: [u8; 16],
-    pub len: u8,
+    pub len: u8
 }
 
 impl Address {
@@ -129,7 +129,7 @@ impl FromStr for Address {
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Range {
     pub base: Address,
-    pub prefix_len: u8,
+    pub prefix_len: u8
 }
 
 pub type RangeList = SmallVec<[Range; 4]>;
@@ -170,7 +170,7 @@ impl FromStr for Range {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let pos = match text.find('/') {
             Some(pos) => pos,
-            None => return Err(Error::Parse("Invalid range format")),
+            None => return Err(Error::Parse("Invalid range format"))
         };
         let prefix_len = u8::from_str(&text[pos + 1..]).map_err(|_| Error::Parse("Failed to parse prefix length"))?;
         let base = Address::from_str(&text[..pos])?;
@@ -199,7 +199,7 @@ pub enum Mode {
     #[serde(rename = "switch")]
     Switch,
     #[serde(rename = "router")]
-    Router,
+    Router
 }
 impl fmt::Display for Mode {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
@@ -207,7 +207,7 @@ impl fmt::Display for Mode {
             Mode::Normal => write!(formatter, "normal"),
             Mode::Hub => write!(formatter, "hub"),
             Mode::Switch => write!(formatter, "switch"),
-            Mode::Router => write!(formatter, "router"),
+            Mode::Router => write!(formatter, "router")
         }
     }
 }
@@ -220,7 +220,7 @@ impl FromStr for Mode {
             "hub" => Self::Hub,
             "switch" => Self::Switch,
             "router" => Self::Router,
-            _ => return Err("Unknown mode"),
+            _ => return Err("Unknown mode")
         })
     }
 }

@@ -112,7 +112,7 @@ impl Protocol for Packet {
                 let dst = Address::read_from_fixed(&data[24..], 16)?;
                 Ok((src, dst))
             }
-            _ => Err(Error::Parse("Invalid IP protocol version")),
+            _ => Err(Error::Parse("Invalid IP protocol version"))
         }
     }
 }
@@ -129,7 +129,7 @@ fn decode_ipv4_packet() {
 fn decode_ipv6_packet() {
     let data = [
         0x60, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 0, 9, 8, 7, 6, 5, 4, 3, 2, 1, 6, 5,
-        4, 3, 2, 1,
+        4, 3, 2, 1
     ];
     let (src, dst) = Packet::parse(&data).unwrap();
     assert_eq!(src, Address { data: [1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6], len: 16 });

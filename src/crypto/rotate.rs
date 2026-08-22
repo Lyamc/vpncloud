@@ -34,7 +34,7 @@ use crate::{error::Error, util::MsgBuffer};
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use ring::{
     agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, X25519},
-    rand::SystemRandom,
+    rand::SystemRandom
 };
 use smallvec::{smallvec, SmallVec};
 use std::io::{self, Cursor, Read, Write};
@@ -45,7 +45,7 @@ type EcdhPrivateKey = EphemeralPrivateKey;
 pub struct RotationMessage {
     message_id: u64,
     propose: EcdhPublicKey,
-    confirm: Option<EcdhPublicKey>,
+    confirm: Option<EcdhPublicKey>
 }
 
 impl RotationMessage {
@@ -89,13 +89,13 @@ pub struct RotationState {
     pending: Option<(Key, EcdhPublicKey)>,   // sent by remote, to be confirmed
     proposed: Option<EcdhPrivateKey>,        // my own, proposed but not confirmed
     message_id: u64,
-    timeout: bool,
+    timeout: bool
 }
 
 pub struct RotatedKey {
     pub key: Key,
     pub id: u64,
-    pub use_for_sending: bool,
+    pub use_for_sending: bool
 }
 
 impl RotationState {
@@ -181,7 +181,7 @@ impl RotationState {
                     // Reconfirm last confirmed key
                     Self::send(
                         &RotationMessage { confirm: Some(confirmed_key.clone()), propose: proposed_key, message_id },
-                        out,
+                        out
                     );
                 } else {
                     // First message has been lost
