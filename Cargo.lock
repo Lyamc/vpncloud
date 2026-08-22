@@ -1864,6 +1864,7 @@ dependencies = [
  "serde_yaml",
  "signal",
  "smallvec",
+ "socket2",
  "structopt",
  "tempfile",
  "thiserror 1.0.69",

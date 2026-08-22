@@ -54,6 +54,33 @@ impl FromStr for Type {
     }
 }
 
+/// Pick a tun-rs interface name for the current OS.
+///
+/// Linux accepts `vpncloud%d` (kernel fills in the number). macOS TUN devices are always
+/// `utunN`; TAP uses `feth` pairs. Linux-style names are ignored there so the OS can assign one.
+fn platform_device_name(ifname: &str, type_: Type) -> Option<String> {
+    if ifname.is_empty() {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if ifname.contains('%') || ifname.starts_with("vpncloud") {
+            return None;
+        }
+        match type_ {
+            Type::Tun if !ifname.starts_with("utun") => return None,
+            Type::Tap if !ifname.starts_with("feth") => return None,
+            _ => {}
+        }
+        Some(ifname.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = type_;
+        Some(ifname.to_string())
+    }
+}
+
 /// Device abstraction used by the rest of the code.
 ///
 /// It still extends `io::Read` and `io::Write` so existing code that uses
@@ -78,17 +105,45 @@ pub struct TunTapDevice {
 
 impl TunTapDevice {
     // Keep the third parameter for compatibility with callers that pass an optional device path.
-    // We currently ignore `device_path` on macOS, but keep the parameter so callers don't need changes.
+    // Linux uses it for `/dev/net/tun`; tun-rs manages that itself, so the path is ignored.
     pub fn new(ifname: &str, type_: Type, _device_path: Option<&str>) -> io::Result<Self> {
-        let mut builder = DeviceBuilder::new().name(ifname);
+        let mut builder = DeviceBuilder::new();
 
-        // Set the OSI layer based on the device type.
+        if let Some(name) = platform_device_name(ifname, type_) {
+            builder = builder.name(name);
+        }
+
         match type_ {
             Type::Tun => builder = builder.layer(Layer::L3),
             Type::Tap => builder = builder.layer(Layer::L2)
         };
 
-        let device = builder.build_sync()?;
+        // vpncloud speaks raw IP / Ethernet frames. On macOS utun, tun-rs will strip the
+        // 4-byte address-family header when packet information is disabled (the default).
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        ))]
+        {
+            builder = builder.packet_information(false);
+        }
+
+        let device = builder.build_sync().map_err(|e| {
+            if e.kind() == io::ErrorKind::PermissionDenied {
+                io::Error::new(
+                    e.kind(),
+                    format!("Permission denied creating {} device (try running as root/sudo): {}", type_, e)
+                )
+            } else {
+                e
+            }
+        })?;
+        // mio requires non-blocking file descriptors.
+        #[cfg(unix)]
+        device.set_nonblocking(true)?;
         let actual_ifname = device.name()?.to_string();
 
         Ok(Self { device, ifname: actual_ifname, type_ })
@@ -98,12 +153,10 @@ impl TunTapDevice {
     pub fn set_mtu(&mut self, value: Option<usize>) -> io::Result<()> {
         let value = match value {
             Some(value) => value,
-            #[cfg(target_os = "linux")]
             None => {
-                self.device.mtu().map(|m| m as usize - 100).unwrap_or(1400)
+                // Leave headroom for VpnCloud encapsulation on top of the kernel MTU.
+                self.device.mtu().map(|m| (m as usize).saturating_sub(100).max(576)).unwrap_or(1400)
             }
-            #[cfg(not(target_os = "linux"))]
-            None => 1500 // Placeholder
         };
 
         info!("Setting MTU {} on device {}", value, self.ifname);
@@ -362,35 +415,38 @@ fn set_rp_filter(device: &str, val: u8) -> io::Result<()> {
     writeln!(fd, "{}", val)
 }
 
-#[cfg(target_os = "linux")]
-fn get_default_device() -> io::Result<String> {
-    use std::io::BufRead;
-    let fd = std::io::BufReader::new(std::fs::File::open("/proc/net/route")?);
-    let mut best = None;
-    for line in fd.lines() {
-        let line = line?;
-        let parts = line.split('\t').collect::<Vec<_>>();
-        if parts.len() < 3 { continue; }
-        if parts[1] == "00000000" {
-            best = Some(parts[0].to_string());
-            break
-        }
-        if parts[2] != "00000000" {
-            best = Some(parts[0].to_string())
-        }
-    }
-    if let Some(ifname) = best {
-        Ok(ifname)
-    } else {
-        Err(io::Error::new(io::ErrorKind::NotFound, "No default interface found".to_string()))
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[cfg(target_os = "linux")]
-fn get_device_mtu(ifname: &str) -> io::Result<usize> {
-    use std::io::Read;
-    let mut fd = std::fs::File::open(format!("/sys/class/net/{}/mtu", ifname))?;
-    let mut contents = String::with_capacity(10);
-    fd.read_to_string(&mut contents)?;
-    contents.trim().parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid MTU value"))
+    #[test]
+    fn platform_name_empty_is_unspecified() {
+        assert_eq!(platform_device_name("", Type::Tun), None);
+    }
+
+    #[test]
+    fn platform_name_linux_style_percent() {
+        let name = platform_device_name("vpncloud%d", Type::Tun);
+        #[cfg(target_os = "macos")]
+        assert_eq!(name, None);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(name.as_deref(), Some("vpncloud%d"));
+    }
+
+    #[test]
+    fn platform_name_explicit_utun() {
+        let name = platform_device_name("utun8", Type::Tun);
+        assert_eq!(name.as_deref(), Some("utun8"));
+    }
+
+    #[test]
+    #[ignore]
+    fn opens_tun_device() {
+        let mut dev = TunTapDevice::new("vpncloud%d", Type::Tun, None).expect("open tun");
+        #[cfg(target_os = "macos")]
+        assert!(dev.ifname().starts_with("utun"), "unexpected ifname {}", dev.ifname());
+        dev.set_mtu(None).expect("set mtu");
+        dev.configure(Ipv4Addr::new(10, 250, 0, 1), Ipv4Addr::new(255, 255, 255, 0)).expect("configure");
+        assert_eq!(dev.address().unwrap(), Ipv4Addr::new(10, 250, 0, 1));
+    }
 }

@@ -6,7 +6,8 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{self, ErrorKind},
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
-    sync::atomic::{AtomicBool, Ordering}
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration
 };
 
 #[cfg(unix)]
@@ -67,7 +68,15 @@ pub fn parse_listen(addr: &str, default_port: u16) -> SocketAddr {
 impl Socket for UdpSocket {
     fn listen(addr: &str) -> Result<Self, io::Error> {
         let addr = mapped_addr(parse_listen(addr, DEFAULT_PORT));
-        UdpSocket::bind(addr)
+        let domain = if addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
+        let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+        sock.set_nonblocking(true)?;
+        // macOS defaults IPV6_V6ONLY to true, which would drop IPv4 peers on an `[::]` bind.
+        if addr.is_ipv6() {
+            sock.set_only_v6(false)?;
+        }
+        sock.bind(&addr.into())?;
+        Ok(sock.into())
     }
 
     fn receive(&mut self, buffer: &mut MsgBuffer) -> Result<SocketAddr, io::Error> {
@@ -187,6 +196,35 @@ impl Socket for MockSocket {
 
     fn create_port_forwarding(&self) -> Option<PortForwarding> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::MsgBuffer;
+
+    #[test]
+    fn dual_stack_listen_accepts_ipv4() {
+        let mut server = UdpSocket::listen("0").expect("listen");
+        let port = server.local_addr().expect("local_addr").port();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client bind");
+        client.send_to(b"hi", ("127.0.0.1", port)).expect("send");
+
+        let mut buf = MsgBuffer::new(0);
+        for _ in 0..50 {
+            match server.receive(&mut buf) {
+                Ok(_) => {
+                    assert_eq!(buf.message(), b"hi");
+                    return;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("receive failed: {}", e)
+            }
+        }
+        panic!("did not receive IPv4 datagram on dual-stack socket");
     }
 }
 

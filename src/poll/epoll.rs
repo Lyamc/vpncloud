@@ -2,7 +2,7 @@
 // Copyright (C) 2015-2021 Dennis Schwerdel
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
-use std::{io, time::Duration};
+use std::{collections::VecDeque, io, time::Duration};
 
 use mio::{Events, Interest, Poll, Token};
 
@@ -24,10 +24,7 @@ const DEVICE_TOKEN: Token = Token(1);
 pub struct EpollWait {
     poll: Poll,
     events: Events,
-    #[cfg(unix)]
-    socket_fd: i32,
-    #[cfg(unix)]
-    device_fd: i32,
+    pending: VecDeque<WaitResult>,
     #[cfg(windows)]
     socket_handle: usize,
     #[cfg(windows)]
@@ -56,6 +53,7 @@ impl Pollable for (RawSocket, RawHandle) {
     fn get_socket(&self) -> RawSocket {
         self.0
     }
+
     fn get_handle(&self) -> RawHandle {
         self.1
     }
@@ -65,6 +63,7 @@ impl Pollable for RawSocket {
     fn get_socket(&self) -> RawSocket {
         *self
     }
+
     fn get_handle(&self) -> RawHandle {
         0 as RawHandle
     }
@@ -74,6 +73,7 @@ impl Pollable for RawHandle {
     fn get_socket(&self) -> RawSocket {
         0
     }
+
     fn get_handle(&self) -> RawHandle {
         *self
     }
@@ -83,6 +83,7 @@ impl<T: AsRawSocket + AsRawHandle> Pollable for T {
     fn get_socket(&self) -> RawSocket {
         self.as_raw_socket()
     }
+
     fn get_handle(&self) -> RawHandle {
         self.as_raw_handle()
     }
@@ -115,7 +116,7 @@ impl EpollWait {
         poll.registry().register(&mut mio::unix::SourceFd(&socket_fd), SOCKET_TOKEN, interest)?;
         poll.registry().register(&mut mio::unix::SourceFd(&device_fd), DEVICE_TOKEN, interest)?;
 
-        Ok(Self { poll, events, socket_fd, device_fd, timeout })
+        Ok(Self { poll, events, pending: VecDeque::new(), timeout })
     }
 
     #[cfg(windows)]
@@ -129,8 +130,8 @@ impl EpollWait {
         // On Windows, mio doesn't have a direct equivalent of SourceFd for arbitrary handles.
         // This is a stub for now, as Windows support is still in progress.
         // In a real implementation, we would need to wrap these in something that implements Source.
-        
-        Ok(Self { poll, events, socket_handle, device_handle, timeout })
+
+        Ok(Self { poll, events, pending: VecDeque::new(), socket_handle, device_handle, timeout })
     }
 }
 
@@ -142,27 +143,29 @@ impl Iterator for EpollWait {
     type Item = WaitResult;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(evt) = self.pending.pop_front() {
+            return Some(evt);
+        }
+
         let timeout_duration = if self.timeout == 0 { None } else { Some(Duration::from_millis(self.timeout as u64)) };
 
-        match self.poll.poll(&mut self.events, timeout_duration) {
-            Ok(_) => {
-                for event in self.events.iter() {
-                    match event.token() {
-                        SOCKET_TOKEN => return Some(WaitResult::Socket),
-                        DEVICE_TOKEN => return Some(WaitResult::Device),
-                        _ => unreachable!()
+        loop {
+            match self.poll.poll(&mut self.events, timeout_duration) {
+                Ok(_) => {
+                    for event in self.events.iter() {
+                        if !event.is_readable() && !event.is_error() {
+                            continue;
+                        }
+                        match event.token() {
+                            SOCKET_TOKEN => self.pending.push_back(WaitResult::Socket),
+                            DEVICE_TOKEN => self.pending.push_back(WaitResult::Device),
+                            _ => unreachable!()
+                        }
                     }
+                    return self.pending.pop_front().or(Some(WaitResult::Timeout));
                 }
-                // If no events were returned but the poll was successful, it's a timeout.
-                Some(WaitResult::Timeout)
-            }
-            Err(e) => {
-                // Ignore `Interrupted` errors and try again.
-                if e.kind() == io::ErrorKind::Interrupted {
-                    self.next()
-                } else {
-                    Some(WaitResult::Error(e))
-                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Some(WaitResult::Error(e))
             }
         }
     }

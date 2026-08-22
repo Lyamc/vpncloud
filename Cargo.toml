@@ -18,7 +18,8 @@ upx_version = "4.2.2"
 chrono = { version = "0.4", features = [
     "std",
     "clock",
-], default_features = false }
+], default-features = false }
+socket2 = "0.6"
 structopt = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
