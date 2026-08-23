@@ -123,7 +123,8 @@ impl OldConfigFile {
             switch_timeout: self.dst_timeout,
             user: self.user,
             hook: None,
-            hooks: HashMap::new()
+            hooks: HashMap::new(),
+            tray: None
         }
     }
 }

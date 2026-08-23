@@ -1016,8 +1016,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                     poll_error = true;
                 }
                 WaitResult::Timeout => {}
-                WaitResult::Socket => self.handle_socket_event(&mut buffer),
-                WaitResult::Device => self.handle_device_event(&mut buffer)
+                WaitResult::Socket if !CtrlC::is_paused() => self.handle_socket_event(&mut buffer),
+                WaitResult::Device if !CtrlC::is_paused() => self.handle_device_event(&mut buffer),
+                WaitResult::Socket | WaitResult::Device => {}
             }
             if self.next_housekeep < TS::now() {
                 // COLD PATH
@@ -1025,8 +1026,10 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 if ctrlc.was_pressed() {
                     break;
                 }
-                if let Err(e) = self.housekeep() {
-                    error!("{}", e)
+                if !CtrlC::is_paused() {
+                    if let Err(e) = self.housekeep() {
+                        error!("{}", e)
+                    }
                 }
                 self.next_housekeep = TS::now() + 1
             }

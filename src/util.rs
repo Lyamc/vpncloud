@@ -284,6 +284,7 @@ impl fmt::Display for Bytes {
 }
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+static PAUSED: AtomicBool = AtomicBool::new(false);
 
 pub struct CtrlC {
     flag: Arc<AtomicBool>
@@ -301,6 +302,15 @@ impl CtrlC {
 
     pub fn clear_stop() {
         STOP_REQUESTED.store(false, Ordering::Relaxed);
+        PAUSED.store(false, Ordering::Relaxed);
+    }
+
+    pub fn set_paused(paused: bool) {
+        PAUSED.store(paused, Ordering::Relaxed);
+    }
+
+    pub fn is_paused() -> bool {
+        PAUSED.load(Ordering::Relaxed)
     }
 
     pub fn was_pressed(&mut self) -> bool {

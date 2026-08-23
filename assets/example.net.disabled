@@ -74,6 +74,8 @@ stats-file: ~               # Periodically write statistics on peers and current
 hook: ~                     # Hook script to run for every event
 hooks: {}                   # Multiple hook scripts to run for specific events
 
+tray: false                 # Windows: system tray icon (Enable / Disable / Exit). Set true at install.
+
 
 
 # Copy this template and save it to a file named /etc/vpncloud/MYNET.net (replace MYNET with your network name)

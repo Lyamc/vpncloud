@@ -199,6 +199,16 @@ vpncloud - Peer-to-peer VPN
   Sets the prefix to use for all statsd entries. [default: **vpncloud**]
   Please see *STATSD SUPPORT* for more info.
 
+*--tray*::
+  Windows only. Show a system tray icon with *Enable*, *Disable*, *Open
+  config folder*, and *Exit*. Double-click toggles Enable/Disable.
+  Disable pauses forwarding without tearing down the TUN/TAP device.
+  Combine with *--daemon* to hide the console window.
+  Chosen at *vpncloud install* (prompt, or *--tray* / *--no-tray*).
+
+*--no-tray*::
+  Windows only. Do not show a system tray icon.
+
 *--daemon*::
   Spawn a background process instead of running the process in the foreground.
   If this flag is set, the process will first carry out all the
@@ -419,6 +429,7 @@ detailed descriptions of the options.
   *prefix*::: Prefix to use when reporting to statsd. Same as *--statsd-prefix*
 *hook*:: A hook script to be called for every event type. See *HOOK SCRIPTS* for info.
 *hooks*:: A map of event type to script for scripts that only fire for one event type. See *HOOK SCRIPTS* for info.
+*tray*:: Windows: show a system tray icon. Same as *--tray*.
 
 === Example
 

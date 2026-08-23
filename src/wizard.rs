@@ -380,6 +380,13 @@ fn configure_stats(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> R
 }
 
 fn configure_process(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> Result<(), dialoguer::Error> {
+    #[cfg(windows)]
+    {
+        config.tray = Confirm::with_theme(theme)
+            .with_prompt("Show a system tray icon (Enable / Disable / Exit)?")
+            .default(config.tray)
+            .interact()?;
+    }
     if mode == MODE_EXPERT {
         config.user = str_opt(
             Input::with_theme(theme)

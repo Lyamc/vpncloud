@@ -199,6 +199,16 @@ pub fn run_vpn(mut config: Config) {
         config.port_forwarding = false;
         config.daemonize = false;
     }
+    #[cfg(windows)]
+    if config.tray {
+        if config.daemonize {
+            unsafe {
+                windows_sys::Win32::System::Console::FreeConsole();
+            }
+        }
+        crate::tray::run(config);
+        return;
+    }
     #[cfg(target_os = "android")]
     if config.device_type == Type::Tap {
         if config.tun_fd.is_some() {
@@ -216,6 +226,11 @@ pub fn run_vpn(mut config: Config) {
         fail!("{}", "Websocket listen is not supported on Android; use UDP (--listen PORT).");
     }
 
+    run_vpn_worker(config);
+}
+
+/// Socket + device loop. On Windows the tray calls this from a worker thread.
+pub(crate) fn run_vpn_worker(config: Config) {
     #[cfg(feature = "websocket")]
     if native_ws_bind(&config.listen).is_some() {
         let socket = try_fail!(

@@ -41,4 +41,7 @@ pub mod wsproxy;
 #[cfg(target_os = "android")]
 mod android;
 
+#[cfg(windows)]
+pub mod tray;
+
 pub use engine::run_vpn;

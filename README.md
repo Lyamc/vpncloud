@@ -67,7 +67,11 @@ with sudo; `--ip` configures the address. Dual-stack UDP listen works
 
 **Windows.** TUN uses [Wintun](https://www.wintun.net/) (`wintun.dll` next to
 `vpncloud.exe`). TAP uses [tap-windows6](https://github.com/OpenVPN/tap-windows6)
-(NdisWan / `tap0901`). Run as Administrator.
+(NdisWan / `tap0901`). Run as Administrator. Optional system tray (Enable /
+Disable / Exit) is offered at `vpncloud install` (build with `--features installer`)
+or `vpncloud.exe --tray`. Install prompts for the tray and optional
+Start-with-Windows; unattended: `vpncloud install --tray` / `--no-tray` /
+`--autostart`.
 
 **Android.** TUN works on all devices through `VpnService` (`--tun-fd` / JNI,
 `protect()` so the UDP mesh does not hairpin). **TAP/L2 is rooted-only:** it

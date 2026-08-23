@@ -165,8 +165,15 @@ fn main() {
                 }
             }
             #[cfg(feature = "installer")]
-            Command::Install { uninstall } => {
-                let result = if uninstall { installer::uninstall() } else { installer::install() };
+            Command::Install { uninstall, tray, no_tray, autostart } => {
+                let tray = if no_tray {
+                    Some(false)
+                } else if tray {
+                    Some(true)
+                } else {
+                    None
+                };
+                let result = installer::install(installer::InstallOpts { uninstall, tray, autostart });
                 if let Err(e) = result {
                     log::error!("{} failed: {}", if uninstall { "Uninstall" } else { "Install" }, e);
                 }

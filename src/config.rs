@@ -9,7 +9,7 @@ use super::{
 };
 pub use crate::crypto::Config as CryptoConfig;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 use std::{cmp::max, collections::HashMap, ffi::OsStr, process, thread};
 
@@ -93,7 +93,9 @@ pub struct Config {
     pub user: Option<String>,
     pub group: Option<String>,
     pub hook: Option<String>,
-    pub hooks: HashMap<String, String>
+    pub hooks: HashMap<String, String>,
+    /// Windows: show a system tray icon (Enable / Disable / Exit).
+    pub tray: bool
 }
 
 impl Default for Config {
@@ -131,7 +133,8 @@ impl Default for Config {
             user: None,
             group: None,
             hook: None,
-            hooks: HashMap::new()
+            hooks: HashMap::new(),
+            tray: false
         }
     }
 }
@@ -248,6 +251,9 @@ impl Config {
         for (k, v) in file.hooks {
             self.hooks.insert(k, v);
         }
+        if let Some(val) = file.tray {
+            self.tray = val;
+        }
     }
 
     pub fn merge_args(&mut self, mut args: Args) {
@@ -358,6 +364,12 @@ impl Config {
                 self.hook = Some(s);
             }
         }
+        if args.tray {
+            self.tray = true;
+        }
+        if args.no_tray {
+            self.tray = false;
+        }
     }
 
     pub fn into_config_file(self) -> ConfigFile {
@@ -395,7 +407,8 @@ impl Config {
             statsd: Some(ConfigFileStatsd { server: self.statsd_server, prefix: self.statsd_prefix }),
             switch_timeout: Some(self.switch_timeout),
             hook: self.hook,
-            hooks: self.hooks
+            hooks: self.hooks,
+            tray: Some(self.tray)
         }
     }
 
@@ -609,6 +622,14 @@ pub struct Args {
     #[arg(long)]
     pub hook: Vec<String>,
 
+    /// Windows: show a system tray icon (Enable / Disable / Exit)
+    #[arg(long)]
+    pub tray: bool,
+
+    /// Windows: do not show a system tray icon
+    #[arg(long, conflicts_with = "tray")]
+    pub no_tray: bool,
+
     #[command(subcommand)]
     pub cmd: Option<Command>
 }
@@ -665,7 +686,16 @@ pub enum Command {
     Install {
         /// Remove installed files again
         #[arg(long)]
-        uninstall: bool
+        uninstall: bool,
+        /// Windows: install a system tray icon (prompted if omitted)
+        #[arg(long)]
+        tray: bool,
+        /// Windows: do not install a system tray icon
+        #[arg(long, conflicts_with = "tray")]
+        no_tray: bool,
+        /// Windows: start VpnCloud with Windows (registry Run key)
+        #[arg(long)]
+        autostart: bool
     }
 }
 
@@ -724,7 +754,9 @@ pub struct ConfigFile {
     pub user: Option<String>,
     pub group: Option<String>,
     pub hook: Option<String>,
-    pub hooks: HashMap<String, String>
+    pub hooks: HashMap<String, String>,
+    /// Windows system tray icon
+    pub tray: Option<bool>
 }
 
 #[test]
@@ -803,7 +835,8 @@ statsd:
             prefix: Some("prefix".to_string())
         }),
         hook: None,
-        hooks: HashMap::new()
+        hooks: HashMap::new(),
+        tray: None
     })
 }
 
@@ -855,7 +888,8 @@ fn config_merge() {
             prefix: Some("prefix".to_string())
         }),
         hook: None,
-        hooks: HashMap::new()
+        hooks: HashMap::new(),
+        tray: None
     });
     assert_eq!(config, Config {
         device_type: Type::Tun,
@@ -951,7 +985,8 @@ fn config_merge() {
         statsd_prefix: Some("prefix2".to_string()),
         daemonize: true,
         hook: None,
-        hooks: HashMap::new()
+        hooks: HashMap::new(),
+        tray: false
     });
 }
 
@@ -981,7 +1016,17 @@ peers:
 
 #[test]
 fn clap_help_says_android_tap_needs_root() {
+    use clap::CommandFactory;
     let help = Args::command().render_long_help().to_string();
     assert!(help.to_lowercase().contains("rooted"), "{}", help);
     assert!(help.contains("tun") || help.contains("TUN"), "{}", help);
+}
+
+#[test]
+fn tray_yaml() {
+    let file: ConfigFile = serde_norway::from_str("tray: true\n").unwrap();
+    assert_eq!(file.tray, Some(true));
+    let mut config = Config::default();
+    config.merge_file(file);
+    assert!(config.tray);
 }
