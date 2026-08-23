@@ -432,10 +432,12 @@ address of the remote node and the the *X* in the interface address must be
 unique among all nodes, e.g. 0, 1, 2, ...):
 
 ----
-vpncloud -c REMOTE_HOST:PORT --ip 10.0.0.X/24 --password PASSWORD
+vpncloud --type tun -c REMOTE_HOST:PORT --ip 10.0.0.X/24 --password PASSWORD
 ----
 
-Afterwards, the interface can be used to communicate.
+Both nodes must use the same *--type* (*tun* or *tap*). Default is *tun*.
+Afterwards, the interface can be used to communicate (*ping 10.0.0.1*).
+Do not write a custom start wrapper; run under *sudo* or *vpncloud install*.
 
 === Routed TUN example
 

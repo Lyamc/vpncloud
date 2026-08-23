@@ -46,6 +46,25 @@ password = "mysecret"
 See `vpncloud.adoc` (the man page) for every option, `assets/example.net.disabled`
 for a commented YAML template, and `assets/example.toml.disabled` for TOML.
 
+**Two-node TUN** (default `--type tun`; both ends must match — TAP will not
+mesh with TUN). Unique overlay IPs, same password. Needs root to create the
+device (`sudo` in a terminal; no extra start script):
+
+```sh
+# node A
+sudo vpncloud --type tun --ip 10.0.0.1/24 -p 'mypassword' --listen 3210 --no-seccomp
+
+# node B
+sudo vpncloud --type tun --ip 10.0.0.2/24 -c HOST_A:3210 -p 'mypassword' --no-seccomp
+ping 10.0.0.1
+```
+
+`--ip` auto-claims only that host (`10.0.0.1/32`). To route extra subnets
+(WireGuard `AllowedIPs`-style), advertise them with `--claim 10.8.0.0/24`
+on the node that owns them. `--mode normal` is router on TUN and switch on
+TAP. For a process that outlives the terminal, use `vpncloud install`
+(systemd / LaunchDaemon / rc.d / Windows service), not a custom wrapper.
+
 
 ### Project status
 
@@ -79,9 +98,11 @@ unprivileged LXC/Proxmox, bind-mount `/dev/net` and allow cgroup device
 `10:200` (see *CONTAINERS* in `vpncloud.adoc`).
 
 **macOS.** TUN uses `utun`. TAP uses `feth` plus BPF. Create the interface
-with sudo; `--ip` configures the address. Dual-stack UDP listen works
-(`--listen 3210` binds IPv4 and IPv6). `vpncloud install` (installer feature)
-registers a LaunchDaemon (`ca.witherow.vpncloud`).
+with `sudo` from a terminal (`sudo vpncloud --type tun --ip 10.0.0.2/24
+-c HOST:3210 -p PASS`). Dual-stack UDP listen works (`--listen 3210` binds
+IPv4 and IPv6). `--daemon` from a one-shot GUI/osascript helper can die when
+that helper exits; persist with `vpncloud install` (LaunchDaemon
+`ca.witherow.vpncloud`), then `sudo launchctl start ca.witherow.vpncloud`.
 
 **FreeBSD.** TUN uses `tun(4)`, TAP uses `tap(4)` (both via tun-rs). Default
 `vpncloud%d` names are ignored; the kernel assigns `tunN` / `tapN`. Dual-stack
