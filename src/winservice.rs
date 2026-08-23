@@ -9,7 +9,10 @@ use std::{
     mem,
     path::{Path, PathBuf},
     ptr,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicPtr, Ordering},
+        Mutex
+    },
     thread,
     time::Duration
 };
@@ -35,13 +38,13 @@ pub const SERVICE_DISPLAY: &str = "VpnCloud P2P VPN";
 pub const SERVICE_DESC: &str = "Peer-to-peer mesh VPN over UDP.";
 
 static SERVICE_CONFIG: Mutex<Option<Config>> = Mutex::new(None);
-static STATUS_HANDLE: Mutex<SERVICE_STATUS_HANDLE> = Mutex::new(0);
+static STATUS_HANDLE: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn win_err(msg: &str) -> Error {
+fn win_err(msg: &'static str) -> Error {
     let code = unsafe { GetLastError() };
     Error::FileIo(msg, io::Error::from_raw_os_error(code as i32))
 }
@@ -64,8 +67,9 @@ fn set_status(handle: SERVICE_STATUS_HANDLE, state: u32, accept: u32, wait_hint_
 unsafe extern "system" fn ctrl_handler(ctrl: u32, _event: u32, _data: *mut core::ffi::c_void, _ctx: *mut core::ffi::c_void) -> u32 {
     match ctrl {
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
-            if let Ok(h) = STATUS_HANDLE.lock() {
-                set_status(*h, SERVICE_STOP_PENDING, 0, 10_000);
+            let h = STATUS_HANDLE.load(Ordering::SeqCst);
+            if !h.is_null() {
+                set_status(h, SERVICE_STOP_PENDING, 0, 10_000);
             }
             CtrlC::request_stop();
             0
@@ -77,11 +81,11 @@ unsafe extern "system" fn ctrl_handler(ctrl: u32, _event: u32, _data: *mut core:
 unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     let name = wide(SERVICE_NAME);
     let handle = RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(ctrl_handler), ptr::null_mut());
-    if handle == 0 {
+    if handle.is_null() {
         error!("RegisterServiceCtrlHandlerEx failed: {}", unsafe { GetLastError() });
         return;
     }
-    *STATUS_HANDLE.lock().expect("status handle") = handle;
+    STATUS_HANDLE.store(handle, Ordering::SeqCst);
     set_status(handle, SERVICE_START_PENDING, 0, 5000);
 
     let config = SERVICE_CONFIG.lock().expect("service config").take();
@@ -192,20 +196,20 @@ pub fn install(config_path: Option<&Path>, start_now: bool) -> Result<(), Error>
 }
 
 fn create_scm_service(bin_path: &str) -> Result<(), Error> {
-    let mut name = wide(SERVICE_NAME);
-    let mut display = wide(SERVICE_DISPLAY);
-    let mut bin = wide(bin_path);
+    let name = wide(SERVICE_NAME);
+    let display = wide(SERVICE_DISPLAY);
+    let bin = wide(bin_path);
     let mut desc_text = wide(SERVICE_DESC);
 
     unsafe {
         let scm = OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS);
-        if scm == 0 {
+        if scm.is_null() {
             return Err(win_err(
                 "OpenSCManager failed. Run as Administrator: vpncloud service install"
             ));
         }
         let existing = OpenServiceW(scm, name.as_ptr(), SERVICE_ALL_ACCESS);
-        if existing != 0 {
+        if !existing.is_null() {
             DeleteService(existing);
             CloseServiceHandle(existing);
         }
@@ -224,7 +228,7 @@ fn create_scm_service(bin_path: &str) -> Result<(), Error> {
             ptr::null(),
             ptr::null()
         );
-        if svc == 0 {
+        if svc.is_null() {
             CloseServiceHandle(scm);
             return Err(win_err("CreateService failed"));
         }
@@ -241,11 +245,11 @@ pub fn uninstall() -> Result<(), Error> {
     let name = wide(SERVICE_NAME);
     unsafe {
         let scm = OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS);
-        if scm == 0 {
+        if scm.is_null() {
             return Err(win_err("OpenSCManager failed. Run as Administrator: vpncloud service uninstall"));
         }
         let svc = OpenServiceW(scm, name.as_ptr(), SERVICE_ALL_ACCESS);
-        if svc == 0 {
+        if svc.is_null() {
             let code = GetLastError();
             CloseServiceHandle(scm);
             if code == 1060 {
@@ -270,11 +274,11 @@ pub fn start() -> Result<(), Error> {
     let name = wide(SERVICE_NAME);
     unsafe {
         let scm = OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS);
-        if scm == 0 {
+        if scm.is_null() {
             return Err(win_err("OpenSCManager failed. Run as Administrator."));
         }
         let svc = OpenServiceW(scm, name.as_ptr(), SERVICE_START);
-        if svc == 0 {
+        if svc.is_null() {
             CloseServiceHandle(scm);
             return Err(win_err("OpenService failed"));
         }
@@ -293,11 +297,11 @@ pub fn stop() -> Result<(), Error> {
     let name = wide(SERVICE_NAME);
     unsafe {
         let scm = OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS);
-        if scm == 0 {
+        if scm.is_null() {
             return Err(win_err("OpenSCManager failed. Run as Administrator."));
         }
         let svc = OpenServiceW(scm, name.as_ptr(), SERVICE_STOP);
-        if svc == 0 {
+        if svc.is_null() {
             CloseServiceHandle(scm);
             return Err(win_err("OpenService failed"));
         }

@@ -115,6 +115,22 @@ fn install_windows(opts: InstallOpts) -> Result<(), Error> {
         .and_then(|p| fs::copy(p, &exe_dest))
         .map_err(|e| Error::FileIo("Failed to copy binary", e))?;
 
+    if let Ok(src_exe) = env::current_exe() {
+        if let Some(dir) = src_exe.parent() {
+            let src_dll = dir.join("wintun.dll");
+            if src_dll.exists() {
+                fs::copy(&src_dll, base.join("wintun.dll"))
+                    .map_err(|e| Error::FileIo("Failed to copy wintun.dll", e))?;
+                info!("Copied wintun.dll");
+            } else {
+                warn!(
+                    "wintun.dll not found next to {}. TUN mode needs it: download from https://www.wintun.net/ and place it beside vpncloud.exe",
+                    src_exe.display()
+                );
+            }
+        }
+    }
+
     File::create(base.join("example.net.disabled"))
         .and_then(|mut f| f.write_all(EXAMPLE_CONFIG))
         .map_err(|e| Error::FileIo("Failed to create example config", e))?;
@@ -209,7 +225,7 @@ fn write_run_key(exe: &std::path::Path, cfg: &std::path::Path, tray: bool) -> Re
         RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_WRITE, REG_SZ
     };
     let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-    let mut hkey = 0;
+    let mut hkey = std::ptr::null_mut();
     let rc = unsafe {
         RegCreateKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, std::ptr::null(), 0, KEY_WRITE, std::ptr::null(), &mut hkey, std::ptr::null_mut())
     };
@@ -238,7 +254,7 @@ fn write_run_key(exe: &std::path::Path, cfg: &std::path::Path, tray: bool) -> Re
 fn delete_run_key() {
     use windows_sys::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, RegDeleteValueW, HKEY_CURRENT_USER, KEY_WRITE};
     let sub = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-    let mut hkey = 0;
+    let mut hkey = std::ptr::null_mut();
     let rc = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_WRITE, &mut hkey) };
     if rc != 0 {
         return;
@@ -277,6 +293,7 @@ pub fn uninstall() -> Result<(), Error> {
         let _ = crate::winservice::uninstall();
         if let Ok(base) = windows_install_dir() {
             let _ = fs::remove_file(base.join("vpncloud.exe"));
+            let _ = fs::remove_file(base.join("wintun.dll"));
             let _ = fs::remove_file(base.join("example.net.disabled"));
             let _ = fs::remove_dir(&base);
         }

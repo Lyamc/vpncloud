@@ -103,7 +103,7 @@ fn tooltip() -> String {
 fn show_menu(hwnd: HWND) {
     unsafe {
         let menu = CreatePopupMenu();
-        if menu == 0 {
+        if menu.is_null() {
             return;
         }
         let paused = CtrlC::is_paused();
@@ -192,8 +192,8 @@ pub fn run(config: Config) {
             cbWndExtra: 0,
             hInstance: GetModuleHandleW(ptr::null()),
             hIcon: LoadIconW(ptr::null_mut(), IDI_APPLICATION),
-            hCursor: 0,
-            hbrBackground: 0,
+            hCursor: ptr::null_mut(),
+            hbrBackground: ptr::null_mut(),
             lpszMenuName: ptr::null(),
             lpszClassName: class.as_ptr()
         };
@@ -208,18 +208,18 @@ pub fn run(config: Config) {
             0,
             0,
             0,
-            0,
-            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
             GetModuleHandleW(ptr::null()),
             ptr::null()
         );
-        if hwnd == 0 {
+        if hwnd.is_null() {
             error!("Failed to create tray window");
             CtrlC::request_stop();
         } else {
             notify(hwnd, true, &tooltip());
             let mut msg = mem::zeroed::<MSG>();
-            while GetMessageW(&mut msg, 0, 0, 0) > 0 {
+            while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }

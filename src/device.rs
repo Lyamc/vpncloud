@@ -17,8 +17,7 @@ use std::process::Command;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 
-#[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, RawHandle};
+
 
 use getifaddrs::getifaddrs;
 use log::info;
@@ -732,8 +731,7 @@ impl AsRawFd for MockDevice {
 #[cfg(windows)]
 impl std::os::windows::io::AsRawHandle for MockDevice {
     fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
-        use std::os::windows::io::AsRawHandle;
-        self.fd.as_raw_handle()
+        std::os::windows::io::AsRawHandle::as_raw_handle(&self.fd)
     }
 }
 

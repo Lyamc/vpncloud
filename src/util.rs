@@ -3,7 +3,7 @@
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
 use std::{
-    fmt, io,
+    fmt,
     net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
     process::{self, Command},
     sync::{
@@ -15,6 +15,8 @@ use std::{
 
 use crate::error::Error;
 
+#[cfg(unix)]
+use std::io;
 #[cfg(unix)]
 use signal_hook::consts::{SIGQUIT, SIGTERM};
 use signal_hook::{consts::SIGINT, flag};
