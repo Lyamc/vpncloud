@@ -16,16 +16,14 @@ use std::{
 use crate::error::Error;
 
 #[cfg(unix)]
-use std::io;
-#[cfg(unix)]
 use signal_hook::consts::{SIGQUIT, SIGTERM};
 use signal_hook::{consts::SIGINT, flag};
 use smallvec::SmallVec;
+#[cfg(unix)] use std::io;
 
 pub type Duration = u32;
 pub type Time = i64;
 
-#[derive(Clone)]
 pub struct MsgBuffer {
     space_before: usize,
     buffer: [u8; 65535],
@@ -99,6 +97,16 @@ impl MsgBuffer {
     pub fn clear(&mut self) {
         self.set_start(self.space_before);
         self.set_length(0)
+    }
+}
+
+impl Clone for MsgBuffer {
+    fn clone(&self) -> Self {
+        let mut n = MsgBuffer::new(self.space_before);
+        n.start = self.start;
+        n.end = self.end;
+        n.buffer[self.start..self.end].copy_from_slice(&self.buffer[self.start..self.end]);
+        n
     }
 }
 

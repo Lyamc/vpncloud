@@ -4,6 +4,7 @@ This project follows [semantic versioning](http://semver.org).
 
 ### UNRELEASED
 
+- [changed] Datapath: reuse packet buffers (no 64 KiB zero / `to_vec` per packet); skip crypto mutex when `--crypto-threads` is 0; Linux TUN GSO/GRO offload
 - [changed] Release builds use thin LTO, abort-on-panic, and symbol stripping; packaged binaries can use `--profile dist` (fat LTO)
 - [changed] Optional crates are feature-gated (`noise`, `installer`/`service-manager`, GUI Iced). Host lib crate-type is `rlib` only
 - [changed] Service install uses the `service-manager` crate (systemd, launchd, Windows `sc.exe`); the Windows service *process* is unchanged

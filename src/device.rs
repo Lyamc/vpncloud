@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use tun_rs::SyncDevice;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tun_rs::{DeviceBuilder, Layer};
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+use tun_rs::{GROTable, VIRTIO_NET_HDR_LEN};
 
 use crate::error::Error;
 
@@ -130,6 +132,20 @@ pub trait Device: io::Read + io::Write {
     /// These operate directly on `MsgBuffer` (avoiding extra allocations / copies).
     fn write_msg(&mut self, data: &mut crate::util::MsgBuffer) -> Result<(), Error>;
     fn read_msg(&mut self, buffer: &mut crate::util::MsgBuffer) -> Result<(), Error>;
+
+    /// Fill `bufs` with packets until WouldBlock or `bufs` is full.
+    fn read_batch(&mut self, bufs: &mut [crate::util::MsgBuffer]) -> Result<usize, Error> {
+        let mut n = 0;
+        for b in bufs.iter_mut() {
+            match self.read_msg(b) {
+                Ok(()) => n += 1,
+                Err(Error::DeviceIo(_, ref e)) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) if n > 0 => break,
+                Err(e) => return Err(e)
+            }
+        }
+        Ok(n)
+    }
 }
 
 pub struct TunTapDevice {
@@ -137,7 +153,17 @@ pub struct TunTapDevice {
     ifname: String,
     type_: Type,
     #[cfg(windows)]
-    incoming: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>
+    incoming: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>,
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    tun_offload: bool,
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    tun_scratch: Vec<u8>,
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    tun_batch: Vec<Vec<u8>>,
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    tun_sizes: Vec<usize>,
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    gro_table: GROTable
 }
 
 /// Shown in `--help` and in the error when TAP is requested without root.
@@ -314,7 +340,17 @@ impl TunTapDevice {
             ifname: format!("tun{}", fd),
             type_,
             #[cfg(windows)]
-            incoming: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
+            incoming: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            tun_offload: false,
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            tun_scratch: Vec::new(),
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            tun_batch: Vec::new(),
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            tun_sizes: Vec::new(),
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            gro_table: GROTable::default()
         })
     }
 
@@ -332,7 +368,21 @@ impl TunTapDevice {
                 return Err(android_tap_needs_root());
             }
             let (device, actual) = android_tun::create(ifname, type_ == Type::Tap, _device_path)?;
-            return Ok(Self { device: std::sync::Arc::new(device), ifname: actual, type_ });
+            return Ok(Self {
+                device: std::sync::Arc::new(device),
+                ifname: actual,
+                type_,
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                tun_offload: false,
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                tun_scratch: Vec::new(),
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                tun_batch: Vec::new(),
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                tun_sizes: Vec::new(),
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                gro_table: GROTable::default()
+            });
         }
         #[cfg(target_os = "ios")]
         {
@@ -354,7 +404,13 @@ impl TunTapDevice {
             }
 
             match type_ {
-                Type::Tun => builder = builder.layer(Layer::L3),
+                Type::Tun => {
+                    builder = builder.layer(Layer::L3);
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                    {
+                        builder = builder.offload(true);
+                    }
+                }
                 Type::Tap => {
                     builder = builder.layer(Layer::L2);
                     // Kernel/tun-rs defaults can collide across nodes (#381). Assign a unique LAA.
@@ -398,7 +454,17 @@ impl TunTapDevice {
                 ifname: actual_ifname,
                 type_,
                 #[cfg(windows)]
-                incoming: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
+                incoming: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                tun_offload: type_ == Type::Tun,
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                tun_scratch: if type_ == Type::Tun { vec![0u8; VIRTIO_NET_HDR_LEN + 65535] } else { Vec::new() },
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                tun_batch: if type_ == Type::Tun { vec![vec![0u8; 2048]; 64] } else { Vec::new() },
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                tun_sizes: if type_ == Type::Tun { vec![0usize; 64] } else { Vec::new() },
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                gro_table: GROTable::default()
             })
         }
     }
@@ -551,6 +617,17 @@ impl Device for TunTapDevice {
             Type::Tap => crate::payload::fix_ethernet_ipv4_checksums(data.message_mut()),
             Type::Tun => crate::payload::fix_ipv4_checksums(data.message_mut())
         }
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        if self.tun_offload && self.type_ == Type::Tun {
+            let mut pkt = data.message().to_vec();
+            match self.device.send_multiple(&mut self.gro_table, std::slice::from_mut(&mut pkt), 0) {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(Error::DeviceIo("IO error when sending to device", e));
+                }
+                Err(_) => {}
+            }
+        }
         let slice = data.message();
         match self.device.send(slice) {
             Ok(written) if written == slice.len() => Ok(()),
@@ -600,6 +677,40 @@ impl Device for TunTapDevice {
                 ))
             }
             Err(io_err) => Err(Error::DeviceIo("IO error when reading from device", io_err))
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn read_batch(&mut self, bufs: &mut [crate::util::MsgBuffer]) -> Result<usize, Error> {
+        if !self.tun_offload || bufs.is_empty() {
+            let mut n = 0;
+            for b in bufs.iter_mut() {
+                match self.read_msg(b) {
+                    Ok(()) => n += 1,
+                    Err(Error::DeviceIo(_, ref e)) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) if n > 0 => break,
+                    Err(e) => return Err(e)
+                }
+            }
+            return Ok(n);
+        }
+        let nbufs = bufs.len().min(self.tun_batch.len());
+        match self.device.recv_multiple(
+            &mut self.tun_scratch,
+            &mut self.tun_batch[..nbufs],
+            &mut self.tun_sizes[..nbufs],
+            0
+        ) {
+            Ok(n) => {
+                for i in 0..n {
+                    bufs[i].clear();
+                    bufs[i].clone_from(&self.tun_batch[i][..self.tun_sizes[i]]);
+                    crate::payload::fix_ipv4_checksums(bufs[i].message_mut());
+                }
+                Ok(n)
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted => Ok(0),
+            Err(e) => Err(Error::DeviceIo("IO error when reading from device", e))
         }
     }
 }

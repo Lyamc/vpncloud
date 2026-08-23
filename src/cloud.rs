@@ -65,6 +65,45 @@ const OWN_ADDRESS_RESET_INTERVAL: Time = 30;
 const SPACE_BEFORE: usize = 100;
 const BATCH_SIZE: usize = 64;
 
+enum PeerCryptoSlot {
+    Direct(PeerCrypto<NodeInfo>),
+    Shared(CryptoBoxHandle)
+}
+
+impl PeerCryptoSlot {
+    fn wrap(crypto: PeerCrypto<NodeInfo>, shared: bool) -> Self {
+        if shared {
+            Self::Shared(Arc::new(Mutex::new(crypto)))
+        } else {
+            Self::Direct(crypto)
+        }
+    }
+
+    fn shared_handle(&self) -> Option<CryptoBoxHandle> {
+        match self {
+            Self::Shared(h) => Some(h.clone()),
+            Self::Direct(_) => None
+        }
+    }
+
+    fn with_mut<R, F: FnOnce(&mut PeerCrypto<NodeInfo>) -> R>(&mut self, f: F) -> Result<R, Error> {
+        match self {
+            Self::Direct(c) => Ok(f(c)),
+            Self::Shared(h) => {
+                let mut g = h.lock().map_err(|_| Error::InvalidCryptoState("crypto lock"))?;
+                Ok(f(&mut *g))
+            }
+        }
+    }
+
+    fn algorithm_name(&self) -> &'static str {
+        match self {
+            Self::Direct(c) => c.algorithm_name(),
+            Self::Shared(h) => h.lock().map(|g| g.algorithm_name()).unwrap_or("?")
+        }
+    }
+}
+
 struct PeerData {
     addrs: AddrList,
     #[allow(dead_code)] // TODO: export in status
@@ -72,7 +111,7 @@ struct PeerData {
     timeout: Time,
     peer_timeout: u16,
     node_id: NodeId,
-    crypto: CryptoBoxHandle
+    crypto: PeerCryptoSlot
 }
 
 #[derive(Clone)]
@@ -129,10 +168,12 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     claims: RangeList,
     crypto: Crypto,
     crypto_pool: CryptoPool,
-    outbox: Vec<(SocketAddr, Vec<u8>)>,
+    outbox: Vec<(SocketAddr, MsgBuffer)>,
+    buf_spare: Vec<MsgBuffer>,
     pending_encrypt: HashMap<SocketAddr, Vec<(u8, MsgBuffer)>, Hash>,
     rx_bufs: Vec<MsgBuffer>,
     rx_addrs: Vec<SocketAddr>,
+    tun_bufs: Vec<MsgBuffer>,
     next_peers: Time,
     peer_timeout_publish: u16,
     update_freq: u16,
@@ -221,9 +262,11 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             crypto,
             crypto_pool: CryptoPool::new(config.crypto_threads),
             outbox: Vec::with_capacity(BATCH_SIZE),
+            buf_spare: Vec::with_capacity(BATCH_SIZE),
             pending_encrypt: HashMap::default(),
             rx_bufs: (0..BATCH_SIZE).map(|_| MsgBuffer::new(SPACE_BEFORE)).collect(),
             rx_addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)); BATCH_SIZE],
+            tun_bufs: (0..BATCH_SIZE).map(|_| MsgBuffer::new(SPACE_BEFORE)).collect(),
             acl: try_fail!(crate::acl::Acl::parse(&config.acl), "Invalid ACL: {}"),
             config: config.clone(),
             _dummy_p: PhantomData,
@@ -255,12 +298,19 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         Ok(())
     }
 
+    fn take_spare(&mut self) -> MsgBuffer {
+        self.buf_spare.pop().unwrap_or_else(|| MsgBuffer::new(SPACE_BEFORE))
+    }
+
     #[inline]
     fn send_to(&mut self, addr: SocketAddr, msg: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
         debug!("Sending msg with {} bytes to {}", msg.len(), addr);
         self.traffic.count_out_traffic(addr, msg.len());
-        self.outbox.push((addr, msg.message().to_vec()));
+        let mut owned = self.take_spare();
+        owned.clear();
+        owned.clone_from(msg.message());
+        self.outbox.push((addr, owned));
         Ok(())
     }
 
@@ -271,12 +321,17 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         if !self.peers.contains_key(&addr) {
             return Err(Error::Message("Sending to node that is not a peer"));
         }
-        if type_ == MESSAGE_TYPE_DATA && self.crypto_pool.enabled() {
-            self.pending_encrypt.entry(addr).or_default().push((type_, msg.clone()));
-            return Ok(());
+        if type_ == MESSAGE_TYPE_DATA {
+            if self.peers.get(&addr).and_then(|p| p.crypto.shared_handle()).is_some() {
+                self.pending_encrypt.entry(addr).or_default().push((type_, msg.clone()));
+                return Ok(());
+            }
         }
-        let crypto = self.peers.get(&addr).unwrap().crypto.clone();
-        crypto.lock().map_err(|_| Error::InvalidCryptoState("crypto lock"))?.send_message(type_, msg)?;
+        self.peers
+            .get_mut(&addr)
+            .ok_or(Error::Message("Sending to node that is not a peer"))?
+            .crypto
+            .with_mut(|c| c.send_message(type_, msg))??;
         self.send_to(addr, msg)
     }
 
@@ -287,14 +342,12 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
         if !self.crypto_pool.enabled() {
             for (addr, packets) in pending {
-                let Some(crypto) = self.peers.get(&addr).map(|p| p.crypto.clone()) else {
-                    continue;
-                };
                 for (type_, mut data) in packets {
-                    crypto
-                        .lock()
-                        .map_err(|_| Error::InvalidCryptoState("crypto lock"))?
-                        .send_message(type_, &mut data)?;
+                    if let Some(peer) = self.peers.get_mut(&addr) {
+                        peer.crypto.with_mut(|c| c.send_message(type_, &mut data))??;
+                    } else {
+                        continue;
+                    }
                     self.send_to(addr, &mut data)?;
                 }
             }
@@ -302,7 +355,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
         let mut jobs = 0;
         for (addr, packets) in pending {
-            let Some(crypto) = self.peers.get(&addr).map(|p| p.crypto.clone()) else {
+            let Some(crypto) = self.peers.get(&addr).and_then(|p| p.crypto.shared_handle()) else {
                 continue;
             };
             self.crypto_pool.submit(CryptoJob::Encrypt { crypto, packets, addr });
@@ -328,8 +381,12 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             return Ok(());
         }
         let pkts = mem::take(&mut self.outbox);
-        let refs: Vec<(&SocketAddr, &[u8])> = pkts.iter().map(|(a, d)| (a, d.as_slice())).collect();
-        match self.socket.send_batch(&refs) {
+        let refs: Vec<(&SocketAddr, &[u8])> = pkts.iter().map(|(a, d)| (a, d.message())).collect();
+        let send_res = self.socket.send_batch(&refs);
+        for (_, buf) in pkts {
+            self.buf_spare.push(buf);
+        }
+        match send_res {
             Ok(_) => Ok(()),
             Err(e) => Err(Error::SocketIo("IOError when sending", e))
         }
@@ -501,11 +558,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
         for addr in self.peers.keys().copied().collect::<SmallVec<[SocketAddr; 16]>>() {
             msg.clear();
-            let crypto = self.peers.get(&addr).unwrap().crypto.clone();
-            let result = {
-                let mut g = crypto.lock().map_err(|_| Error::InvalidCryptoState("crypto lock"))?;
-                g.every_second(&mut msg)
-            };
+            let result = self.peers.get_mut(&addr).unwrap().crypto.with_mut(|c| c.every_second(&mut msg))?;
             match result {
                 Err(_) => del.push(addr),
                 Ok(MessageResult::None) => (),
@@ -742,7 +795,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                     "  - \"{}\": {{ ttl_secs: {}, crypto: {} }}",
                     addr_nice(*addr),
                     data.timeout - now,
-                    data.crypto.lock().map(|g| g.algorithm_name()).unwrap_or("?")
+                    data.crypto.algorithm_name()
                 )?;
             }
             writeln!(f)?;
@@ -899,7 +952,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         if let Some(init) = self.pending_inits.remove(&addr) {
             self.peers.insert(addr, PeerData {
                 addrs: info.addrs.clone(),
-                crypto: Arc::new(Mutex::new(init)),
+                crypto: PeerCryptoSlot::wrap(init, self.crypto_pool.enabled()),
                 node_id: info.node_id,
                 peer_timeout: info.peer_timeout.unwrap_or(DEFAULT_PEER_TIMEOUT),
                 last_seen: TS::now(),
@@ -1120,14 +1173,8 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 return Ok(());
             }
             let mut result = None;
-            if let Some(crypto) = self.peers.get(&src).map(|p| p.crypto.clone()) {
-                result = {
-                    let locked = crypto.lock();
-                    match locked {
-                        Ok(mut g) if g.has_init() => Some(g.handle_message(data)),
-                        _ => None
-                    }
-                };
+            if let Some(peer) = self.peers.get_mut(&src) {
+                result = peer.crypto.with_mut(|c| if c.has_init() { Some(c.handle_message(data)) } else { None })?;
             }
             if let Some(result) = result {
                 result
@@ -1153,13 +1200,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                     }
                 }
             }
-        } else if let Some(crypto) = self.peers.get(&src).map(|p| p.crypto.clone()) {
+        } else if let Some(peer) = self.peers.get_mut(&src) {
             // HOT PATH
-            let result = {
-                let mut g = crypto.lock().map_err(|_| Error::InvalidCryptoState("crypto lock"))?;
-                g.handle_message(data)
-            };
-            result
+            peer.crypto.with_mut(|c| c.handle_message(data))?
         } else {
             // COLD PATH
             info!("Ignoring non-init message from unknown peer {}", addr_nice(src));
@@ -1188,8 +1231,10 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
 
     fn handle_socket_event(&mut self, _buffer: &mut MsgBuffer) {
         // HOT PATH
+        let mut bufs = mem::take(&mut self.rx_bufs);
+        let mut addrs = mem::take(&mut self.rx_addrs);
         loop {
-            let n = match self.socket.receive_batch(&mut self.rx_bufs, &mut self.rx_addrs) {
+            let n = match self.socket.receive_batch(&mut bufs, &mut addrs) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -1197,17 +1242,18 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             };
             let mut decrypt: HashMap<SocketAddr, (CryptoBoxHandle, Vec<MsgBuffer>), Hash> = HashMap::default();
             for i in 0..n {
-                let src = mapped_addr(self.rx_addrs[i]);
-                let mut buf = mem::replace(&mut self.rx_bufs[i], MsgBuffer::new(SPACE_BEFORE));
-                self.traffic.count_in_traffic(src, buf.len());
-                let offload =
-                    self.crypto_pool.enabled() && self.peers.contains_key(&src) && !is_init_message(buf.message());
+                let src = mapped_addr(addrs[i]);
+                self.traffic.count_in_traffic(src, bufs[i].len());
+                let offload = self.crypto_pool.enabled()
+                    && !is_init_message(bufs[i].message())
+                    && self.peers.get(&src).and_then(|p| p.crypto.shared_handle()).is_some();
                 if offload {
-                    let crypto = self.peers.get(&src).unwrap().crypto.clone();
-                    decrypt.entry(src).or_insert_with(|| (crypto, Vec::new())).1.push(buf);
+                    let crypto = self.peers.get(&src).unwrap().crypto.shared_handle().unwrap();
+                    let packet = mem::replace(&mut bufs[i], self.take_spare());
+                    decrypt.entry(src).or_insert_with(|| (crypto, Vec::new())).1.push(packet);
                     continue;
                 }
-                match self.handle_net_message(src, &mut buf) {
+                match self.handle_net_message(src, &mut bufs[i]) {
                     Err(e @ Error::CryptoInitFatal(_)) => {
                         debug!("Fatal crypto init error from {}: {}", src, e);
                         info!("Closing pending connection to {} due to error in crypto init", addr_nice(src));
@@ -1228,7 +1274,6 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                     Err(e) => error!("{}", e),
                     Ok(_) => {}
                 }
-                self.rx_bufs[i] = buf;
             }
             let jobs = decrypt.len();
             for (src, (crypto, packets)) in decrypt {
@@ -1245,29 +1290,27 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 }
             }
         }
+        self.rx_bufs = bufs;
+        self.rx_addrs = addrs;
         let _ = self.flush_pending_crypto();
         let _ = self.flush_outbox();
     }
 
-    fn handle_device_event(&mut self, buffer: &mut MsgBuffer) {
+    fn handle_device_event(&mut self, _buffer: &mut MsgBuffer) {
         // HOT PATH
-        let mut n = 0;
-        loop {
-            if n >= BATCH_SIZE {
-                break;
-            }
-            match self.device.read_msg(buffer) {
-                Ok(()) => {
-                    if let Err(e) = self.handle_interface_data(buffer) {
-                        error!("{}", e);
-                    }
-                    n += 1;
-                }
-                Err(Error::DeviceIo(_, ref e)) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) if n > 0 => break,
-                Err(e) => try_fail!(Err(e), "Failed to read from device: {}")
+        let mut bufs = mem::take(&mut self.tun_bufs);
+        let n = match self.device.read_batch(&mut bufs) {
+            Ok(n) => n,
+            Err(Error::DeviceIo(_, ref e)) if e.kind() == io::ErrorKind::WouldBlock => 0,
+            Err(Error::Device(_)) => 0,
+            Err(e) => try_fail!(Err(e), "Failed to read from device: {}")
+        };
+        for buf in bufs.iter_mut().take(n) {
+            if let Err(e) = self.handle_interface_data(buf) {
+                error!("{}", e);
             }
         }
+        self.tun_bufs = bufs;
         let _ = self.flush_pending_crypto();
         let _ = self.flush_outbox();
     }
