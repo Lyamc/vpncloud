@@ -48,6 +48,7 @@ mio = { version = "1.2.2", features = ["os-poll", "os-ext", "net"] }
 tun-rs = "2.8.8"
 ipnet = "2.12.1"
 getifaddrs = "0.6.2"
+service-manager = "0.11"
 # Software renderer only — wgpu is several MB and unused for this form.
 iced = { version = "0.14", optional = true, default-features = false, features = [
     "tiny-skia",

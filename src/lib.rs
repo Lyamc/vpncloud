@@ -30,6 +30,7 @@ pub mod oldconfig;
 pub mod payload;
 pub mod poll;
 pub mod port_forwarding;
+pub mod svc;
 pub mod table;
 pub mod traffic;
 pub mod types;

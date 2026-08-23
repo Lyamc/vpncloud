@@ -64,7 +64,8 @@ unprivileged LXC/Proxmox, bind-mount `/dev/net` and allow cgroup device
 
 **macOS.** TUN uses `utun`. TAP uses `feth` plus BPF. Create the interface
 with sudo; `--ip` configures the address. Dual-stack UDP listen works
-(`--listen 3210` binds IPv4 and IPv6).
+(`--listen 3210` binds IPv4 and IPv6). `vpncloud install` (installer feature)
+registers a LaunchDaemon (`ca.witherow.vpncloud`).
 
 **Windows.** TUN uses [Wintun](https://www.wintun.net/) (`wintun.dll` next to
 `vpncloud.exe`). TAP uses [tap-windows6](https://github.com/OpenVPN/tap-windows6)
@@ -135,6 +136,11 @@ sudo ./target/release/vpncloud --help
 sudo ./target/release/vpncloud install
 ```
 
+That copies the binary, example config, man page, and the systemd units
+`vpncloud@.service`, `vpncloud.target`, and `vpncloud-wsproxy.service`
+(same templates as `assets/`). Enable a network with
+`sudo systemctl enable --now vpncloud@mynet`.
+
 Desktop GUI (Iced, software renderer — not pulled into the CLI):
 
 ```sh
@@ -145,6 +151,23 @@ sudo ./target/release/vpncloud-gui                 # optional path: vpncloud-gui
 Debian/RPM packaging helpers live in `maskfile.md` (requires
 [mask](https://github.com/jacobdeichert/mask)). Systemd units are in
 `assets/`.
+
+#### macOS
+
+```sh
+cargo build --release --features installer
+sudo ./target/release/vpncloud install
+```
+
+Copies `/usr/bin/vpncloud`, writes `/etc/vpncloud/`, and registers LaunchDaemon
+`ca.witherow.vpncloud` (`/usr/bin/vpncloud --config /etc/vpncloud/vpncloud.yaml`).
+Edit that config, then:
+
+```sh
+sudo launchctl start ca.witherow.vpncloud
+```
+
+Uninstall: `sudo ./target/release/vpncloud install --uninstall`.
 
 #### Windows
 

@@ -12,6 +12,8 @@ This project follows [semantic versioning](http://semver.org).
 - [added] iOS TUN via Packet Tunnel Provider; TAP is not available
 - [added] Optional Iced desktop GUI (`vpncloud-gui`, `--features gui`)
 - [added] Noise protocol handshake (`--algorithm noise`: Noise_XX_25519_ChaChaPoly_SHA256)
+- [changed] Service install uses the `service-manager` crate (systemd, launchd, Windows `sc.exe`); the Windows service *process* is unchanged
+- [added] macOS `vpncloud install` registers LaunchDaemon `ca.witherow.vpncloud`
 - [added] Native websocket listen (`ws-listen://` / `ws://0.0.0.0:port`)
 - [added] Configurable device MTU (`--mtu`)
 - [added] Multiple addresses per peer with priority order

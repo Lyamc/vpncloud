@@ -295,6 +295,17 @@ subcommands.
   *vpncloud install --service* (installer feature) also registers the service
   and copies a user config into ProgramData.
 
+*install* (installer feature)::
+  Copy the binary, example config, and OS service files.
+  Linux: systemd units *vpncloud@.service*, *vpncloud.target*, and
+  *vpncloud-wsproxy.service* (templates in *assets/*, written to
+  */etc/systemd/system* and */lib/systemd/system*). Enable a network with
+  *systemctl enable --now vpncloud@<name>*.
+  macOS: LaunchDaemon *ca.witherow.vpncloud* running
+  */usr/bin/vpncloud --config /etc/vpncloud/vpncloud.yaml*.
+  Windows: optional tray / autostart / *--service* (see *service* above).
+  *--uninstall* removes the installed files and service.
+
 
 == DESCRIPTION
 
