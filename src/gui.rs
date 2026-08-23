@@ -17,7 +17,10 @@ use iced::{
 };
 
 use crate::{
-    config::{Config, ConfigFile, ConfigFileDevice, CryptoConfig},
+    config::{
+        config_format_from_path, load_config_file, resolve_config_path, write_config_file, Config, ConfigFile,
+        ConfigFileDevice, ConfigFormat, CryptoConfig
+    },
     device::Type,
     engine::run_vpn,
     util::CtrlC
@@ -242,10 +245,9 @@ fn disconnect(gui: &mut Gui) {
 
 fn engine_config(gui: &Gui) -> Result<Config, String> {
     let mut config = Config::default();
-    let path = Path::new(&gui.config_path);
+    let path = resolve_config_path(Path::new(&gui.config_path));
     if path.is_file() {
-        let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let file: ConfigFile = serde_norway::from_str(&raw).map_err(|e| e.to_string())?;
+        let (_path, file) = load_config_file(&path).map_err(|e| e.to_string())?;
         config.merge_file(file);
     }
     config.crypto.password = Some(gui.password.clone());
@@ -269,7 +271,10 @@ fn save(gui: &Gui) -> io::Result<PathBuf> {
             fs::create_dir_all(dir)?;
         }
     }
-    fs::write(&path, to_yaml(gui))?;
+    match config_format_from_path(&path) {
+        ConfigFormat::Toml => write_config_file(&path, &gui_to_config_file(gui))?,
+        ConfigFormat::Yaml => fs::write(&path, to_yaml(gui))?
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -279,8 +284,9 @@ fn save(gui: &Gui) -> io::Result<PathBuf> {
 }
 
 fn load_into(gui: &mut Gui) -> Result<(), String> {
-    let raw = fs::read_to_string(&gui.config_path).map_err(|e| e.to_string())?;
-    let file: ConfigFile = serde_norway::from_str(&raw).map_err(|e| e.to_string())?;
+    let path = resolve_config_path(Path::new(&gui.config_path));
+    let (path, file) = load_config_file(&path).map_err(|e| e.to_string())?;
+    gui.config_path = path.display().to_string();
     let mut config = Config::default();
     config.merge_file(file);
     gui.password = config.crypto.password.unwrap_or_default();
@@ -291,7 +297,7 @@ fn load_into(gui: &mut Gui) -> Result<(), String> {
     Ok(())
 }
 
-fn to_yaml(gui: &Gui) -> String {
+fn gui_to_config_file(gui: &Gui) -> ConfigFile {
     let mut file = ConfigFile::default();
     file.crypto = CryptoConfig { password: Some(gui.password.clone()), ..CryptoConfig::default() };
     let overlay = gui.overlay.trim();
@@ -319,7 +325,11 @@ fn to_yaml(gui: &Gui) -> String {
     if !peers.is_empty() {
         file.peers = Some(peers);
     }
-    serde_norway::to_string(&file).unwrap_or_default()
+    file
+}
+
+fn to_yaml(gui: &Gui) -> String {
+    serde_norway::to_string(&gui_to_config_file(gui)).unwrap_or_default()
 }
 
 fn default_config_path() -> PathBuf {
@@ -332,25 +342,27 @@ fn default_config_path() -> PathBuf {
     #[cfg(windows)]
     {
         if let Ok(ad) = env::var("LOCALAPPDATA") {
-            return PathBuf::from(ad).join("VpnCloud").join("vpncloud.yaml");
+            return resolve_config_path(&PathBuf::from(ad).join("VpnCloud").join("vpncloud.yaml"));
         }
     }
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = env::var_os("HOME") {
-            return PathBuf::from(home).join("Library/Application Support/VpnCloud/vpncloud.yaml");
+            return resolve_config_path(
+                &PathBuf::from(home).join("Library/Application Support/VpnCloud/vpncloud.yaml")
+            );
         }
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-            return PathBuf::from(xdg).join("vpncloud/vpncloud.yaml");
+            return resolve_config_path(&PathBuf::from(xdg).join("vpncloud/vpncloud.yaml"));
         }
         if let Some(home) = env::var_os("HOME") {
-            return PathBuf::from(home).join(".config/vpncloud/vpncloud.yaml");
+            return resolve_config_path(&PathBuf::from(home).join(".config/vpncloud/vpncloud.yaml"));
         }
     }
-    PathBuf::from("vpncloud.yaml")
+    resolve_config_path(&PathBuf::from("vpncloud.yaml"))
 }
 
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {

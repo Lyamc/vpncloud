@@ -1,9 +1,18 @@
-use crate::{config::Config, crypto::Crypto, device, types::Mode};
+use crate::{
+    config::{load_config_file, resolve_config_path, write_config_file, Config},
+    crypto::Crypto,
+    device,
+    types::Mode
+};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
 use ring::aead;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::{collections::HashMap, fs, io, path::Path};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs, io,
+    path::Path
+};
 
 const MODE_SIMPLE: usize = 0;
 const MODE_ADVANCED: usize = 1;
@@ -465,16 +474,17 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
         name
     } else {
         // Try to list existing networks from /etc/vpncloud; if directory doesn't exist treat as empty
-        let mut names = vec![];
+        let mut names = BTreeSet::new();
         if let Ok(entries) = fs::read_dir("/etc/vpncloud") {
             for file in entries {
                 if let Ok(entry) = file {
                     if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                        names.push(stem.to_string());
+                        names.insert(stem.to_string());
                     }
                 }
             }
         }
+        let names: Vec<String> = names.into_iter().collect();
         let selection =
             Select::with_theme(&theme).with_prompt("Which network?").item("New network").items(&names).interact()?;
         if selection > 0 {
@@ -487,22 +497,25 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
     let mut config = Config::default();
 
     // Resolve target path for config file:
-    // - If user provided --config, use that path
-    // - Otherwise default to /etc/vpncloud/<name>.net
+    // - If user provided --config, use that path (YAML wins over TOML for the same stem)
+    // - Otherwise default to /etc/vpncloud/<name>.net, or an existing .yaml/.toml
     use std::path::PathBuf;
     let mut file: PathBuf = if let Some(p) = config_path {
-        PathBuf::from(p)
+        resolve_config_path(Path::new(&p))
     } else {
-        Path::new("/etc/vpncloud").join(format!("{}.net", name))
+        let base = Path::new("/etc/vpncloud").join(&name);
+        let resolved = resolve_config_path(&base);
+        if resolved.is_file() {
+            resolved
+        } else {
+            base.with_extension("net")
+        }
     };
 
     // If file exists, attempt to read and merge it
     if file.exists() {
-        let f = fs::File::open(&file).map_err(|e| {
-            io::Error::new(e.kind(), format!("Failed to open existing config file '{}': {}", file.display(), e))
-        })?;
-        let config_file = serde_norway::from_reader(f).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse config file '{}'", file.display()))
+        let (_path, config_file) = load_config_file(&file).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse config file '{}': {}", file.display(), e))
         })?;
         config.merge_file(config_file);
     }
@@ -583,14 +596,8 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
         }
 
         // Try to create the file; provide detailed error messages including path on failure
-        match fs::File::create(&file) {
-            Ok(fh) => {
-                serde_norway::to_writer(fh, &config_file).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Failed to write config to '{}'", file.display())
-                    )
-                })?;
+        match write_config_file(&file, &config_file) {
+            Ok(()) => {
                 // set safe permissions where possible
                 #[cfg(unix)]
                 if let Err(e) = fs::set_permissions(&file, fs::Permissions::from_mode(0o600)) {
@@ -635,32 +642,20 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
                                     )
                                 })?;
                             }
-                            let fh = fs::File::create(&file).map_err(|e| {
+                            write_config_file(&file, &config_file).map_err(|e| {
                                 io::Error::new(
                                     e.kind(),
-                                    format!("Failed to create per-user file '{}': {}", file.display(), e)
-                                )
-                            })?;
-                            serde_norway::to_writer(fh, &config_file).map_err(|_| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("Failed to write config to '{}'", file.display())
+                                    format!("Failed to write per-user file '{}': {}", file.display(), e)
                                 )
                             })?;
                             println!("Configuration written to '{}'", file.display());
                         }
                         1 => {
                             file = temp;
-                            let fh = fs::File::create(&file).map_err(|e| {
+                            write_config_file(&file, &config_file).map_err(|e| {
                                 io::Error::new(
                                     e.kind(),
-                                    format!("Failed to create temp file '{}': {}", file.display(), e)
-                                )
-                            })?;
-                            serde_norway::to_writer(fh, &config_file).map_err(|_| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("Failed to write config to '{}'", file.display())
+                                    format!("Failed to write temp file '{}': {}", file.display(), e)
                                 )
                             })?;
                             println!("Configuration written to temporary file '{}'", file.display());

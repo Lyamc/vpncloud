@@ -1,0 +1,57 @@
+# VpnCloud configuration (TOML)
+#
+# YAML (.yaml / .yml / .net) is also supported. If both a YAML file and a
+# TOML file exist for the same name, YAML is used.
+#
+# Keys use the same kebab-case names as the YAML config.
+# Put top-level keys first; keys after a [table] belong to that table.
+
+listen = "3210"
+
+peers = [
+  "node2.example.com:3210",
+  "node3.example.com:3210",
+  # alternative addresses for one peer (first = highest priority):
+  # [ "192.168.0.3:3210", "172.16.0.3:3210" ],
+]
+
+# Must be different for every node on the VPN
+# ip = "10.0.0.1/24"
+
+auto-claim = true
+# claims = ["10.1.1.0/24"]
+
+mode = "normal"
+port-forwarding = true
+switch-timeout = 300
+peer-timeout = 300
+# keepalive = 120
+# pid-file = "/run/vpncloud.run"
+# stats-file = "/var/log/vpncloud.stats"
+# hook = ""
+tray = false
+
+[crypto]
+# password = "change-me"
+# private-key = ""
+# public-key = ""
+# trusted-keys = []
+
+[device]
+name = "vpncloud%d"
+type = "tun"
+# path = "/dev/net/tun"
+fix-rp-filter = false
+# mtu = 1400
+
+[beacon]
+# store = "/run/vpncloud.beacon.out"
+# load = "/run/vpncloud.beacon.in"
+interval = 3600
+# password = ""
+
+# [statsd]
+# server = "example.com:1234"
+# prefix = "vpncloud"
+
+# [hooks]

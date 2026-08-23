@@ -70,10 +70,10 @@ pub extern "system" fn Java_ca_witherow_vpncloud_NativeEngine_nativeStart(
             return;
         }
     };
-    let file: crate::config::ConfigFile = match serde_norway::from_str(&yaml) {
+    let file: crate::config::ConfigFile = match crate::config::parse_config_auto(&yaml) {
         Ok(f) => f,
         Err(e) => {
-            throw(&mut env, &format!("config YAML: {}", e));
+            throw(&mut env, &format!("config YAML/TOML: {}", e));
             return;
         }
     };

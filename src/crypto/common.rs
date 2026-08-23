@@ -51,10 +51,15 @@ pub struct Algorithms {
 #[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
 pub struct Config {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub private_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trusted_keys: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub algorithms: Vec<String>
 }
 

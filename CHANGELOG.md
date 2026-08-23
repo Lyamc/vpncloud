@@ -2,7 +2,12 @@
 
 This project follows [semantic versioning](http://semver.org).
 
-### UNRELEASED (2.4.0 fork)
+### UNRELEASED
+
+- [changed] Service install uses the `service-manager` crate (systemd, launchd, Windows `sc.exe`); the Windows service *process* is unchanged
+- [added] macOS `vpncloud install` registers LaunchDaemon `ca.witherow.vpncloud`
+
+### v2.4.0 (2026-08-22)
 
 - [added] macOS TUN (`utun`) and TAP (`feth` + BPF) via tun-rs
 - [added] Windows TUN (Wintun) and TAP (tap-windows6)
@@ -12,13 +17,12 @@ This project follows [semantic versioning](http://semver.org).
 - [added] iOS TUN via Packet Tunnel Provider; TAP is not available
 - [added] Optional Iced desktop GUI (`vpncloud-gui`, `--features gui`)
 - [added] Noise protocol handshake (`--algorithm noise`: Noise_XX_25519_ChaChaPoly_SHA256)
-- [changed] Service install uses the `service-manager` crate (systemd, launchd, Windows `sc.exe`); the Windows service *process* is unchanged
-- [added] macOS `vpncloud install` registers LaunchDaemon `ca.witherow.vpncloud`
 - [added] Native websocket listen (`ws-listen://` / `ws://0.0.0.0:port`)
 - [added] Configurable device MTU (`--mtu`)
 - [added] Multiple addresses per peer with priority order
 - [added] IPv6 overlay addresses on `--ip` (e.g. `fd00:1::1/64`)
 - [added] Firewall, LXC/Proxmox, and IPv6 documentation
+- [added] TOML config files (`.toml`); YAML still wins if both exist for the same name
 - [changed] Updated dependencies (clap 4, serde_norway, igd-next, libc::daemon)
 - [changed] Unique TAP MAC on every node
 - [fixed] Dual-stack UDP listen on macOS (IPV6_V6ONLY)

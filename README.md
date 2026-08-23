@@ -18,7 +18,9 @@ and dependency fixes. Upstream documentation lives at
 vpncloud -c REMOTE_HOST:PORT -p 'mypassword' --ip 10.0.0.1/24
 ```
 
-Or as a config file (`/etc/vpncloud/mynet.net` on Linux):
+Or as a config file (`/etc/vpncloud/mynet.net` on Linux). YAML
+(`.yaml` / `.yml` / `.net`) and TOML (`.toml`) are both accepted. If both
+exist for the same name, **YAML is used**.
 
 ```yaml
 crypto:
@@ -28,8 +30,16 @@ peers:
   - REMOTE_HOST:PORT
 ```
 
-See `vpncloud.adoc` (the man page) for every option, and
-`assets/example.net.disabled` for a commented template.
+```toml
+ip = "10.0.0.1/24"
+peers = ["REMOTE_HOST:PORT"]
+
+[crypto]
+password = "mysecret"
+```
+
+See `vpncloud.adoc` (the man page) for every option, `assets/example.net.disabled`
+for a commented YAML template, and `assets/example.toml.disabled` for TOML.
 
 
 ### Project status
