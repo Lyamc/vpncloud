@@ -27,9 +27,9 @@ fn apply_linux() -> Result<(), String> {
     }
     let arch = audit_arch()?;
     let mut filter = Vec::new();
-    // if arch != expected -> KILL
+    // if arch != expected -> KILL (jt=1 skips the RET KILL when arch matches)
     filter.push(bpf(bpf_class::LD | bpf_class::W | bpf_class::ABS, 0, 0, 4)); // arch offset
-    filter.push(bpf(bpf_class::JMP | bpf_class::JEQ | bpf_class::K, 0, 1, arch));
+    filter.push(bpf(bpf_class::JMP | bpf_class::JEQ | bpf_class::K, 1, 0, arch));
     filter.push(bpf(bpf_class::RET | bpf_class::K, 0, 0, seccomp_ret::KILL_PROCESS));
     filter.push(bpf(bpf_class::LD | bpf_class::W | bpf_class::ABS, 0, 0, 0)); // nr offset
     for &nr in blocked_syscalls() {
