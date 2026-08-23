@@ -282,6 +282,33 @@ struct SendMmsgScratch {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_msghdr(
+    name: *mut libc::c_void,
+    namelen: u32,
+    iov: *mut libc::iovec,
+    control: *mut libc::c_void,
+    controllen: usize
+) -> libc::msghdr {
+    // musl's msghdr has private padding; zero then fill public fields.
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_name = name;
+    hdr.msg_namelen = namelen;
+    hdr.msg_iov = iov;
+    hdr.msg_iovlen = 1;
+    hdr.msg_control = control;
+    hdr.msg_controllen = controllen as _;
+    hdr
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mmsghdr(msg_hdr: libc::msghdr) -> libc::mmsghdr {
+    let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_hdr = msg_hdr;
+    hdr.msg_len = 0;
+    hdr
+}
+
+#[cfg(target_os = "linux")]
 thread_local! {
     static RECV_MMSG: RefCell<RecvMmsgScratch> =
         RefCell::new(RecvMmsgScratch { names: Vec::new(), iov: Vec::new(), hdrs: Vec::new(), cbufs: Vec::new() });
@@ -308,21 +335,17 @@ fn linux_recvmmsg(fd: RawFd, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -
             bufs[i].clear();
             let buf = bufs[i].buffer();
             s.iov[i] = libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: buf.len() };
-            s.hdrs[i] = libc::mmsghdr {
-                msg_hdr: libc::msghdr {
-                    msg_name: &mut s.names[i] as *mut _ as *mut _,
-                    msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as u32,
-                    msg_iov: &mut s.iov[i],
-                    msg_iovlen: 1,
-                    msg_control: s.cbufs[i].as_mut_ptr() as *mut _,
-                    msg_controllen: s.cbufs[i].len(),
-                    msg_flags: 0
-                },
-                msg_len: 0
-            };
+            s.hdrs[i] = linux_mmsghdr(linux_msghdr(
+                &mut s.names[i] as *mut _ as *mut _,
+                std::mem::size_of::<libc::sockaddr_storage>() as u32,
+                &mut s.iov[i],
+                s.cbufs[i].as_mut_ptr() as *mut _,
+                s.cbufs[i].len()
+            ));
         }
-        let got =
-            unsafe { libc::recvmmsg(fd, s.hdrs.as_mut_ptr(), n as u32, libc::MSG_DONTWAIT, std::ptr::null_mut()) };
+        let got = unsafe {
+            libc::recvmmsg(fd, s.hdrs.as_mut_ptr(), n as u32, libc::MSG_DONTWAIT as _, std::ptr::null_mut())
+        };
         if got < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -388,18 +411,13 @@ fn linux_sendmmsg(fd: RawFd, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usi
         // mutably borrow the whole scratch struct and fail on stable).
         s.hdrs.resize_with(n, || unsafe { std::mem::zeroed() });
         for i in 0..n {
-            s.hdrs[i] = libc::mmsghdr {
-                msg_hdr: libc::msghdr {
-                    msg_name: &mut s.names[i].0 as *mut _ as *mut _,
-                    msg_namelen: s.names[i].1,
-                    msg_iov: &mut s.iov[i],
-                    msg_iovlen: 1,
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
-                    msg_flags: 0
-                },
-                msg_len: 0
-            };
+            s.hdrs[i] = linux_mmsghdr(linux_msghdr(
+                &mut s.names[i].0 as *mut _ as *mut _,
+                s.names[i].1,
+                &mut s.iov[i],
+                std::ptr::null_mut(),
+                0
+            ));
         }
         let got = unsafe { libc::sendmmsg(fd, s.hdrs.as_mut_ptr(), n as u32, 0) };
         if got < 0 {
@@ -430,15 +448,13 @@ fn linux_gso_send_concat(fd: RawFd, dest: &SocketAddr, n: usize, seg: usize, con
     let mut name = std_to_sockaddr(*dest);
     let mut iov = libc::iovec { iov_base: concat.as_ptr() as *mut _, iov_len: concat.len() };
     let mut cbuf = [0u8; 32];
-    let hdr = libc::msghdr {
-        msg_name: &mut name.0 as *mut _ as *mut _,
-        msg_namelen: name.1,
-        msg_iov: &mut iov,
-        msg_iovlen: 1,
-        msg_control: cbuf.as_mut_ptr() as *mut _,
-        msg_controllen: unsafe { libc::CMSG_SPACE(2) } as _,
-        msg_flags: 0
-    };
+    let hdr = linux_msghdr(
+        &mut name.0 as *mut _ as *mut _,
+        name.1,
+        &mut iov,
+        cbuf.as_mut_ptr() as *mut _,
+        unsafe { libc::CMSG_SPACE(2) } as usize
+    );
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&hdr);
         if cmsg.is_null() {
