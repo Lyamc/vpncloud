@@ -55,10 +55,22 @@ impl Pollable for UdpSocket {
     }
 }
 
+impl Pollable for std::net::TcpStream {
+    fn wait_socket(&self) -> Option<RawSocket> {
+        Some(self.as_raw_socket())
+    }
+}
+
+fn wsa_event_invalid(ev: WSAEVENT) -> bool {
+    ev as usize == 0
+}
+
 pub struct WaitImpl {
     socket: SOCKET,
     socket_event: WSAEVENT,
     device_event: HANDLE,
+    device_socket: Option<SOCKET>,
+    device_wsa: Option<WSAEVENT>,
     handles: [HANDLE; 2],
     queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     timeout_ms: u32,
@@ -68,12 +80,11 @@ pub struct WaitImpl {
 
 impl WaitImpl {
     pub fn new(socket: &impl Pollable, device: &impl Pollable, timeout: u32) -> io::Result<Self> {
-        let raw_socket = socket.wait_socket().ok_or_else(|| io::Error::other("Windows poll requires a UDP socket"))?;
-        let source = device.wait_device().ok_or_else(|| io::Error::other("Windows poll requires a TUN/TAP device"))?;
+        let raw_socket = socket.wait_socket().ok_or_else(|| io::Error::other("Windows poll requires a socket"))?;
 
         unsafe {
             let socket_event = WSACreateEvent();
-            if socket_event.is_null() {
+            if wsa_event_invalid(socket_event) {
                 return Err(io::Error::last_os_error());
             }
             let rc = WSAEventSelect(raw_socket as SOCKET, socket_event, (FD_READ | FD_CLOSE) as i32);
@@ -82,50 +93,84 @@ impl WaitImpl {
                 return Err(io::Error::last_os_error());
             }
 
-            let device_event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
-            if device_event.is_null() {
-                WSACloseEvent(socket_event);
-                return Err(io::Error::last_os_error());
-            }
+            if let Some(source) = device.wait_device() {
+                let device_event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+                if device_event.is_null() {
+                    WSACloseEvent(socket_event);
+                    return Err(io::Error::last_os_error());
+                }
 
-            let stop = Arc::new(AtomicBool::new(false));
-            let queue = source.queue.clone();
-            let recv = source.recv.clone();
-            let stop_t = stop.clone();
-            let queue_t = queue.clone();
-            let ev_t = device_event;
+                let stop = Arc::new(AtomicBool::new(false));
+                let queue = source.queue.clone();
+                let recv = source.recv.clone();
+                let stop_t = stop.clone();
+                let queue_t = queue.clone();
+                // windows-sys 0.61 HANDLE is a raw pointer (not Send). Pass it as usize.
+                let ev_bits = device_event as usize;
 
-            let thread = thread::Builder::new().name("vpncloud-wintun".into()).spawn(move || {
-                let mut buf = vec![0u8; 65535];
-                while !stop_t.load(Ordering::Relaxed) {
-                    match (recv)(&mut buf) {
-                        Ok(n) => {
-                            queue_t.lock().expect("device queue").push_back(buf[..n].to_vec());
-                            let _ = SetEvent(ev_t);
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted => {
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(_) => {
-                            if stop_t.load(Ordering::Relaxed) {
-                                break;
+                let thread = thread::Builder::new().name("vpncloud-wintun".into()).spawn(move || {
+                    let mut buf = vec![0u8; 65535];
+                    while !stop_t.load(Ordering::Relaxed) {
+                        match (recv)(&mut buf) {
+                            Ok(n) => {
+                                queue_t.lock().expect("device queue").push_back(buf[..n].to_vec());
+                                let _ = SetEvent(ev_bits as HANDLE);
                             }
-                            thread::sleep(Duration::from_millis(20));
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted => {
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(_) => {
+                                if stop_t.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(20));
+                            }
                         }
                     }
-                }
-            })?;
+                })?;
 
-            Ok(Self {
-                socket: raw_socket as SOCKET,
-                socket_event,
-                device_event,
-                handles: [socket_event, device_event],
-                queue,
-                timeout_ms: timeout,
-                stop,
-                _thread: Some(thread)
-            })
+                return Ok(Self {
+                    socket: raw_socket as SOCKET,
+                    socket_event,
+                    device_event,
+                    device_socket: None,
+                    device_wsa: None,
+                    handles: [socket_event as HANDLE, device_event],
+                    queue,
+                    timeout_ms: timeout,
+                    stop,
+                    _thread: Some(thread)
+                });
+            }
+
+            if let Some(raw_dev) = device.wait_socket() {
+                let device_wsa = WSACreateEvent();
+                if wsa_event_invalid(device_wsa) {
+                    WSACloseEvent(socket_event);
+                    return Err(io::Error::last_os_error());
+                }
+                let rc = WSAEventSelect(raw_dev as SOCKET, device_wsa, (FD_READ | FD_CLOSE) as i32);
+                if rc != 0 {
+                    WSACloseEvent(device_wsa);
+                    WSACloseEvent(socket_event);
+                    return Err(io::Error::last_os_error());
+                }
+                return Ok(Self {
+                    socket: raw_socket as SOCKET,
+                    socket_event,
+                    device_event: device_wsa as HANDLE,
+                    device_socket: Some(raw_dev as SOCKET),
+                    device_wsa: Some(device_wsa),
+                    handles: [socket_event as HANDLE, device_wsa as HANDLE],
+                    queue: Arc::new(Mutex::new(VecDeque::new())),
+                    timeout_ms: timeout,
+                    stop: Arc::new(AtomicBool::new(false)),
+                    _thread: None
+                });
+            }
+
+            WSACloseEvent(socket_event);
+            Err(io::Error::other("Windows poll requires a TUN/TAP device or a second socket"))
         }
     }
 }
@@ -136,8 +181,11 @@ impl Drop for WaitImpl {
         unsafe {
             let _ = SetEvent(self.device_event);
             WSACloseEvent(self.socket_event);
-            // device_event is closed after the thread may still signal it; leaking it until
-            // process exit is preferable to a use-after-close in the reader thread.
+            if let Some(ev) = self.device_wsa {
+                WSACloseEvent(ev);
+            }
+            // CreateEventW device_event is leaked until process exit so the reader thread
+            // cannot signal a closed handle.
         }
     }
 }
@@ -168,7 +216,12 @@ impl Iterator for WaitImpl {
                 return Some(WaitResult::Socket);
             }
             if rc == DEVICE_SLOT {
-                let _ = ResetEvent(self.device_event);
+                if let (Some(sock), Some(ev)) = (self.device_socket, self.device_wsa) {
+                    let mut events = WSANETWORKEVENTS { lNetworkEvents: 0, iErrorCode: [0; 10] };
+                    let _ = WSAEnumNetworkEvents(sock, ev, &mut events);
+                } else {
+                    let _ = ResetEvent(self.device_event);
+                }
                 return Some(WaitResult::Device);
             }
             Some(WaitResult::Timeout)

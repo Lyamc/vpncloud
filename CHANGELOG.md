@@ -24,6 +24,8 @@ This project follows [semantic versioning](http://semver.org).
 - [fixed] TUN vs TAP mismatch error message
 - [fixed] Republish addresses when the public IP changes
 - [fixed] Parse interface IPs without host-endian ioctl packing
+- [fixed] Windows build against windows-sys 0.61 (HANDLE as pointer: tray, service, poll)
+- [fixed] Windows `vpncloud install` copies `wintun.dll` when it sits next to the exe
 
 ### v2.3.0 (2021-12-23)
 

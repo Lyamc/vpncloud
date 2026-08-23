@@ -3,13 +3,15 @@
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
 use std::{
-    fs::{self, File, Permissions},
+    fs::{self, File},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket},
     path::Path,
     process,
     str::FromStr
 };
 
+#[cfg(unix)]
+use std::fs::Permissions;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -20,6 +22,7 @@ use crate::{
     net::Socket,
     payload,
     payload::Protocol,
+    poll::Pollable,
     util::SystemTimeSource
 };
 
@@ -122,7 +125,7 @@ fn setup_device(config: &Config) -> TunTapDevice {
 }
 
 #[allow(clippy::cognitive_complexity)]
-fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
+fn run<P: Protocol, S: Socket + Pollable>(config: Config, socket: S) {
     let device = setup_device(&config);
     let port_forwarding = if config.port_forwarding { socket.create_port_forwarding() } else { None };
     let stats_file = match config.stats_file {

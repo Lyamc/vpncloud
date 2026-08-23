@@ -68,11 +68,13 @@ with sudo; `--ip` configures the address. Dual-stack UDP listen works
 
 **Windows.** TUN uses [Wintun](https://www.wintun.net/) (`wintun.dll` next to
 `vpncloud.exe`). TAP uses [tap-windows6](https://github.com/OpenVPN/tap-windows6)
-(NdisWan / `tap0901`). Run as Administrator. Optional system tray (Enable /
-Disable / Exit) is offered at `vpncloud install` (build with `--features installer`)
-or `vpncloud.exe --tray`. Install prompts for the tray and optional
-Start-with-Windows; unattended: `vpncloud install --tray` / `--no-tray` /
-`--autostart`.
+(NdisWan / `tap0901`). Run as Administrator. See *Installing* below for MSVC
+build steps and where `vpncloud install` puts files. Optional system tray
+(Enable / Disable / Exit) is offered at `vpncloud install` (build with
+`--features installer`) or `vpncloud.exe --tray`. Install prompts for the tray
+and optional Start-with-Windows; unattended: `vpncloud install --tray` /
+`--no-tray` / `--autostart`. If `wintun.dll` is next to the built exe, `install`
+copies it into the install folder.
 
 As a **system service** (Administrator, LocalSystem, auto-start at boot):
 
@@ -115,17 +117,23 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 
 ### Installing
 
-Prerequisites: Rust/Cargo (edition 2021, toolchain 1.75+), and on Linux
-`asciidoctor` if you want the man page.
+Prerequisites: Rust/Cargo (edition 2021, toolchain 1.75+). On Linux, install
+`asciidoctor` if you want the man page. The `install` subcommand is compiled
+only with `--features installer`.
 
 ```sh
 git clone https://github.com/Lyamc/vpncloud.git
 cd vpncloud
-cargo build --release
-sudo ./target/release/vpncloud --help
+cargo test
 ```
 
-Tests: `cargo test`.
+#### Linux
+
+```sh
+cargo build --release --features installer
+sudo ./target/release/vpncloud --help
+sudo ./target/release/vpncloud install
+```
 
 Desktop GUI (Iced, software renderer — not pulled into the CLI):
 
@@ -137,6 +145,69 @@ sudo ./target/release/vpncloud-gui                 # optional path: vpncloud-gui
 Debian/RPM packaging helpers live in `maskfile.md` (requires
 [mask](https://github.com/jacobdeichert/mask)). Systemd units are in
 `assets/`.
+
+#### Windows
+
+Windows has no in-box TUN/TAP. **TUN** needs [Wintun](https://www.wintun.net/)
+(`wintun.dll` next to `vpncloud.exe`). **TAP** needs the
+[tap-windows6](https://github.com/OpenVPN/tap-windows6) driver. Creating the
+virtual interface requires **Administrator**.
+
+1. Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+   with the **Desktop development with C++** workload. The GNU Rust toolchain
+   (`x86_64-pc-windows-gnu`) also needs a MinGW `cc` on `PATH` because `ring`
+   compiles C; **MSVC is the path that works out of the box**.
+
+2. Build with the MSVC toolchain and the installer feature:
+
+```bat
+rustup toolchain install stable-x86_64-pc-windows-msvc
+cargo +stable-x86_64-pc-windows-msvc build --release --features installer
+```
+
+The binary is `target\release\vpncloud.exe`.
+
+3. Download [Wintun 0.14.1](https://www.wintun.net/builds/wintun-0.14.1.zip)
+   (SHA2-256 `07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51`).
+   Copy `bin\amd64\wintun.dll` (or `arm64` on ARM) next to `vpncloud.exe`:
+
+```bat
+copy path\to\wintun\bin\amd64\wintun.dll target\release\
+```
+
+Without `wintun.dll`, TUN fails at startup with `LoadLibraryExW failed`.
+
+4. Optional TAP: install a tap-windows6 release from
+   [OpenVPN downloads](https://build.openvpn.net/downloads/releases/)
+   (hardware id `tap0901` / NdisWan).
+
+5. Install (copies the exe, `wintun.dll` if present, an example config, and a
+   Start Menu shortcut). User-level files go to `%LOCALAPPDATA%\VpnCloud`
+   (`C:\Users\<you>\AppData\Local\VpnCloud`):
+
+```bat
+.\target\release\vpncloud.exe install --no-service
+```
+
+Unattended flags: `--tray` / `--no-tray`, `--autostart`, `--service` /
+`--no-service`. `--service` requires Administrator and registers a LocalSystem
+auto-start service (`C:\Program Files\VpnCloud` plus
+`C:\ProgramData\VpnCloud\vpncloud.yaml`).
+
+```bat
+vpncloud.exe install --uninstall
+```
+
+6. Edit `%LOCALAPPDATA%\VpnCloud\vpncloud.yaml` (set `crypto.password` or a
+   keypair and `--ip`), then run **as Administrator**:
+
+```bat
+cd %LOCALAPPDATA%\VpnCloud
+vpncloud.exe --config vpncloud.yaml --ip 10.0.0.1/24 -p mysecret
+```
+
+Or `vpncloud.exe --tray --config vpncloud.yaml` for the tray icon. Keep
+`wintun.dll` in that same folder.
 
 
 ### Websocket
