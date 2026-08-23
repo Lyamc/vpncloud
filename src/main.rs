@@ -165,7 +165,7 @@ fn main() {
                 }
             }
             #[cfg(feature = "installer")]
-            Command::Install { uninstall, tray, no_tray, autostart } => {
+            Command::Install { uninstall, tray, no_tray, autostart, service, no_service } => {
                 let tray = if no_tray {
                     Some(false)
                 } else if tray {
@@ -173,9 +173,32 @@ fn main() {
                 } else {
                     None
                 };
-                let result = installer::install(installer::InstallOpts { uninstall, tray, autostart });
+                let service = if no_service {
+                    Some(false)
+                } else if service {
+                    Some(true)
+                } else {
+                    None
+                };
+                let result = installer::install(installer::InstallOpts { uninstall, tray, autostart, service });
                 if let Err(e) = result {
                     log::error!("{} failed: {}", if uninstall { "Uninstall" } else { "Install" }, e);
+                }
+            }
+            #[cfg(windows)]
+            Command::Service { action } => {
+                use vpncloud::config::WindowsServiceAction;
+                let result = match action {
+                    WindowsServiceAction::Install { config, start } => {
+                        let path = config.as_deref().map(std::path::Path::new);
+                        vpncloud::winservice::install(path, start)
+                    }
+                    WindowsServiceAction::Uninstall => vpncloud::winservice::uninstall(),
+                    WindowsServiceAction::Start => vpncloud::winservice::start(),
+                    WindowsServiceAction::Stop => vpncloud::winservice::stop()
+                };
+                if let Err(e) = result {
+                    log::error!("Windows service: {}", e);
                 }
             }
         }
@@ -217,10 +240,20 @@ fn main() {
         };
         config.merge_file(config_file)
     }
+    #[cfg(windows)]
+    let as_service = args.service;
     config.merge_args(args);
     log::debug!("Config: {:?}", config);
     if config.crypto.password.is_none() && config.crypto.private_key.is_none() {
         log::error!("Either password or private key must be set in config or given as parameter");
+        return;
+    }
+    #[cfg(windows)]
+    if as_service {
+        config.tray = false;
+        if let Err(e) = vpncloud::winservice::run(config) {
+            log::error!("{}", e);
+        }
         return;
     }
     run_vpn(config);

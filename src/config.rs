@@ -618,6 +618,11 @@ pub struct Args {
     #[arg(long)]
     pub log_file: Option<String>,
 
+    /// Run as a Windows service (used by the Service Control Manager)
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    pub service: bool,
+
     /// Call script on event
     #[arg(long)]
     pub hook: Vec<String>,
@@ -695,8 +700,42 @@ pub enum Command {
         no_tray: bool,
         /// Windows: start VpnCloud with Windows (registry Run key)
         #[arg(long)]
-        autostart: bool
+        autostart: bool,
+        /// Windows: register a system service (requires Administrator)
+        #[arg(long)]
+        service: bool,
+        /// Windows: do not register a system service
+        #[arg(long, conflicts_with = "service")]
+        no_service: bool
+    },
+
+    /// Windows service (install / uninstall / start / stop). Requires Administrator.
+    #[cfg(windows)]
+    Service {
+        #[command(subcommand)]
+        action: WindowsServiceAction
     }
+}
+
+/// Windows Service Control Manager actions
+#[cfg(windows)]
+#[derive(Subcommand, Debug)]
+pub enum WindowsServiceAction {
+    /// Register VpnCloud as a LocalSystem auto-start service
+    Install {
+        /// Config file the service should load
+        #[arg(long)]
+        config: Option<String>,
+        /// Start the service immediately after installing
+        #[arg(long)]
+        start: bool
+    },
+    /// Unregister the Windows service
+    Uninstall,
+    /// Start the VpnCloud service
+    Start,
+    /// Stop the VpnCloud service
+    Stop
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]

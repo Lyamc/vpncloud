@@ -14,7 +14,9 @@ pub struct InstallOpts {
     pub uninstall: bool,
     /// None = prompt on Windows when stdin is a TTY
     pub tray: Option<bool>,
-    pub autostart: bool
+    pub autostart: bool,
+    /// None = prompt on Windows when stdin is a TTY
+    pub service: Option<bool>
 }
 
 #[cfg(unix)]
@@ -117,11 +119,22 @@ fn install_windows(opts: InstallOpts) -> Result<(), Error> {
         .and_then(|mut f| f.write_all(EXAMPLE_CONFIG))
         .map_err(|e| Error::FileIo("Failed to create example config", e))?;
 
-    let tray = opts.tray.unwrap_or_else(|| {
-        prompt_yes_no("Install a system tray icon (Enable / Disable / Exit)?", true)
+    let service = opts.service.unwrap_or_else(|| {
+        prompt_yes_no(
+            "Install as a Windows system service? Requires Administrator (sc start VpnCloud).",
+            false
+        )
     });
-    let autostart = opts.autostart
-        || (tray && prompt_yes_no("Start VpnCloud with Windows (uses the tray icon)?", false));
+    let tray = if service {
+        false
+    } else {
+        opts.tray.unwrap_or_else(|| {
+            prompt_yes_no("Install a system tray icon (Enable / Disable / Exit)?", true)
+        })
+    };
+    let autostart = !service
+        && (opts.autostart
+            || (tray && prompt_yes_no("Start VpnCloud with Windows (uses the tray icon)?", false)));
 
     let cfg_path = base.join("vpncloud.yaml");
     if !cfg_path.exists() {
@@ -139,6 +152,16 @@ fn install_windows(opts: InstallOpts) -> Result<(), Error> {
     }
     if tray {
         info!("Tray icon enabled. Run: {} --config {} --tray", exe_dest.display(), cfg_path.display());
+    }
+    if service {
+        let svc_cfg = crate::winservice::default_config_path();
+        if let Some(parent) = svc_cfg.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if cfg_path.exists() {
+            let _ = fs::copy(&cfg_path, &svc_cfg);
+        }
+        crate::winservice::install(Some(&svc_cfg), true)?;
     }
     info!("Install successful ({})", base.display());
     Ok(())
@@ -251,6 +274,7 @@ pub fn uninstall() -> Result<(), Error> {
     #[cfg(windows)]
     {
         delete_run_key();
+        let _ = crate::winservice::uninstall();
         if let Ok(base) = windows_install_dir() {
             let _ = fs::remove_file(base.join("vpncloud.exe"));
             let _ = fs::remove_file(base.join("example.net.disabled"));

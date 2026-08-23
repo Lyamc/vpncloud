@@ -73,6 +73,18 @@ or `vpncloud.exe --tray`. Install prompts for the tray and optional
 Start-with-Windows; unattended: `vpncloud install --tray` / `--no-tray` /
 `--autostart`.
 
+As a **system service** (Administrator, LocalSystem, auto-start at boot):
+
+```bat
+vpncloud service install --config C:\ProgramData\VpnCloud\vpncloud.yaml --start
+vpncloud service start
+vpncloud service stop
+vpncloud service uninstall
+```
+
+Or `vpncloud install --service` (installer feature). Put `wintun.dll` next to
+the installed `vpncloud.exe`. The service has no tray icon.
+
 **Android.** TUN works on all devices through `VpnService` (`--tun-fd` / JNI,
 `protect()` so the UDP mesh does not hairpin). **TAP/L2 is rooted-only:** it
 opens `/dev/net/tun` with `IFF_TAP`. On an unrooted phone, `--type tap` errors

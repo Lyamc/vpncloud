@@ -44,4 +44,7 @@ mod android;
 #[cfg(windows)]
 pub mod tray;
 
+#[cfg(windows)]
+pub mod winservice;
+
 pub use engine::run_vpn;

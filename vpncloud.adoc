@@ -273,6 +273,24 @@ subcommands.
   *--shell*:::
     The shell type to create completions for. [default: **bash**]
 
+*service* (Windows)::
+  Install, uninstall, start, or stop VpnCloud as a *Windows system service*.
+  Must be run from an elevated (Administrator) command prompt. The service
+  runs as *LocalSystem*, starts automatically at boot, and has no tray icon.
+
+  *service install*:::
+    Copy *vpncloud.exe* to *%ProgramFiles%\\VpnCloud*, write
+    *%ProgramData%\\VpnCloud\\vpncloud.yaml* if missing, and register the
+    service. *--config <file>* selects the config the service loads.
+    *--start* starts the service immediately.
+  *service uninstall*:::
+    Stop and delete the service.
+  *service start* / *service stop*:::
+    Same as *sc start VpnCloud* / *sc stop VpnCloud*.
+
+  *vpncloud install --service* (installer feature) also registers the service
+  and copies a user config into ProgramData.
+
 
 == DESCRIPTION
 

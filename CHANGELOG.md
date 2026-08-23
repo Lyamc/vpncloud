@@ -7,6 +7,7 @@ This project follows [semantic versioning](http://semver.org).
 - [added] macOS TUN (`utun`) and TAP (`feth` + BPF) via tun-rs
 - [added] Windows TUN (Wintun) and TAP (tap-windows6)
 - [added] Optional Windows system tray (Enable / Disable / Exit), chosen at install
+- [added] Windows system service (`vpncloud service install`, LocalSystem auto-start)
 - [added] Android TUN via VpnService; TAP/L2 on rooted devices with /dev/net/tun
 - [added] Native websocket listen (`ws-listen://` / `ws://0.0.0.0:port`)
 - [added] Configurable device MTU (`--mtu`)
