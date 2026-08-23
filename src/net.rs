@@ -258,6 +258,7 @@ fn gro_segment_size(hdr: &libc::msghdr) -> usize {
 }
 
 /// Split a GRO datagram into segments of `gro` bytes (last may be shorter).
+#[cfg(test)]
 fn split_gro_payload(payload: &[u8], gro: usize) -> Vec<&[u8]> {
     if gro == 0 || gro >= payload.len() {
         return vec![payload];
@@ -426,7 +427,7 @@ fn linux_gso_send_concat(fd: RawFd, dest: &SocketAddr, n: usize, seg: usize, con
     let mut name = std_to_sockaddr(*dest);
     let mut iov = libc::iovec { iov_base: concat.as_ptr() as *mut _, iov_len: concat.len() };
     let mut cbuf = [0u8; 32];
-    let mut hdr = libc::msghdr {
+    let hdr = libc::msghdr {
         msg_name: &mut name.0 as *mut _ as *mut _,
         msg_namelen: name.1,
         msg_iov: &mut iov,

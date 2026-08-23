@@ -32,7 +32,7 @@ fn apply_linux() -> Result<(), String> {
     filter.push(bpf(bpf_class::JMP | bpf_class::JEQ | bpf_class::K, 0, 1, arch));
     filter.push(bpf(bpf_class::RET | bpf_class::K, 0, 0, seccomp_ret::KILL_PROCESS));
     filter.push(bpf(bpf_class::LD | bpf_class::W | bpf_class::ABS, 0, 0, 0)); // nr offset
-    for nr in blocked_syscalls() {
+    for &nr in blocked_syscalls() {
         filter.push(bpf(bpf_class::JMP | bpf_class::JEQ | bpf_class::K, 0, 1, nr as u32));
         filter.push(bpf(bpf_class::RET | bpf_class::K, 0, 0, seccomp_ret::KILL_PROCESS));
     }
