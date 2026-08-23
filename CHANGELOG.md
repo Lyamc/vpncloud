@@ -10,7 +10,7 @@ This project follows [semantic versioning](http://semver.org).
 - [added] STUN mapped-address publish, LAN peer preference, `--lan-only`, handshake rate-limit
 - [added] Optional password KDF PBKDF2-100000 when `crypto.salt` is set (legacy 4096 remains default)
 - [added] NAT-PMP mapping, claim metrics (`10.0.0.0/8@50`), ciphertext peer-relay
-- [added] 2 MiB UDP socket buffers and multi-packet socket drain
+- [added] Configurable UDP socket buffers (`--socket-buffer`, default 2 MiB) and multi-packet socket drain
 - [added] Overlay ACLs (`--acl allow:10.0.0.0/8`) and `trusted-key` expiry (`key:YYYY-MM-DD`)
 - [added] Optional TCP fallback (`--tcp-fallback`) with length-prefixed datagrams on the mesh port
 - [added] Linux `recvmmsg`/`sendmmsg` batch I/O and UDP GSO (`UDP_SEGMENT`)

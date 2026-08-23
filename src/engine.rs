@@ -260,8 +260,11 @@ pub(crate) fn run_vpn_worker(config: Config) {
         }
         return;
     }
-    let socket =
-        try_fail!(MeshSocket::open(&config.listen, config.tcp_fallback), "Failed to open socket {}: {}", config.listen);
+    let socket = try_fail!(
+        MeshSocket::open_with_buffers(&config.listen, config.tcp_fallback, config.socket_buffer_bytes),
+        "Failed to open socket {}: {}",
+        config.listen
+    );
     match config.device_type {
         Type::Tap => run::<payload::Frame, _>(config, socket),
         Type::Tun => run::<payload::Packet, _>(config, socket)

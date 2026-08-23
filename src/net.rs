@@ -124,6 +124,21 @@ fn default_send_batch<S: Socket>(sock: &mut S, packets: &[(&SocketAddr, &[u8])])
     Ok(n)
 }
 
+fn apply_socket2_buffers(sock: &socket2::Socket, bytes: usize) {
+    let _ = sock.set_recv_buffer_size(bytes);
+    let _ = sock.set_send_buffer_size(bytes);
+}
+
+/// Set `SO_RCVBUF` / `SO_SNDBUF` on an already-bound UDP socket.
+pub fn set_udp_buffer_bytes(sock: &UdpSocket, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let s = socket2::SockRef::from(sock);
+    let _ = s.set_recv_buffer_size(bytes);
+    let _ = s.set_send_buffer_size(bytes);
+}
+
 pub fn parse_listen(addr: &str, default_port: u16) -> SocketAddr {
     if let Some(addr) = addr.strip_prefix("*:") {
         let port = try_fail!(addr.parse::<u16>(), "Invalid port: {}");
@@ -162,8 +177,7 @@ impl Socket for UdpSocket {
         let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
         sock.set_nonblocking(true)?;
         sock.set_reuse_address(true)?;
-        let _ = sock.set_recv_buffer_size(2 * 1024 * 1024);
-        let _ = sock.set_send_buffer_size(2 * 1024 * 1024);
+        apply_socket2_buffers(&sock, crate::config::DEFAULT_SOCKET_BUFFER);
         // macOS defaults IPV6_V6ONLY to true, which would drop IPv4 peers on an `[::]` bind.
         if addr.is_ipv6() {
             sock.set_only_v6(false)?;

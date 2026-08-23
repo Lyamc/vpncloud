@@ -22,6 +22,7 @@ use std::{
 
 pub const DEFAULT_PEER_TIMEOUT: u16 = 300;
 pub const DEFAULT_PORT: u16 = 3210;
+pub const DEFAULT_SOCKET_BUFFER: usize = 2 * 1024 * 1024;
 
 /// System-wide config directory (`/usr/local/etc/vpncloud` on FreeBSD, `/etc/vpncloud` elsewhere).
 pub fn system_config_dir() -> &'static Path {
@@ -160,7 +161,9 @@ pub struct Config {
     /// Refuse config files that are not Ed25519-signed.
     pub require_signed_config: bool,
     /// Linux: install a seccomp blacklist after bind/TUN/privdrop.
-    pub seccomp: bool
+    pub seccomp: bool,
+    /// `SO_RCVBUF` / `SO_SNDBUF` in bytes (default 2 MiB).
+    pub socket_buffer_bytes: usize
 }
 
 impl Default for Config {
@@ -212,7 +215,8 @@ impl Default for Config {
             tcp_fallback: !cfg!(test),
             crypto_threads: 0,
             require_signed_config: false,
-            seccomp: !cfg!(test)
+            seccomp: !cfg!(test),
+            socket_buffer_bytes: DEFAULT_SOCKET_BUFFER
         }
     }
 }
@@ -364,6 +368,9 @@ impl Config {
         }
         if let Some(val) = file.seccomp {
             self.seccomp = val;
+        }
+        if let Some(val) = file.socket_buffer {
+            self.socket_buffer_bytes = val;
         }
     }
 
@@ -521,6 +528,9 @@ impl Config {
         if args.no_seccomp {
             self.seccomp = false;
         }
+        if let Some(val) = args.socket_buffer {
+            self.socket_buffer_bytes = val;
+        }
     }
 
     pub fn into_config_file(self) -> ConfigFile {
@@ -569,6 +579,7 @@ impl Config {
             crypto_threads: Some(self.crypto_threads),
             require_signed_config: Some(self.require_signed_config),
             seccomp: Some(self.seccomp),
+            socket_buffer: Some(self.socket_buffer_bytes),
             signature: None
         }
     }
@@ -845,6 +856,9 @@ pub struct Args {
     /// Do not install seccomp
     #[arg(long, conflicts_with = "seccomp")]
     pub no_seccomp: bool,
+    /// UDP SO_RCVBUF/SO_SNDBUF in bytes [default: 2097152]
+    #[arg(long = "socket-buffer")]
+    pub socket_buffer: Option<usize>,
 
     #[command(subcommand)]
     pub cmd: Option<Command>
@@ -1073,6 +1087,8 @@ pub struct ConfigFile {
     pub require_signed_config: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seccomp: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_buffer: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>
 }

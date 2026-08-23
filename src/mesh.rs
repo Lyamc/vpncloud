@@ -13,7 +13,8 @@ use std::{
 };
 
 use crate::{
-    net::{mapped_addr, send_addr, Socket},
+    config::DEFAULT_SOCKET_BUFFER,
+    net::{mapped_addr, send_addr, set_udp_buffer_bytes, Socket},
     port_forwarding::PortForwarding,
     util::MsgBuffer
 };
@@ -39,7 +40,12 @@ pub struct MeshSocket {
 
 impl MeshSocket {
     pub fn open(addr: &str, tcp: bool) -> io::Result<Self> {
+        Self::open_with_buffers(addr, tcp, DEFAULT_SOCKET_BUFFER)
+    }
+
+    pub fn open_with_buffers(addr: &str, tcp: bool, buffer_bytes: usize) -> io::Result<Self> {
         let udp = UdpSocket::listen(addr)?;
+        set_udp_buffer_bytes(&udp, buffer_bytes);
         let local = udp.local_addr()?;
         let inbound: Inbound = Arc::new(Mutex::new(VecDeque::new()));
         let peers: Peers = Arc::new(Mutex::new(HashMap::new()));

@@ -56,7 +56,7 @@ A → B → C → D. Each wave should compile and `cargo test` on its own.
 
 | Wave | Done | Not in this pass |
 |------|------|------------------|
-| A | STUN on the mesh socket, LAN sort, `--lan-only`, init rate-limit, `crypto.salt` → PBKDF2-100000 | vpn-bench PR |
+| A | STUN on the mesh socket, LAN sort, `--lan-only`, init rate-limit, `crypto.salt` → PBKDF2-100000; [vpn-bench PR #2](https://github.com/Qubasa/vpn-bench/pull/2) | skips listed above |
 | B | NAT-PMP probes, `claim/prefix@metric`, `MESSAGE_TYPE_RELAY` via freshest peer, native TCP fallback (`--tcp-fallback`, length-prefixed datagrams) | |
-| C | 2 MiB `SO_RCVBUF`/`SO_SNDBUF`, drain socket until `WouldBlock`, Linux `recvmmsg`/`sendmmsg`, UDP GSO (`UDP_SEGMENT`), `--crypto-threads` DATA worker pool | |
-| D | Overlay `--acl`, `trusted-key:YYYY-MM-DD` expiry, Ed25519 signed configs (`sign-config`, `--require-signed-config`), Linux seccomp blacklist after bind/TUN | |
+| C | Configurable `SO_RCVBUF`/`SO_SNDBUF` (`--socket-buffer`, default 2 MiB), drain socket until `WouldBlock`, Linux `recvmmsg`/`sendmmsg`, UDP GSO (`UDP_SEGMENT`), `--crypto-threads` DATA worker pool | UDP GRO (needs userspace split) |
+| D | Overlay `--acl`, `trusted-key:YYYY-MM-DD` expiry, Ed25519 signed configs (`sign-config`, `--require-signed-config`), Linux seccomp blacklist after bind/TUN | proto/port ACL (later) |
