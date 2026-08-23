@@ -127,6 +127,13 @@ sudo ./target/release/vpncloud --help
 
 Tests: `cargo test`.
 
+Desktop GUI (Iced, software renderer — not pulled into the CLI):
+
+```sh
+cargo build --release --features gui --bin vpncloud-gui
+sudo ./target/release/vpncloud-gui                 # optional path: vpncloud-gui ./mynet.yaml
+```
+
 Debian/RPM packaging helpers live in `maskfile.md` (requires
 [mask](https://github.com/jacobdeichert/mask)). Systemd units are in
 `assets/`.

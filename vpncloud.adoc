@@ -745,6 +745,23 @@ set), configure a static UDP port forward to the listen port, or use the
 websocket proxy (see *WEBSOCKET PROXY*).
 
 
+== DESKTOP GUI
+
+An optional Iced window (*vpncloud-gui*) edits the YAML config and
+starts/stops the node on Linux, macOS, and Windows. It is a separate
+binary (software renderer only) so the CLI is not linked with a GUI
+toolkit.
+
+----
+cargo build --release --features gui --bin vpncloud-gui
+vpncloud-gui
+vpncloud-gui /path/to/mynet.yaml
+----
+
+Connect still needs the same privileges as the CLI (root/Administrator,
+TUN/TAP). Disable/pause uses the same pause flag as the Windows tray.
+
+
 == ANDROID
 
 *tun* works on every device through *VpnService* (layer 3). *tap* (layer 2)

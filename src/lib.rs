@@ -44,6 +44,9 @@ mod android;
 #[cfg(target_os = "ios")]
 mod ios;
 
+#[cfg(feature = "gui")]
+pub mod gui;
+
 #[cfg(windows)]
 pub mod tray;
 

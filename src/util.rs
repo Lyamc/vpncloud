@@ -3,10 +3,9 @@
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
 use std::{
-    fmt,
-    io,
+    fmt, io,
     net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
-    process::Command,
+    process::{self, Command},
     sync::{
         atomic::{AtomicBool, AtomicIsize, Ordering},
         Arc
@@ -175,16 +174,10 @@ impl Encoder {
 
 macro_rules! fail {
     ($format:expr) => ( {
-        use std::process;
-        error!($format);
-        log::logger().flush();
-        process::exit(-1);
+        crate::util::fatal_stop($format);
     } );
     ($format:expr, $( $arg:expr ),+) => ( {
-        use std::process;
-        error!($format, $( $arg ),+ );
-        log::logger().flush();
-        process::exit(-1);
+        crate::util::fatal_stop(&format!($format, $( $arg ),+));
     } );
 }
 
@@ -285,6 +278,22 @@ impl fmt::Display for Bytes {
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
+static FAIL_PANICS: AtomicBool = AtomicBool::new(false);
+
+/// When true, `fail!` panics the current thread instead of exiting the process.
+/// Used by the GUI worker so a TUN error does not kill the window.
+pub fn set_fail_panics(v: bool) {
+    FAIL_PANICS.store(v, Ordering::Relaxed);
+}
+
+pub fn fatal_stop(msg: &str) -> ! {
+    error!("{}", msg);
+    log::logger().flush();
+    if FAIL_PANICS.load(Ordering::Relaxed) {
+        panic!("{}", msg);
+    }
+    process::exit(-1);
+}
 
 pub struct CtrlC {
     flag: Arc<AtomicBool>
