@@ -28,8 +28,8 @@ mkdir dist
 build_static() {
   ARCH=$1
   TARGET=$2
-  cargo build --release --features installer --target ${TARGET} && upx --lzma target/${TARGET}/release/vpncloud
-  cp target/${TARGET}/release/vpncloud ../dist/vpncloud_${VERSION}_static_${ARCH}
+  cargo build --profile dist --features installer --target ${TARGET} && upx --lzma target/${TARGET}/dist/vpncloud
+  cp target/${TARGET}/dist/vpncloud ../dist/vpncloud_${VERSION}_static_${ARCH}
 }
 
 build_static amd64 x86_64-unknown-linux-musl

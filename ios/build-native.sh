@@ -11,9 +11,10 @@ SIM_TARGET=aarch64-apple-ios-sim
 
 rustup target add "$DEVICE_TARGET" "$SIM_TARGET"
 
-# Network Extension links a static library. Skip the interactive wizard (no TTY).
-cargo build --release --lib --target "$DEVICE_TARGET" --no-default-features --features nat,websocket
-cargo build --release --lib --target "$SIM_TARGET" --no-default-features --features nat,websocket
+# Network Extension links a static library. Skip wizard; host crate-type is rlib.
+FEATURES=nat,websocket,noise
+cargo rustc --release --lib --target "$DEVICE_TARGET" --no-default-features --features "$FEATURES" -- --crate-type staticlib
+cargo rustc --release --lib --target "$SIM_TARGET" --no-default-features --features "$FEATURES" -- --crate-type staticlib
 
 OUT="$ROOT/ios/libvpncloud.xcframework"
 rm -rf "$OUT"

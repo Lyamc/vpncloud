@@ -24,11 +24,11 @@ mkdir dist
 build_deb() {
   ARCH=$1
   TARGET=$2
-  cargo deb --target ${TARGET}
+  cargo deb --profile dist --target ${TARGET}
   cp target/${TARGET}/debian/vpncloud_${DEB_VERSION}_${ARCH}.deb dist/vpncloud_${DEB_VERSION}_${ARCH}.deb
 }
 
-cargo deb
+cargo deb --profile dist
 cp target/debian/vpncloud_${DEB_VERSION}_amd64.deb dist/vpncloud_${DEB_VERSION}_amd64.deb
 
 build_deb i386 i686-unknown-linux-gnu

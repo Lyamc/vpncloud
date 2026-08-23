@@ -7,5 +7,8 @@ set -e
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT="$ROOT/android/app/src/main/jniLibs"
 cd "$ROOT"
-cargo ndk -t arm64-v8a -t armeabi-v7a -o "$OUT" build --release --lib
+# Skip wizard/dialoguer. Host crate-type is rlib; JNI needs a cdylib.
+cargo ndk -t arm64-v8a -t armeabi-v7a -o "$OUT" rustc --release --lib \
+  --no-default-features --features nat,websocket,noise \
+  -- --crate-type cdylib
 echo "Native libraries written to $OUT"

@@ -41,9 +41,9 @@ TARGET_DIR=target/$target_name
 
 # compile
 echo >&2 "Compiling for $target_name"
-cross build --release --target $TARGET --target-dir $TARGET_DIR
+cross build --profile dist --target $TARGET --target-dir $TARGET_DIR
 mkdir -p target/$TARGET/release
-cp $TARGET_DIR/$TARGET/release/vpncloud target/$TARGET/release/
+cp $TARGET_DIR/$TARGET/dist/vpncloud target/$TARGET/release/
 
 # build deb
 echo >&2 "Building deb package"

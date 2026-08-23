@@ -12,7 +12,9 @@ edition = "2021"
 
 [lib]
 name = "vpncloud"
-crate-type = ["rlib", "cdylib", "staticlib"]
+# Host builds only need an rlib. Android/iOS scripts pass `--crate-type cdylib` /
+# `staticlib` to rustc so JNI / Network Extension still get a shared/static lib.
+crate-type = ["rlib"]
 
 [package.metadata]
 toolchain = "1.75.0"
@@ -35,8 +37,8 @@ rand = "0.10.2"
 
 fnv = "1.0.7"
 ring = "0.17.14"
-snow = { version = "0.10", default-features = false, features = ["std", "default-resolver", "default-resolver-crypto"] }
-x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+snow = { version = "0.10", optional = true, default-features = false, features = ["std", "default-resolver", "default-resolver-crypto"] }
+x25519-dalek = { version = "2", optional = true, default-features = false, features = ["static_secrets"] }
 byteorder = "1.5.0"
 thiserror = "2.0.20"
 smallvec = "1.15.2"
@@ -47,10 +49,17 @@ url = { version = "2.5.8", optional = true }
 igd-next = { version = "0.17.1", optional = true }
 mio = { version = "1.2.2", features = ["os-poll", "os-ext", "net"] }
 tun-rs = "2.8.8"
-ipnet = "2.12.1"
 getifaddrs = "0.6.2"
-service-manager = "0.11"
+service-manager = { version = "0.11", optional = true }
 # Software renderer only — wgpu is several MB and unused for this form.
+# X11/Wayland are Linux/FreeBSD-only (see target-specific features below).
+iced = { version = "0.14", optional = true, default-features = false, features = [
+    "tiny-skia",
+    "thread-pool",
+    "basic-shaping",
+] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 iced = { version = "0.14", optional = true, default-features = false, features = [
     "tiny-skia",
     "thread-pool",
@@ -64,6 +73,7 @@ libc = "0.2"
 privdrop = "0.5.6"
 
 [target.'cfg(windows)'.dependencies]
+service-manager = "0.11"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -88,12 +98,13 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 iai = "0.1.1"
 
 [features]
-default = ["nat", "websocket", "wizard"]
-nat = ["igd-next"]
-websocket = ["tungstenite", "url"]
-wizard = ["dialoguer"]
-installer = []
-gui = ["iced"]
+default = ["nat", "websocket", "wizard", "noise"]
+nat = ["dep:igd-next"]
+websocket = ["dep:tungstenite", "dep:url"]
+wizard = ["dep:dialoguer"]
+installer = ["dep:service-manager"]
+gui = ["dep:iced"]
+noise = ["dep:snow", "dep:x25519-dalek"]
 
 [[bin]]
 name = "vpncloud-gui"
@@ -109,12 +120,21 @@ name = "valgrind"
 harness = false
 
 [profile.release]
-lto = true
-strip = true
+opt-level = 3
+lto = "thin"
 codegen-units = 1
+strip = "symbols"
+panic = "abort"
+incremental = false
+
+# Fat LTO for packaged/static binaries (`cargo build --profile dist`).
+[profile.dist]
+inherits = "release"
+lto = "fat"
 
 [profile.dev]
 lto = false
+incremental = true
 
 [profile.test]
 lto = false

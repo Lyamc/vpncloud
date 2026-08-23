@@ -1,7 +1,8 @@
+#[cfg(feature = "noise")]
+use super::noise::{self, NoiseInit, NoiseTransport};
 use super::{
     core::{test_speed, CryptoCore},
     init::{self, InitResult, InitState, CLOSING},
-    noise::{self, NoiseInit, NoiseTransport},
     rotate::RotationState
 };
 use crate::{
@@ -75,8 +76,11 @@ pub struct Crypto {
     trusted_keys: Arc<[Ed25519PublicKey]>,
     algorithms: Algorithms,
     use_noise: bool,
+    #[cfg(feature = "noise")]
     dh_private: [u8; 32],
+    #[cfg(feature = "noise")]
     dh_public: [u8; 32],
+    #[cfg(feature = "noise")]
     trusted_dh: Arc<[[u8; 32]]>
 }
 
@@ -94,7 +98,16 @@ impl Crypto {
                     unencrypted = true;
                 }
                 "NOISE" | "NOISEXX" | "NOISE_XX" | "NOISE-XX" => {
-                    use_noise = true;
+                    #[cfg(feature = "noise")]
+                    {
+                        use_noise = true;
+                    }
+                    #[cfg(not(feature = "noise"))]
+                    {
+                        return Err(Error::InvalidConfig(
+                            "Noise support was not compiled in (rebuild with --features noise)"
+                        ));
+                    }
                 }
                 "AES128" | "AES128_GCM" | "AES_128" | "AES_128_GCM" => algos.push(&aead::AES_128_GCM),
                 "AES256" | "AES256_GCM" | "AES_256" | "AES_256_GCM" => algos.push(&aead::AES_256_GCM),
@@ -179,7 +192,9 @@ impl Crypto {
         if unencrypted {
             warn!("Crypto settings allow unencrypted connections")
         }
+        #[cfg(feature = "noise")]
         let (dh_private, dh_public) = noise::dh_keypair_from_seed(&seed);
+        #[cfg(feature = "noise")]
         if use_noise {
             info!("Using {} (X25519 / ChaCha20-Poly1305 / SHA-256)", noise::PATTERN);
             info!("Noise static public key: {}", to_base62(&dh_public));
@@ -203,6 +218,7 @@ impl Crypto {
                 speeds.into_iter().map(|(a, s)| format!("{}: {:.1} MiB/s", a, s)).collect::<Vec<_>>().join(", ")
             );
         }
+        #[cfg(feature = "noise")]
         let trusted_dh: Arc<[[u8; 32]]> =
             if config.trusted_keys.is_empty() { Arc::from(vec![dh_public]) } else { Arc::from(trusted_keys.clone()) };
         Ok(Self {
@@ -211,8 +227,11 @@ impl Crypto {
             trusted_keys: trusted_keys.into_boxed_slice().into(),
             algorithms: algos,
             use_noise,
+            #[cfg(feature = "noise")]
             dh_private,
+            #[cfg(feature = "noise")]
             dh_public,
+            #[cfg(feature = "noise")]
             trusted_dh
         })
     }
@@ -300,8 +319,11 @@ impl Crypto {
             self.trusted_keys.clone(),
             self.algorithms.clone(),
             self.use_noise,
+            #[cfg(feature = "noise")]
             self.dh_private,
+            #[cfg(feature = "noise")]
             self.dh_public,
+            #[cfg(feature = "noise")]
             self.trusted_dh.clone()
         )
     }
@@ -320,10 +342,12 @@ pub struct PeerCrypto<P: Payload> {
     #[allow(dead_code)]
     node_id: NodeId,
     init: Option<InitState<P>>,
+    #[cfg(feature = "noise")]
     noise: Option<NoiseInit<P>>,
     rotation: Option<RotationState>,
     unencrypted: bool,
     core: Option<CryptoCore>,
+    #[cfg(feature = "noise")]
     noise_transport: Option<NoiseTransport>,
     rotate_counter: usize
 }
@@ -331,11 +355,12 @@ pub struct PeerCrypto<P: Payload> {
 impl<P: Payload> PeerCrypto<P> {
     pub fn new(
         node_id: NodeId, init_payload: P, key_pair: Arc<Ed25519KeyPair>, trusted_keys: Arc<[Ed25519PublicKey]>,
-        algorithms: Algorithms, use_noise: bool, dh_private: [u8; 32], dh_public: [u8; 32],
-        trusted_dh: Arc<[[u8; 32]]>
+        algorithms: Algorithms, use_noise: bool, #[cfg(feature = "noise")] dh_private: [u8; 32],
+        #[cfg(feature = "noise")] dh_public: [u8; 32], #[cfg(feature = "noise")] trusted_dh: Arc<[[u8; 32]]>
     ) -> Self {
+        #[cfg(feature = "noise")]
         if use_noise {
-            Self {
+            return Self {
                 node_id,
                 init: None,
                 noise: Some(NoiseInit::new(node_id, init_payload, dh_private, dh_public, trusted_dh)),
@@ -344,18 +369,20 @@ impl<P: Payload> PeerCrypto<P> {
                 core: None,
                 noise_transport: None,
                 rotate_counter: 0
-            }
-        } else {
-            Self {
-                node_id,
-                init: Some(InitState::new(node_id, init_payload, key_pair, trusted_keys, algorithms)),
-                noise: None,
-                rotation: None,
-                unencrypted: false,
-                core: None,
-                noise_transport: None,
-                rotate_counter: 0
-            }
+            };
+        }
+        let _ = use_noise;
+        Self {
+            node_id,
+            init: Some(InitState::new(node_id, init_payload, key_pair, trusted_keys, algorithms)),
+            #[cfg(feature = "noise")]
+            noise: None,
+            rotation: None,
+            unencrypted: false,
+            core: None,
+            #[cfg(feature = "noise")]
+            noise_transport: None,
+            rotate_counter: 0
         }
     }
 
@@ -384,6 +411,7 @@ impl<P: Payload> PeerCrypto<P> {
     }
 
     pub fn initialize(&mut self, out: &mut MsgBuffer) -> Result<(), Error> {
+        #[cfg(feature = "noise")]
         if let Some(noise) = &mut self.noise {
             if noise.stage() != init::STAGE_PING {
                 return Err(Error::InvalidCryptoState("Initialization already ongoing"));
@@ -403,17 +431,33 @@ impl<P: Payload> PeerCrypto<P> {
     }
 
     pub fn has_init(&self) -> bool {
-        self.init.is_some() || self.noise.is_some()
+        #[cfg(feature = "noise")]
+        {
+            self.init.is_some() || self.noise.is_some()
+        }
+        #[cfg(not(feature = "noise"))]
+        {
+            self.init.is_some()
+        }
     }
 
     pub fn is_ready(&self) -> bool {
-        self.core.is_some() || self.noise_transport.is_some()
+        #[cfg(feature = "noise")]
+        {
+            self.core.is_some() || self.noise_transport.is_some()
+        }
+        #[cfg(not(feature = "noise"))]
+        {
+            self.core.is_some()
+        }
     }
 
     pub fn algorithm_name(&self) -> &'static str {
+        #[cfg(feature = "noise")]
         if self.noise_transport.is_some() {
-            "NOISE"
-        } else if let Some(ref core) = self.core {
+            return "NOISE";
+        }
+        if let Some(ref core) = self.core {
             let algo = core.algorithm();
             if algo == &aead::CHACHA20_POLY1305 {
                 "CHACHA20"
@@ -430,8 +474,9 @@ impl<P: Payload> PeerCrypto<P> {
     }
 
     fn handle_init_message(&mut self, buffer: &mut MsgBuffer) -> Result<MessageResult<P>, Error> {
+        #[cfg(feature = "noise")]
         if self.noise.is_some() {
-            if !noise::is_noise_frame(buffer.buffer()) {
+            if !super::is_noise_frame(buffer.buffer()) {
                 return Err(Error::CryptoInit("Peer is not using Noise"));
             }
             let result = self.noise.as_mut().unwrap().handle(buffer)?;
@@ -453,7 +498,7 @@ impl<P: Payload> PeerCrypto<P> {
                 }
             };
         }
-        if noise::is_noise_frame(buffer.buffer()) {
+        if super::is_noise_frame(buffer.buffer()) {
             return Err(Error::CryptoInit("Peer requires Noise; this node does not"));
         }
         let result = self.get_init()?.handle_init(buffer)?;
@@ -503,6 +548,7 @@ impl<P: Payload> PeerCrypto<P> {
         if self.unencrypted {
             return Ok(());
         }
+        #[cfg(feature = "noise")]
         if let Some(ref mut noise) = self.noise_transport {
             return noise.encrypt(buffer);
         }
@@ -515,6 +561,7 @@ impl<P: Payload> PeerCrypto<P> {
         if self.unencrypted {
             return Ok(());
         }
+        #[cfg(feature = "noise")]
         if let Some(ref mut noise) = self.noise_transport {
             return noise.decrypt(buffer);
         }
@@ -563,12 +610,14 @@ impl<P: Payload> PeerCrypto<P> {
         if let Some(ref mut init) = self.init {
             init.every_second(out)?;
         }
+        #[cfg(feature = "noise")]
         if let Some(ref mut noise) = self.noise {
             noise.every_second(out)?;
         }
         if self.init.as_ref().map(|i| i.stage()).unwrap_or(CLOSING) == CLOSING {
             self.init = None
         }
+        #[cfg(feature = "noise")]
         if self.noise.as_ref().map(|n| n.stage()).unwrap_or(CLOSING) == CLOSING {
             self.noise = None
         }
@@ -576,6 +625,7 @@ impl<P: Payload> PeerCrypto<P> {
             out.prepend_byte(INIT_MESSAGE_FIRST_BYTE);
             return Ok(MessageResult::Reply);
         }
+        #[cfg(feature = "noise")]
         if self.noise_transport.is_some() {
             return Ok(MessageResult::None);
         }
@@ -677,6 +727,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "noise")]
     #[test]
     fn noise_handshake_and_messages() {
         let config =

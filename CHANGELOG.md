@@ -4,6 +4,8 @@ This project follows [semantic versioning](http://semver.org).
 
 ### UNRELEASED
 
+- [changed] Release builds use thin LTO, abort-on-panic, and symbol stripping; packaged binaries can use `--profile dist` (fat LTO)
+- [changed] Optional crates are feature-gated (`noise`, `installer`/`service-manager`, GUI Iced). Host lib crate-type is `rlib` only
 - [changed] Service install uses the `service-manager` crate (systemd, launchd, Windows `sc.exe`); the Windows service *process* is unchanged
 - [added] macOS `vpncloud install` registers LaunchDaemon `ca.witherow.vpncloud`
 - [added] FreeBSD TUN/TAP (`tun`/`tap`) and rc.d install (`/usr/local/etc/rc.d/vpncloud`)
