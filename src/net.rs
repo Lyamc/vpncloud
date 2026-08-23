@@ -9,8 +9,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering}
 };
 
-#[cfg(unix)]
-use std::sync::Mutex;
+#[cfg(unix)] use std::sync::Mutex;
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -117,6 +116,8 @@ impl Socket for UdpSocket {
         let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
         sock.set_nonblocking(true)?;
         sock.set_reuse_address(true)?;
+        let _ = sock.set_recv_buffer_size(2 * 1024 * 1024);
+        let _ = sock.set_send_buffer_size(2 * 1024 * 1024);
         // macOS defaults IPV6_V6ONLY to true, which would drop IPv4 peers on an `[::]` bind.
         if addr.is_ipv6() {
             sock.set_only_v6(false)?;
@@ -233,7 +234,7 @@ impl Socket for MockSocket {
             buffer.message_mut().copy_from_slice(&data);
             Ok(addr)
         } else {
-            Err(io::Error::new(ErrorKind::Other, "nothing in queue"))
+            Err(io::Error::new(ErrorKind::WouldBlock, "nothing in queue"))
         }
     }
 

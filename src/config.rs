@@ -143,7 +143,16 @@ pub struct Config {
     pub hook: Option<String>,
     pub hooks: HashMap<String, String>,
     /// Windows: show a system tray icon (Enable / Disable / Exit).
-    pub tray: bool
+    pub tray: bool,
+    /// Query STUN servers and publish the mapped address.
+    pub stun: bool,
+    pub stun_servers: Vec<String>,
+    /// Only accept underlay peers on local interface prefixes.
+    pub lan_only: bool,
+    /// Max crypto-init packets per source IP per 10 seconds.
+    pub init_rate_limit: u32,
+    /// Overlay ACL entries (`allow:10.0.0.0/8`, `deny:0.0.0.0/0`). Empty = allow all.
+    pub acl: Vec<String>
 }
 
 impl Default for Config {
@@ -182,7 +191,16 @@ impl Default for Config {
             group: None,
             hook: None,
             hooks: HashMap::new(),
-            tray: false
+            tray: false,
+            stun: !cfg!(test),
+            stun_servers: if cfg!(test) {
+                vec![]
+            } else {
+                vec!["stun.l.google.com:19302".into(), "stun1.l.google.com:19302".into()]
+            },
+            lan_only: false,
+            init_rate_limit: 20,
+            acl: vec![]
         }
     }
 }
@@ -302,6 +320,27 @@ impl Config {
         if let Some(val) = file.tray {
             self.tray = val;
         }
+        if let Some(val) = file.stun {
+            self.stun = val;
+        }
+        if let Some(val) = file.stun_servers {
+            self.stun_servers = val;
+        }
+        if let Some(val) = file.lan_only {
+            self.lan_only = val;
+        }
+        if let Some(val) = file.init_rate_limit {
+            self.init_rate_limit = val;
+        }
+        if let Some(mut val) = file.acl {
+            self.acl.append(&mut val);
+        }
+        if let Some(val) = file.crypto.salt {
+            self.crypto.salt = Some(val);
+        }
+        if let Some(val) = file.crypto.kdf {
+            self.crypto.kdf = Some(val);
+        }
     }
 
     pub fn merge_args(&mut self, mut args: Args) {
@@ -418,6 +457,28 @@ impl Config {
         if args.no_tray {
             self.tray = false;
         }
+        if args.no_stun {
+            self.stun = false;
+        }
+        if args.stun {
+            self.stun = true;
+        }
+        if !args.stun_server.is_empty() {
+            self.stun_servers = args.stun_server;
+        }
+        if args.lan_only {
+            self.lan_only = true;
+        }
+        if let Some(val) = args.crypto_salt {
+            self.crypto.salt = Some(val);
+        }
+        if let Some(val) = args.kdf {
+            self.crypto.kdf = Some(val);
+        }
+        if let Some(val) = args.init_rate_limit {
+            self.init_rate_limit = val;
+        }
+        self.acl.append(&mut args.acl);
     }
 
     pub fn into_config_file(self) -> ConfigFile {
@@ -456,7 +517,12 @@ impl Config {
             switch_timeout: Some(self.switch_timeout),
             hook: self.hook,
             hooks: self.hooks,
-            tray: Some(self.tray)
+            tray: Some(self.tray),
+            stun: Some(self.stun),
+            stun_servers: Some(self.stun_servers),
+            lan_only: Some(self.lan_only),
+            init_rate_limit: Some(self.init_rate_limit),
+            acl: if self.acl.is_empty() { None } else { Some(self.acl) }
         }
     }
 
@@ -690,6 +756,31 @@ pub struct Args {
     #[arg(long, conflicts_with = "tray")]
     pub no_tray: bool,
 
+    /// Enable STUN reflexive-address discovery (default)
+    #[arg(long)]
+    pub stun: bool,
+    /// Disable STUN
+    #[arg(long, conflicts_with = "stun")]
+    pub no_stun: bool,
+    /// STUN server host:port (repeatable)
+    #[arg(long = "stun-server")]
+    pub stun_server: Vec<String>,
+    /// Only accept peers on local interface prefixes
+    #[arg(long)]
+    pub lan_only: bool,
+    /// Password KDF salt (enables PBKDF2-100000)
+    #[arg(long = "crypto-salt")]
+    pub crypto_salt: Option<String>,
+    /// Password KDF: legacy (4096) or pbkdf2 (100000, needs --crypto-salt)
+    #[arg(long, value_parser = ["legacy", "pbkdf2"])]
+    pub kdf: Option<String>,
+    /// Max handshake packets per source IP per 10 seconds
+    #[arg(long = "init-rate-limit")]
+    pub init_rate_limit: Option<u32>,
+    /// Overlay ACL `allow:CIDR` or `deny:CIDR` (last match wins)
+    #[arg(long = "acl")]
+    pub acl: Vec<String>,
+
     #[command(subcommand)]
     pub cmd: Option<Command>
 }
@@ -884,7 +975,17 @@ pub struct ConfigFile {
     pub hooks: HashMap<String, String>,
     /// Windows system tray icon
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tray: Option<bool>
+    pub tray: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stun: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stun_servers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lan_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub init_rate_limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acl: Option<Vec<String>>
 }
 
 /// Config file encoding. YAML covers `.yaml`, `.yml`, `.net`, and unknown extensions.
@@ -1068,7 +1169,8 @@ statsd:
         }),
         hook: None,
         hooks: HashMap::new(),
-        tray: None
+        tray: None,
+        ..Default::default()
     })
 }
 
@@ -1126,7 +1228,8 @@ fn config_merge() {
         }),
         hook: None,
         hooks: HashMap::new(),
-        tray: None
+        tray: None,
+        ..Default::default()
     });
     assert_eq!(config, Config {
         device_type: Type::Tun,
@@ -1223,7 +1326,8 @@ fn config_merge() {
         daemonize: true,
         hook: None,
         hooks: HashMap::new(),
-        tray: false
+        tray: false,
+        ..Default::default()
     });
 }
 

@@ -15,6 +15,7 @@ pub mod util;
 #[cfg(test)]
 #[macro_use]
 mod tests;
+pub mod acl;
 pub mod beacon;
 pub mod cloud;
 pub mod config;
@@ -24,12 +25,16 @@ pub mod engine;
 pub mod error;
 #[cfg(feature = "installer")]
 pub mod installer;
+pub mod lan;
 pub mod messages;
+pub mod natpmp;
 pub mod net;
 pub mod oldconfig;
 pub mod payload;
 pub mod poll;
 pub mod port_forwarding;
+pub mod rate_limit;
+pub mod stun;
 pub mod svc;
 pub mod table;
 pub mod traffic;

@@ -97,7 +97,8 @@ impl OldConfigFile {
                 password: Some(self.shared_key.unwrap_or_else(|| "none".to_string())),
                 private_key: None,
                 public_key: None,
-                trusted_keys: vec![]
+                trusted_keys: vec![],
+                ..Default::default()
             },
             device: Some(ConfigFileDevice {
                 fix_rp_filter: None,
@@ -124,7 +125,8 @@ impl OldConfigFile {
             user: self.user,
             hook: None,
             hooks: HashMap::new(),
-            tray: None
+            tray: None,
+            ..Default::default()
         }
     }
 }

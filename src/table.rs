@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    types::{Address, Range, RangeList},
+    types::{Address, NodeId, Range, RangeList},
     util::{addr_nice, Duration, Time, TimeSource}
 };
 
@@ -16,11 +16,13 @@ type Hash = BuildHasherDefault<FnvHasher>;
 
 struct CacheValue {
     peer: SocketAddr,
+    node_id: NodeId,
     timeout: Time
 }
 
 struct ClaimEntry {
     peer: SocketAddr,
+    node_id: NodeId,
     claim: Range,
     timeout: Time
 }
@@ -38,22 +40,23 @@ impl<TS: TimeSource> ClaimTable<TS> {
         Self { cache: HashMap::default(), cache_timeout, claims: vec![], claim_timeout, _dummy: PhantomData }
     }
 
-    pub fn cache(&mut self, addr: Address, peer: SocketAddr) {
+    pub fn cache(&mut self, addr: Address, peer: SocketAddr, node_id: NodeId) {
         // HOT PATH
-        self.cache.insert(addr, CacheValue { peer, timeout: TS::now() + self.cache_timeout as Time });
+        self.cache.insert(addr, CacheValue { peer, node_id, timeout: TS::now() + self.cache_timeout as Time });
     }
 
     pub fn clear_cache(&mut self) {
         self.cache.clear()
     }
 
-    pub fn set_claims(&mut self, peer: SocketAddr, mut claims: RangeList) {
+    pub fn set_claims(&mut self, peer: SocketAddr, node_id: NodeId, mut claims: RangeList) {
         let mut removed_claim = false;
         for entry in &mut self.claims {
             if entry.peer == peer {
                 let pos = claims.iter().position(|r| r == &entry.claim);
                 if let Some(pos) = pos {
                     entry.timeout = TS::now() + self.claim_timeout as Time;
+                    entry.node_id = node_id;
                     claims.swap_remove(pos);
                     if claims.is_empty() {
                         break;
@@ -65,7 +68,7 @@ impl<TS: TimeSource> ClaimTable<TS> {
             }
         }
         for claim in claims {
-            self.claims.push(ClaimEntry { peer, claim, timeout: TS::now() + self.claim_timeout as Time })
+            self.claims.push(ClaimEntry { peer, node_id, claim, timeout: TS::now() + self.claim_timeout as Time })
         }
         if removed_claim {
             for entry in self.cache.values_mut() {
@@ -91,26 +94,33 @@ impl<TS: TimeSource> ClaimTable<TS> {
         self.housekeep()
     }
 
-    pub fn lookup(&mut self, addr: Address) -> Option<SocketAddr> {
+    pub fn lookup(&mut self, addr: Address) -> Option<(SocketAddr, NodeId)> {
         // HOT PATH
         if let Some(entry) = self.cache.get(&addr) {
-            return Some(entry.peer);
+            return Some((entry.peer, entry.node_id));
         }
         // COLD PATH
         let mut found = None;
         let mut prefix_len = -1;
+        let mut metric = u8::MAX;
         for entry in &self.claims {
-            if entry.claim.prefix_len as isize > prefix_len && entry.claim.matches(addr) {
+            if !entry.claim.matches(addr) {
+                continue;
+            }
+            let pl = entry.claim.prefix_len as isize;
+            if pl > prefix_len || (pl == prefix_len && entry.claim.metric < metric) {
                 found = Some(entry);
-                prefix_len = entry.claim.prefix_len as isize;
+                prefix_len = pl;
+                metric = entry.claim.metric;
             }
         }
         if let Some(entry) = found {
             self.cache.insert(addr, CacheValue {
                 peer: entry.peer,
+                node_id: entry.node_id,
                 timeout: min(TS::now() + self.cache_timeout as Time, entry.timeout)
             });
-            return Some(entry.peer);
+            return Some((entry.peer, entry.node_id));
         }
         None
     }

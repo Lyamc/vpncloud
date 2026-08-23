@@ -18,6 +18,7 @@ use std::{
 pub const MESSAGE_TYPE_DATA: u8 = 0;
 pub const MESSAGE_TYPE_NODE_INFO: u8 = 1;
 pub const MESSAGE_TYPE_KEEPALIVE: u8 = 2;
+pub const MESSAGE_TYPE_RELAY: u8 = 3;
 pub const MESSAGE_TYPE_CLOSE: u8 = 0xff;
 
 pub type AddrList = SmallVec<[SocketAddr; 4]>;
@@ -41,6 +42,7 @@ pub struct NodeInfo {
 impl NodeInfo {
     const PART_ADDRS: u8 = 5;
     const PART_CLAIMS: u8 = 2;
+    const PART_CLAIM_METRICS: u8 = 6;
     const PART_END: u8 = 0;
     const PART_NODEID: u8 = 4;
     const PART_PEERS: u8 = 1;
@@ -115,6 +117,13 @@ impl NodeInfo {
                     peers = Self::decode_peer_list_part(&mut rp).map_err(|_| Error::Message("Truncated message"))?
                 }
                 Self::PART_CLAIMS => claims = Self::decode_claims_part(&mut rp)?,
+                Self::PART_CLAIM_METRICS => {
+                    let mut metrics = vec![0u8; part_len];
+                    rp.read_exact(&mut metrics).map_err(|_| Error::Message("Truncated message"))?;
+                    for (c, m) in claims.iter_mut().zip(metrics.into_iter()) {
+                        c.metric = m;
+                    }
+                }
                 Self::PART_PEER_TIMEOUT => {
                     peer_timeout =
                         Some(rp.read_u16::<NetworkEndian>().map_err(|_| Error::Message("Truncated message"))?)
@@ -236,6 +245,14 @@ impl NodeInfo {
                 }
                 Ok(())
             })?;
+            if self.claims.iter().any(|c| c.metric != 0) {
+                Self::encode_part(&mut cursor, Self::PART_CLAIM_METRICS, |cursor| {
+                    for c in &self.claims {
+                        cursor.write_u8(c.metric)?;
+                    }
+                    Ok(())
+                })?;
+            }
             if let Some(timeout) = self.peer_timeout {
                 Self::encode_part(&mut cursor, Self::PART_PEER_TIMEOUT, |cursor| {
                     cursor.write_u16::<NetworkEndian>(timeout)

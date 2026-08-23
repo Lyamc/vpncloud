@@ -23,19 +23,24 @@ use rand::{
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
+    acl::Acl,
     beacon::BeaconSerializer,
     config::{Config, DEFAULT_PEER_TIMEOUT, DEFAULT_PORT},
     crypto::{is_init_message, Crypto, MessageResult, PeerCrypto},
     device::{Device, Type},
     error::Error,
+    lan,
     messages::{
         AddrList, NodeInfo, PeerInfo, MESSAGE_TYPE_CLOSE, MESSAGE_TYPE_DATA, MESSAGE_TYPE_KEEPALIVE,
-        MESSAGE_TYPE_NODE_INFO
+        MESSAGE_TYPE_NODE_INFO, MESSAGE_TYPE_RELAY
     },
+    natpmp,
     net::{mapped_addr, parse_listen, Socket},
     payload::Protocol,
     poll::{Pollable, WaitImpl, WaitResult},
     port_forwarding::PortForwarding,
+    rate_limit::InitRateLimit,
+    stun,
     table::ClaimTable,
     traffic::TrafficStats,
     types::{Address, Mode, NodeId, Range, RangeList},
@@ -101,6 +106,8 @@ fn resolve_peer_group(names: &[String]) -> AddrList {
             Err(err) => warn!("Failed to resolve {}: {:?}", name, err)
         }
     }
+    let prefixes = lan::interface_prefixes();
+    lan::sort_lan_first(&mut resolved, &prefixes);
     resolved
 }
 
@@ -129,6 +136,9 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     next_own_address_reset: Time,
     port_forwarding: Option<PortForwarding>,
     traffic: TrafficStats,
+    init_limit: InitRateLimit,
+    stun_txid: [u8; 12],
+    stun_reflexive: AddrList,
     beacon_serializer: BeaconSerializer<TS>,
     _dummy_p: PhantomData<P>,
     _dummy_ts: PhantomData<TS>
@@ -157,7 +167,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         if device.get_type() == Type::Tun && config.auto_claim {
             match device.address() {
                 Ok(ip) => {
-                    let range = Range { base: Address::from(ip), prefix_len: 32 };
+                    let range = Range { base: Address::from(ip), prefix_len: 32, metric: 0 };
                     info!("Auto-claiming {} due to interface address", range);
                     claims.push(range);
                 }
@@ -195,6 +205,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             next_own_address_reset: now + OWN_ADDRESS_RESET_INTERVAL,
             port_forwarding,
             traffic: TrafficStats::default(),
+            init_limit: InitRateLimit::new(config.init_rate_limit, 10),
+            stun_txid: [0; 12],
+            stun_reflexive: SmallVec::new(),
             beacon_serializer: BeaconSerializer::new(beacon_key),
             crypto,
             config: config.clone(),
@@ -272,6 +285,11 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         if let Some(ref pfw) = self.port_forwarding {
             self.own_addresses.push(pfw.get_internal_ip().into());
             self.own_addresses.push(pfw.get_external_ip().into());
+        }
+        for addr in &self.stun_reflexive {
+            if !self.own_addresses.contains(addr) {
+                self.own_addresses.push(*addr);
+            }
         }
         debug!("Own addresses: {:?}", self.own_addresses);
         // TODO: detect address changes and call event
@@ -359,6 +377,10 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
 
     fn connect_sock(&mut self, addr: SocketAddr) -> Result<(), Error> {
         let addr = mapped_addr(addr);
+        if self.config.lan_only && !lan::addr_on_local_prefix(addr, &lan::interface_prefixes()) {
+            debug!("lan-only: skipping non-local {}", addr_nice(addr));
+            return Ok(());
+        }
         if self.peers.contains_key(&addr)
             || self.own_addresses.contains(&addr)
             || self.pending_inits.contains_key(&addr)
@@ -484,6 +506,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             self.connect_sock(addr)?; // Try to reconnect
         }
         self.table.housekeep();
+        self.init_limit.housekeep(now);
         self.crypto_housekeep()?;
         // Periodically extend the port-forwarding
         if let Some(ref mut pfw) = self.port_forwarding {
@@ -533,8 +556,29 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 self.reconnect_to_peers()?;
             }
             self.next_own_address_reset = now + OWN_ADDRESS_RESET_INTERVAL;
+            self.send_stun_probes();
         }
         Ok(())
+    }
+
+    fn send_stun_probes(&mut self) {
+        if !self.config.stun || self.config.stun_servers.is_empty() {
+            return;
+        }
+        self.stun_txid = random();
+        let req = stun::encode_binding_request(&self.stun_txid);
+        for server in stun::resolve_stun_servers(&self.config.stun_servers) {
+            if let Err(e) = self.socket.send(&req, server) {
+                debug!("STUN send to {} failed: {}", addr_nice(server), e);
+            }
+        }
+        if let Ok(local) = self.socket.address() {
+            if let std::net::IpAddr::V4(v4) = crate::net::send_addr(local).ip() {
+                let gw = natpmp::guess_gateway(v4);
+                let pkt = natpmp::encode_udp_mapping(local.port(), local.port(), 1800);
+                let _ = self.socket.send(&pkt, gw);
+            }
+        }
     }
 
     /// Stores the beacon
@@ -664,21 +708,58 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         Ok(())
     }
 
+    fn pick_relay(&self, except: SocketAddr) -> Option<SocketAddr> {
+        self.peers.iter().filter(|(addr, _)| **addr != except).max_by_key(|(_, p)| p.last_seen).map(|(addr, _)| *addr)
+    }
+
+    fn send_relay(&mut self, via: SocketAddr, dest: NodeId, inner: u8, msg: &mut MsgBuffer) -> Result<(), Error> {
+        msg.prepend_byte(inner);
+        for b in dest.iter().rev() {
+            msg.prepend_byte(*b);
+        }
+        debug!("Relaying type {} for node via {}", inner, addr_nice(via));
+        self.send_msg(via, MESSAGE_TYPE_RELAY, msg)
+    }
+
+    fn handle_relay(&mut self, src: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
+        let msg = data.message();
+        if msg.len() < 17 {
+            return Err(Error::Message("Truncated relay"));
+        }
+        let mut dest = [0u8; 16];
+        dest.copy_from_slice(&msg[..16]);
+        let inner = msg[16];
+        let start = data.get_start();
+        data.set_start(start + 17);
+        if inner == MESSAGE_TYPE_RELAY {
+            return Ok(());
+        }
+        if dest == self.node_id {
+            return self.handle_message(src, MessageResult::Message(inner), data);
+        }
+        if let Some(addr) = self.peers.iter().find(|(_, p)| p.node_id == dest).map(|(a, _)| *a) {
+            self.send_msg(addr, inner, data)
+        } else {
+            debug!("Relay dest unknown, dropping");
+            Ok(())
+        }
+    }
+
     pub fn handle_interface_data(&mut self, data: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
         let (src, dst) = P::parse(data.message())?;
         debug!("Read data from interface: src: {}, dst: {}, {} bytes", src, dst, data.len());
         self.traffic.count_out_payload(dst, src, data.len());
         match self.table.lookup(dst) {
-            Some(addr) => {
+            Some((addr, dest_id)) => {
                 // HOT PATH
-                // Peer found for destination
                 debug!("Found destination for {} => {}", dst, addr);
-                self.send_msg(addr, MESSAGE_TYPE_DATA, data)?;
-                if !self.peers.contains_key(&addr) {
-                    // COLD PATH
-                    // If the peer is not actually connected, remove the entry in the table and try
-                    // to reconnect.
+                if self.peers.contains_key(&addr) {
+                    self.send_msg(addr, MESSAGE_TYPE_DATA, data)?;
+                } else if let Some(via) = self.pick_relay(addr) {
+                    self.send_relay(via, dest_id, MESSAGE_TYPE_DATA, data)?;
+                    self.connect_sock(addr)?;
+                } else {
                     warn!("Destination for {} not found in peers: {}", dst, addr_nice(addr));
                     self.table.remove_claims(addr);
                     self.connect_sock(addr)?;
@@ -783,6 +864,8 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                         peer.addrs.push(*addr);
                     }
                 }
+                let prefixes = lan::interface_prefixes();
+                lan::sort_lan_first(&mut peer.addrs, &prefixes);
             }
         } else {
             error!("Received peer update from non peer {}", addr_nice(addr));
@@ -790,7 +873,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
         if let Some(info) = info {
             debug!("Adding claims of peer {}: {:?}", addr_nice(addr), info.claims);
-            self.table.set_claims(addr, info.claims);
+            self.table.set_claims(addr, info.node_id, info.claims);
             debug!("Received {} peers from {}: {:?}", info.peers.len(), addr_nice(addr), info.peers);
             self.connect_to_peers(&info.peers)?;
         }
@@ -800,6 +883,14 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     fn handle_payload_from(&mut self, peer: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
         let (src, dst) = P::parse(data.message())?;
+        if !self.config.acl.is_empty() {
+            if let Ok(acl) = crate::acl::Acl::parse(&self.config.acl) {
+                if !acl.allows(src) {
+                    debug!("ACL dropped overlay src {}", src);
+                    return Ok(());
+                }
+            }
+        }
         let len = data.len();
         debug!("Writing data to device: {} bytes", len);
         self.traffic.count_in_payload(src, dst, len);
@@ -809,7 +900,8 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
         if self.learning {
             // Learn single address
-            self.table.cache(src, peer);
+            let nid = self.peers.get(&peer).map(|p| p.node_id).unwrap_or([0; 16]);
+            self.table.cache(src, peer, nid);
         }
         Ok(())
     }
@@ -826,6 +918,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                         // HOT PATH
                         self.handle_payload_from(src, data)?
                     }
+                    MESSAGE_TYPE_RELAY => self.handle_relay(src, data)?,
                     MESSAGE_TYPE_NODE_INFO => {
                         // COLD PATH
                         let info = match NodeInfo::decode(Cursor::new(data.message())) {
@@ -875,6 +968,35 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     pub fn handle_net_message(&mut self, src: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
         let src = mapped_addr(src);
+        if natpmp::is_natpmp_response(data.message()) {
+            if let Some((_, ext, _)) = natpmp::parse_udp_mapping(data.message()) {
+                if let Ok(local) = self.socket.address() {
+                    let mapped = SocketAddr::new(local.ip(), ext);
+                    let mapped = mapped_addr(mapped);
+                    if !self.stun_reflexive.contains(&mapped) {
+                        info!("NAT-PMP mapped port {}", ext);
+                        self.stun_reflexive.push(mapped);
+                        let _ = self.reset_own_addresses();
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if stun::is_stun_message(data.message()) {
+            if let Some(mapped) = stun::parse_binding_success(data.message(), &self.stun_txid) {
+                let mapped = mapped_addr(mapped);
+                if !self.stun_reflexive.contains(&mapped) {
+                    info!("STUN mapped address {}", addr_nice(mapped));
+                    self.stun_reflexive.push(mapped);
+                    let _ = self.reset_own_addresses();
+                }
+            }
+            return Ok(());
+        }
+        if self.config.lan_only && !lan::addr_on_local_prefix(src, &lan::interface_prefixes()) {
+            debug!("lan-only: ignoring {}", addr_nice(src));
+            return Ok(());
+        }
         if is_loopback_ip(src.ip()) {
             // Peers (or this process) hitting the listen port via 127.0.0.1 spam crypto-init
             // failures (#313). Loopback is never a real remote node.
@@ -887,6 +1009,10 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             init.handle_message(data)
         } else if is_init_message(data.message()) {
             // COLD PATH
+            if !self.init_limit.allow(src.ip(), TS::now()) {
+                debug!("Rate-limited handshake from {}", addr_nice(src));
+                return Ok(());
+            }
             let mut result = None;
             if let Some(peer) = self.peers.get_mut(&src) {
                 if peer.crypto.has_init() {
@@ -948,34 +1074,31 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
 
     fn handle_socket_event(&mut self, buffer: &mut MsgBuffer) {
         // HOT PATH
-        let src = match self.socket.receive(buffer) {
-            Ok(src) => src,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
-            Err(e) => try_fail!(Err(e), "Failed to read from network socket: {}")
-        };
-        self.traffic.count_in_traffic(src, buffer.len());
-        match self.handle_net_message(src, buffer) {
-            Err(e @ Error::CryptoInitFatal(_)) => {
-                // COLD PATH
-                debug!("Fatal crypto init error from {}: {}", src, e);
-                info!("Closing pending connection to {} due to error in crypto init", addr_nice(src));
-                self.pending_inits.remove(&src);
-                self.config.call_hook(
-                    "peer_disconnected",
-                    vec![("PEER", format!("{:?}", addr_nice(src))), ("IFNAME", self.device.ifname().to_owned())],
-                    true
-                );
+        loop {
+            let src = match self.socket.receive(buffer) {
+                Ok(src) => src,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) => try_fail!(Err(e), "Failed to read from network socket: {}")
+            };
+            self.traffic.count_in_traffic(src, buffer.len());
+            match self.handle_net_message(src, buffer) {
+                Err(e @ Error::CryptoInitFatal(_)) => {
+                    debug!("Fatal crypto init error from {}: {}", src, e);
+                    info!("Closing pending connection to {} due to error in crypto init", addr_nice(src));
+                    self.pending_inits.remove(&src);
+                    self.config.call_hook(
+                        "peer_disconnected",
+                        vec![("PEER", format!("{:?}", addr_nice(src))), ("IFNAME", self.device.ifname().to_owned())],
+                        true
+                    );
+                }
+                Err(e @ Error::CryptoInit(_)) => {
+                    debug!("Recoverable init error from {}: {}", src, e);
+                    info!("Ignoring invalid init message from peer {}", addr_nice(src));
+                }
+                Err(e) => error!("{}", e),
+                Ok(_) => {}
             }
-            Err(e @ Error::CryptoInit(_)) => {
-                // COLD PATH
-                debug!("Recoverable init error from {}: {}", src, e);
-                info!("Ignoring invalid init message from peer {}", addr_nice(src));
-            }
-            Err(e) => {
-                // COLD PATH
-                error!("{}", e);
-            }
-            Ok(_) => {} // HOT PATH
         }
     }
 

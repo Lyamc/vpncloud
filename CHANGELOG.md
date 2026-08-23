@@ -7,6 +7,11 @@ This project follows [semantic versioning](http://semver.org).
 - [changed] Service install uses the `service-manager` crate (systemd, launchd, Windows `sc.exe`); the Windows service *process* is unchanged
 - [added] macOS `vpncloud install` registers LaunchDaemon `ca.witherow.vpncloud`
 - [added] FreeBSD TUN/TAP (`tun`/`tap`) and rc.d install (`/usr/local/etc/rc.d/vpncloud`)
+- [added] STUN mapped-address publish, LAN peer preference, `--lan-only`, handshake rate-limit
+- [added] Optional password KDF PBKDF2-100000 when `crypto.salt` is set (legacy 4096 remains default)
+- [added] NAT-PMP mapping, claim metrics (`10.0.0.0/8@50`), ciphertext peer-relay
+- [added] 2 MiB UDP socket buffers and multi-packet socket drain
+- [added] Overlay ACLs (`--acl allow:10.0.0.0/8`) and `trusted-key` expiry (`key:YYYY-MM-DD`)
 
 ### v2.4.0 (2026-08-22)
 

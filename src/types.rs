@@ -126,10 +126,25 @@ impl FromStr for Address {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Range {
     pub base: Address,
-    pub prefix_len: u8
+    pub prefix_len: u8,
+    /// Lower is preferred when prefix lengths match (Wave B claim metrics).
+    pub metric: u8
+}
+
+impl PartialEq for Range {
+    fn eq(&self, other: &Self) -> bool {
+        self.base == other.base && self.prefix_len == other.prefix_len
+    }
+}
+impl Eq for Range {}
+impl Hash for Range {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.base.hash(state);
+        self.prefix_len.hash(state);
+    }
 }
 
 pub type RangeList = SmallVec<[Range; 4]>;
@@ -154,7 +169,7 @@ impl Range {
     pub fn read_from<R: Read>(mut r: R) -> Result<Range, Error> {
         let base = Address::read_from(&mut r)?;
         let prefix_len = r.read_u8().map_err(|_| Error::Parse("Address too short"))?;
-        Ok(Range { base, prefix_len })
+        Ok(Range { base, prefix_len, metric: 0 })
     }
 
     #[inline]
@@ -172,15 +187,26 @@ impl FromStr for Range {
             Some(pos) => pos,
             None => return Err(Error::Parse("Invalid range format"))
         };
-        let prefix_len = u8::from_str(&text[pos + 1..]).map_err(|_| Error::Parse("Failed to parse prefix length"))?;
+        let rest = &text[pos + 1..];
+        let (plen_s, metric) = if let Some(at) = rest.find('@') {
+            let m = u8::from_str(&rest[at + 1..]).map_err(|_| Error::Parse("Failed to parse claim metric"))?;
+            (&rest[..at], m)
+        } else {
+            (rest, 0)
+        };
+        let prefix_len = u8::from_str(plen_s).map_err(|_| Error::Parse("Failed to parse prefix length"))?;
         let base = Address::from_str(&text[..pos])?;
-        Ok(Range { base, prefix_len })
+        Ok(Range { base, prefix_len, metric })
     }
 }
 
 impl fmt::Display for Range {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(formatter, "{}/{}", self.base, self.prefix_len)
+        if self.metric == 0 {
+            write!(formatter, "{}/{}", self.base, self.prefix_len)
+        } else {
+            write!(formatter, "{}/{}@{}", self.base, self.prefix_len, self.metric)
+        }
     }
 }
 
@@ -292,13 +318,27 @@ mod tests {
     #[test]
     fn address_range_decode_encode() {
         let mut buf = vec![];
-        let range =
-            Range { base: Address { data: [0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], len: 4 }, prefix_len: 24 };
+        let range = Range {
+            base: Address { data: [0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], len: 4 },
+            prefix_len: 24,
+            metric: 0
+        };
         range.write_to(Cursor::new(&mut buf));
         assert_eq!(&buf[0..6], &[4, 0, 1, 2, 3, 24]);
         assert_eq!(range, Range::read_from(Cursor::new(&buf)).unwrap());
         assert!(Range::read_from(Cursor::new(&buf[..5])).is_err()); // Missing prefix length
         buf[0] = 17;
         assert!(Range::read_from(Cursor::new(&buf)).is_err());
+    }
+
+    #[test]
+    fn claim_metric_suffix() {
+        let r = Range::from_str("10.0.0.0/8@50").unwrap();
+        assert_eq!(r.prefix_len, 8);
+        assert_eq!(r.metric, 50);
+        assert_eq!(format!("{}", r), "10.0.0.0/8@50");
+        let plain = Range::from_str("10.0.0.0/8").unwrap();
+        assert_eq!(plain.metric, 0);
+        assert_eq!(plain, r);
     }
 }

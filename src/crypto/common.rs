@@ -60,7 +60,13 @@ pub struct Config {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trusted_keys: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub algorithms: Vec<String>
+    pub algorithms: Vec<String>,
+    /// Optional KDF salt (base62 or raw). When set, password derivation uses PBKDF2-100000.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub salt: Option<String>,
+    /// `legacy` (PBKDF2-4096, default if no salt) or `pbkdf2` (100000 iterations, requires salt).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kdf: Option<String>
 }
 
 pub struct Crypto {
@@ -112,18 +118,29 @@ impl Crypto {
             seed.copy_from_slice(&privkey);
             Ok(seed)
         } else if let Some(password) = &config.password {
-            let mut key = [0; 32];
-            pbkdf2::derive(
-                pbkdf2::PBKDF2_HMAC_SHA256,
-                NonZeroU32::new(4096).unwrap(),
-                SALT,
-                password.as_bytes(),
-                &mut key
-            );
-            Ok(key)
+            Ok(Self::password_seed(password, config.salt.as_deref(), config.kdf.as_deref())?)
         } else {
             Err(Error::InvalidConfig("Either private_key or password must be set"))
         }
+    }
+
+    pub fn password_seed(password: &str, salt: Option<&str>, kdf: Option<&str>) -> Result<[u8; 32], Error> {
+        let mut key = [0; 32];
+        let kdf = kdf.unwrap_or("").to_ascii_lowercase();
+        let (iters, salt_bytes): (u32, &[u8]) = if kdf == "pbkdf2" || salt.is_some() {
+            let s = salt.ok_or(Error::InvalidConfig("crypto.kdf=pbkdf2 requires crypto.salt"))?;
+            (100_000, s.as_bytes())
+        } else {
+            (4096, SALT.as_ref())
+        };
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            NonZeroU32::new(iters).expect("kdf iterations"),
+            salt_bytes,
+            password.as_bytes(),
+            &mut key
+        );
+        Ok(key)
     }
 
     pub fn new(node_id: NodeId, config: &Config) -> Result<Self, Error> {
@@ -140,6 +157,16 @@ impl Crypto {
         };
         let mut trusted_keys = vec![];
         for tn in &config.trusted_keys {
+            if let Some((key, rest)) = tn.rsplit_once(':') {
+                if rest.len() == 10 && rest.as_bytes().get(4) == Some(&b'-') {
+                    if Self::date_expired(rest) {
+                        warn!("Ignoring expired trusted key (until {})", rest);
+                        continue;
+                    }
+                    trusted_keys.push(Self::parse_public_key(key)?);
+                    continue;
+                }
+            }
             trusted_keys.push(Self::parse_public_key(tn)?);
         }
         if trusted_keys.is_empty() {
@@ -233,6 +260,21 @@ impl Crypto {
         let keypair = Ed25519KeyPair::from_seed_unchecked(&privkey)
             .map_err(|_| Error::InvalidConfig("Key rejected by crypto library"))?;
         Ok(keypair)
+    }
+
+    fn date_expired(ymd: &str) -> bool {
+        let Ok(parts) = ymd.split('-').map(|s| s.parse::<u32>()).collect::<Result<Vec<_>, _>>() else {
+            return true;
+        };
+        if parts.len() != 3 {
+            return true;
+        }
+        let (y, m, d) = (parts[0], parts[1], parts[2]);
+        let today = chrono::Utc::now().date_naive();
+        match chrono::NaiveDate::from_ymd_opt(y as i32, m, d) {
+            Some(until) => today > until,
+            None => true
+        }
     }
 
     fn parse_public_key(pubkey: &str) -> Result<Ed25519PublicKey, Error> {
@@ -668,5 +710,18 @@ mod tests {
         node2.send_message(2, &mut buffer).unwrap();
         let res = node1.handle_message(&mut buffer).unwrap();
         assert_eq!(res, MessageResult::Message(2));
+    }
+
+    #[test]
+    fn legacy_and_salted_kdf_differ() {
+        let a = Crypto::password_seed("secret", None, None).unwrap();
+        let b = Crypto::password_seed("secret", Some("netsalt"), Some("pbkdf2")).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a, Crypto::password_seed("secret", None, None).unwrap());
+    }
+
+    #[test]
+    fn pbkdf2_requires_salt() {
+        assert!(Crypto::password_seed("secret", None, Some("pbkdf2")).is_err());
     }
 }
