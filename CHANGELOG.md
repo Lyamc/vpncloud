@@ -4,6 +4,13 @@ This project follows [semantic versioning](http://semver.org).
 
 ### UNRELEASED
 
+### v2.4.2 (2026-08-23)
+
+- [fixed] Linux seccomp arch check was inverted (SIGSYS on `write()`); 2.4.1 Linux binaries needed `--no-seccomp`
+- [fixed] Linux `sendmmsg` compiles on stable rustc (index-assign mmsghdr slots)
+- [fixed] Linux musl `msghdr` construction (private padding fields)
+- Mesh protocol remains compatible with 2.4.0 / 2.4.1 peers
+
 ### v2.4.1 (2026-08-23)
 
 - [changed] Datapath: reuse packet buffers (no 64 KiB zero / `to_vec` per packet); skip crypto mutex when `--crypto-threads` is 0; Linux TUN GSO/GRO offload; queue TUN writes and `send_multiple` after a UDP/TUN batch
