@@ -43,7 +43,7 @@ control plane, skip-crypto-on-LAN, per-app split tunnel.
 
 | Item | Plan |
 |------|------|
-| Overlay ACLs | After decrypt, before TUN write: allow/deny by overlay CIDR (and later proto/port). |
+| Overlay ACLs | After decrypt, before TUN write: allow/deny by overlay CIDR, optional proto/port. |
 | Signed configs | Ed25519 signature over the config blob; `--require-signed-config` refuses unsigned files. |
 | Seccomp | Linux: after bind/TUN, drop to a small syscall set. |
 | Node expiry | `trusted-key` may be `key` or `key:YYYY-MM-DD`; expired keys are not trusted. |
@@ -58,5 +58,5 @@ A → B → C → D. Each wave should compile and `cargo test` on its own.
 |------|------|------------------|
 | A | STUN on the mesh socket, LAN sort, `--lan-only`, init rate-limit, `crypto.salt` → PBKDF2-100000; [vpn-bench PR #2](https://github.com/Qubasa/vpn-bench/pull/2) | skips listed above |
 | B | NAT-PMP probes, `claim/prefix@metric`, `MESSAGE_TYPE_RELAY` via freshest peer, native TCP fallback (`--tcp-fallback`, length-prefixed datagrams) | |
-| C | Configurable `SO_RCVBUF`/`SO_SNDBUF` (`--socket-buffer`, default 2 MiB), drain socket until `WouldBlock`, Linux `recvmmsg`/`sendmmsg`, UDP GSO (`UDP_SEGMENT`), `--crypto-threads` DATA worker pool | UDP GRO (needs userspace split) |
-| D | Overlay `--acl`, `trusted-key:YYYY-MM-DD` expiry, Ed25519 signed configs (`sign-config`, `--require-signed-config`), Linux seccomp blacklist after bind/TUN | proto/port ACL (later) |
+| C | Configurable `SO_RCVBUF`/`SO_SNDBUF` (`--socket-buffer`, default 2 MiB), drain socket until `WouldBlock`, Linux `recvmmsg`/`sendmmsg`, UDP GSO (`UDP_SEGMENT`), UDP GRO receive split, `--crypto-threads` DATA worker pool | |
+| D | Overlay `--acl` (CIDR + optional proto/port), `trusted-key:YYYY-MM-DD` expiry, Ed25519 signed configs (`sign-config`, `--require-signed-config`), Linux seccomp blacklist after bind/TUN | |

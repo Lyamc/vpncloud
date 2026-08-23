@@ -835,7 +835,7 @@ pub struct Args {
     /// Max handshake packets per source IP per 10 seconds
     #[arg(long = "init-rate-limit")]
     pub init_rate_limit: Option<u32>,
-    /// Overlay ACL `allow:CIDR` or `deny:CIDR` (last match wins)
+    /// Overlay ACL `allow:CIDR` / `deny:CIDR` with optional `:tcp|:udp|:icmp[:port[-port]]` (last match wins)
     #[arg(long = "acl")]
     pub acl: Vec<String>,
     /// Listen and connect with length-prefixed TCP as a UDP fallback

@@ -11,9 +11,9 @@ This project follows [semantic versioning](http://semver.org).
 - [added] Optional password KDF PBKDF2-100000 when `crypto.salt` is set (legacy 4096 remains default)
 - [added] NAT-PMP mapping, claim metrics (`10.0.0.0/8@50`), ciphertext peer-relay
 - [added] Configurable UDP socket buffers (`--socket-buffer`, default 2 MiB) and multi-packet socket drain
-- [added] Overlay ACLs (`--acl allow:10.0.0.0/8`) and `trusted-key` expiry (`key:YYYY-MM-DD`)
+- [added] Overlay ACLs (`--acl allow:10.0.0.0/8`, optional `:tcp:22` / port ranges) and `trusted-key` expiry (`key:YYYY-MM-DD`)
 - [added] Optional TCP fallback (`--tcp-fallback`) with length-prefixed datagrams on the mesh port
-- [added] Linux `recvmmsg`/`sendmmsg` batch I/O and UDP GSO (`UDP_SEGMENT`)
+- [added] Linux `recvmmsg`/`sendmmsg` batch I/O, UDP GSO (`UDP_SEGMENT`), and UDP GRO receive split
 - [added] Optional DATA crypto worker pool (`--crypto-threads N`)
 - [added] Ed25519 config signatures (`vpncloud sign-config`, `--require-signed-config`)
 - [added] Linux seccomp blacklist after bind/TUN/privdrop (`--seccomp` / `--no-seccomp`)

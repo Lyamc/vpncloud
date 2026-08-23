@@ -148,6 +148,7 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     stun_txid: [u8; 12],
     stun_reflexive: AddrList,
     beacon_serializer: BeaconSerializer<TS>,
+    acl: crate::acl::Acl,
     _dummy_p: PhantomData<P>,
     _dummy_ts: PhantomData<TS>
 }
@@ -223,6 +224,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             pending_encrypt: HashMap::default(),
             rx_bufs: (0..BATCH_SIZE).map(|_| MsgBuffer::new(SPACE_BEFORE)).collect(),
             rx_addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)); BATCH_SIZE],
+            acl: try_fail!(crate::acl::Acl::parse(&config.acl), "Invalid ACL: {}"),
             config: config.clone(),
             _dummy_p: PhantomData,
             _dummy_ts: PhantomData
@@ -986,12 +988,13 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     fn handle_payload_from(&mut self, peer: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
         let (src, dst) = P::parse(data.message())?;
-        if !self.config.acl.is_empty() {
-            if let Ok(acl) = crate::acl::Acl::parse(&self.config.acl) {
-                if !acl.allows(src) {
-                    debug!("ACL dropped overlay src {}", src);
-                    return Ok(());
-                }
+        if !self.acl.is_empty() {
+            let tap = self.config.device_type == Type::Tap;
+            let l4 = crate::payload::overlay_l4(data.message(), tap);
+            let match_src = l4.ip_src.unwrap_or(src);
+            if !self.acl.allows(match_src, l4.proto, l4.dport) {
+                debug!("ACL dropped overlay src {} proto {:?} dport {:?}", match_src, l4.proto, l4.dport);
+                return Ok(());
             }
         }
         let len = data.len();

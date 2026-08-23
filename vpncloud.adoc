@@ -253,7 +253,9 @@ vpncloud - Peer-to-peer VPN
 
 *--acl allow:CIDR* / *--acl deny:CIDR*::
   Overlay ACL evaluated after decrypt, before writing to TUN/TAP. Last match
-  wins. Empty list allows all overlay sources.
+  wins. Empty list allows all overlay sources. A rule may add L4:
+  *allow:10.0.0.0/8:tcp:22*, *allow:fd00::/8:udp:60000-61000*,
+  *deny:0.0.0.0/0:icmp*. CIDR matches overlay IP source.
 
 *--tcp-fallback* / *--no-tcp-fallback*::
   Also listen and connect with length-prefixed TCP on the mesh port when UDP

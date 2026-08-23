@@ -4,6 +4,7 @@
 
 use crate::{error::Error, types::Address};
 use std::io::{Cursor, Read};
+#[cfg(test)] use std::str::FromStr;
 
 pub trait Protocol: Sized {
     fn parse(_: &[u8]) -> Result<(Address, Address), Error>;
@@ -112,9 +113,11 @@ impl Protocol for Packet {
                 let dst = Address::read_from_fixed(&data[24..], 16)?;
                 Ok((src, dst))
             }
-            _ => Err(Error::Parse(
-                "Invalid IP protocol version (check that every node uses the same device type: tun vs tap)"
-            ))
+            _ => {
+                Err(Error::Parse(
+                    "Invalid IP protocol version (check that every node uses the same device type: tun vs tap)"
+                ))
+            }
         }
     }
 }
@@ -158,6 +161,91 @@ fn decode_invalid_packet() {
         4, 3, 2
     ])
     .is_err());
+}
+
+/// Overlay L4 fields used by ACLs (IP source, protocol, destination port).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OverlayL4 {
+    pub ip_src: Option<Address>,
+    pub proto: Option<u8>,
+    pub dport: Option<u16>
+}
+
+/// Parse IP/L4 from a TUN packet or a TAP Ethernet frame.
+pub fn overlay_l4(data: &[u8], tap: bool) -> OverlayL4 {
+    let ip = if tap { ethernet_payload(data) } else { data };
+    parse_ip_l4(ip)
+}
+
+fn ethernet_payload(frame: &[u8]) -> &[u8] {
+    if frame.len() < 14 {
+        return &[];
+    }
+    let mut ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    let mut off = 14;
+    if ethertype == 0x8100 {
+        if frame.len() < 18 {
+            return &[];
+        }
+        ethertype = u16::from_be_bytes([frame[16], frame[17]]);
+        off = 18;
+    }
+    if ethertype != 0x0800 && ethertype != 0x86dd {
+        return &[];
+    }
+    &frame[off..]
+}
+
+fn parse_ip_l4(pkt: &[u8]) -> OverlayL4 {
+    if pkt.is_empty() {
+        return OverlayL4::default();
+    }
+    match pkt[0] >> 4 {
+        4 => {
+            if pkt.len() < 20 {
+                return OverlayL4::default();
+            }
+            let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+            let ip_src = Address::read_from_fixed(&pkt[12..], 4).ok();
+            let proto = pkt[9];
+            let dport = l4_dport(proto, pkt.get(ihl..).unwrap_or(&[]));
+            OverlayL4 { ip_src, proto: Some(proto), dport }
+        }
+        6 => {
+            if pkt.len() < 40 {
+                return OverlayL4::default();
+            }
+            let ip_src = Address::read_from_fixed(&pkt[8..], 16).ok();
+            let proto = pkt[6];
+            let dport = l4_dport(proto, pkt.get(40..).unwrap_or(&[]));
+            OverlayL4 { ip_src, proto: Some(proto), dport }
+        }
+        _ => OverlayL4::default()
+    }
+}
+
+fn l4_dport(proto: u8, payload: &[u8]) -> Option<u16> {
+    if proto != 6 && proto != 17 {
+        return None;
+    }
+    if payload.len() < 4 {
+        return None;
+    }
+    Some(u16::from_be_bytes([payload[2], payload[3]]))
+}
+
+#[test]
+fn overlay_l4_ipv4_tcp() {
+    let mut pkt = [0u8; 40];
+    pkt[0] = 0x45;
+    pkt[9] = 6;
+    pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+    pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+    pkt[20..24].copy_from_slice(&[0x04, 0xd2, 0x00, 0x16]); // sport 1234, dport 22
+    let l4 = overlay_l4(&pkt, false);
+    assert_eq!(l4.proto, Some(6));
+    assert_eq!(l4.dport, Some(22));
+    assert_eq!(l4.ip_src, Some(Address::from_str("10.0.0.1").unwrap()));
 }
 
 /// Recompute IPv4 / L4 checksums so TAP/feth/BPF offload does not deliver packets the peer kernel drops.

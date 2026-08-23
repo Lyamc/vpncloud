@@ -186,6 +186,8 @@ impl Socket for UdpSocket {
         let sock: UdpSocket = sock.into();
         #[cfg(unix)]
         protect_socket(sock.as_raw_fd())?;
+        #[cfg(target_os = "linux")]
+        enable_udp_gro(sock.as_raw_fd());
         Ok(sock)
     }
 
@@ -226,6 +228,39 @@ impl Socket for UdpSocket {
 
 #[cfg(target_os = "linux")]
 const UDP_SEGMENT: libc::c_int = 103;
+#[cfg(target_os = "linux")]
+const UDP_GRO: libc::c_int = 104;
+
+#[cfg(target_os = "linux")]
+fn enable_udp_gro(fd: RawFd) {
+    let on: libc::c_int = 1;
+    unsafe {
+        libc::setsockopt(fd, libc::IPPROTO_UDP, UDP_GRO, &on as *const _ as *const libc::c_void, 4);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn gro_segment_size(hdr: &libc::msghdr) -> usize {
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(hdr);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::IPPROTO_UDP && (*cmsg).cmsg_type == UDP_GRO {
+                let p = libc::CMSG_DATA(cmsg) as *const u16;
+                return u16::from(*p) as usize;
+            }
+            cmsg = libc::CMSG_NXTHDR(hdr, cmsg);
+        }
+    }
+    0
+}
+
+/// Split a GRO datagram into segments of `gro` bytes (last may be shorter).
+fn split_gro_payload(payload: &[u8], gro: usize) -> Vec<&[u8]> {
+    if gro == 0 || gro >= payload.len() {
+        return vec![payload];
+    }
+    payload.chunks(gro).collect()
+}
 
 #[cfg(target_os = "linux")]
 fn linux_recvmmsg(fd: RawFd, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -> io::Result<usize> {
@@ -236,6 +271,7 @@ fn linux_recvmmsg(fd: RawFd, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -
     let mut names = vec![unsafe { std::mem::zeroed::<libc::sockaddr_storage>() }; n];
     let mut iov = Vec::with_capacity(n);
     let mut hdrs = Vec::with_capacity(n);
+    let mut cbufs = vec![[0u8; 64]; n];
     for i in 0..n {
         bufs[i].clear();
         let buf = bufs[i].buffer();
@@ -248,8 +284,8 @@ fn linux_recvmmsg(fd: RawFd, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -
                 msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as u32,
                 msg_iov: &mut iov[i],
                 msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
+                msg_control: cbufs[i].as_mut_ptr() as *mut _,
+                msg_controllen: cbufs[i].len(),
                 msg_flags: 0
             },
             msg_len: 0
@@ -260,11 +296,34 @@ fn linux_recvmmsg(fd: RawFd, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -
         return Err(io::Error::last_os_error());
     }
     let got = got as usize;
+    let mut extras: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
     for i in 0..got {
-        bufs[i].set_length(hdrs[i].msg_len as usize);
+        let len = hdrs[i].msg_len as usize;
+        bufs[i].set_length(len);
         addrs[i] = sockaddr_to_std(&names[i], hdrs[i].msg_hdr.msg_namelen)?;
+        let gro = gro_segment_size(&hdrs[i].msg_hdr);
+        if gro > 0 && gro < len {
+            let payload = bufs[i].message().to_vec();
+            let segs = split_gro_payload(&payload, gro);
+            bufs[i].set_length(segs[0].len());
+            bufs[i].message_mut().copy_from_slice(segs[0]);
+            for seg in segs.iter().skip(1) {
+                extras.push((addrs[i], seg.to_vec()));
+            }
+        }
     }
-    Ok(got)
+    let mut w = got;
+    for (addr, data) in extras {
+        if w >= bufs.len().min(addrs.len()) {
+            break;
+        }
+        bufs[w].clear();
+        bufs[w].set_length(data.len());
+        bufs[w].message_mut().copy_from_slice(&data);
+        addrs[w] = addr;
+        w += 1;
+    }
+    Ok(w)
 }
 
 #[cfg(target_os = "linux")]
@@ -592,5 +651,14 @@ mod tests {
             }
         }
         panic!("did not receive {:?}", std::str::from_utf8(expect));
+    }
+
+    #[test]
+    fn split_gro_payload_chunks() {
+        let p = b"aaabbbcc";
+        let segs = super::split_gro_payload(p, 3);
+        assert_eq!(segs, vec![&b"aaa"[..], &b"bbb"[..], &b"cc"[..]]);
+        assert_eq!(super::split_gro_payload(p, 0), vec![&p[..]]);
+        assert_eq!(super::split_gro_payload(p, 8), vec![&p[..]]);
     }
 }
