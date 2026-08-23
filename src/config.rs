@@ -60,7 +60,7 @@ pub struct Config {
     pub device_type: Type,
     pub device_name: String,
     pub device_path: Option<String>,
-    /// TUN file descriptor from Android VpnService (owned). TAP is rejected.
+    /// TUN file descriptor from Android VpnService or iOS Packet Tunnel (owned). TAP is rejected.
     pub tun_fd: Option<i32>,
     pub fix_rp_filter: bool,
     pub mtu: Option<usize>,
@@ -444,14 +444,17 @@ impl Config {
     }
 }
 
-const ANDROID_AFTER_HELP: &str = "\
+const PLATFORM_AFTER_HELP: &str = "\
 Android:
   tun    Works on all devices through VpnService (--tun-fd).
   tap    Only on rooted devices with /dev/net/tun. Unrooted TAP fails with an error; see --type.
+iOS:
+  tun    Packet Tunnel Provider (--tun-fd from utun). Overlay routes only.
+  tap    Not available (no Ethernet / no /dev/net/tun).
 ";
 
 #[derive(Parser, Debug, Default)]
-#[command(name = "vpncloud", disable_version_flag = true, after_help = ANDROID_AFTER_HELP)]
+#[command(name = "vpncloud", disable_version_flag = true, after_help = PLATFORM_AFTER_HELP)]
 pub struct Args {
     /// Read configuration options from the specified file.
     #[arg(long)]
@@ -462,7 +465,7 @@ pub struct Args {
         short,
         long,
         value_name = "type",
-        long_help = "Set the type of network: tun (IP packets) or tap (Ethernet frames).\n\nOn Android, tap is only supported on rooted devices (needs /dev/net/tun). Unrooted devices must use tun via VpnService."
+        long_help = "Set the type of network: tun (IP packets) or tap (Ethernet frames).\n\nOn Android, tap is only supported on rooted devices (needs /dev/net/tun). Unrooted devices must use tun via VpnService.\nOn iOS, only tun is available (Packet Tunnel Provider); tap is not supported."
     )]
     pub type_: Option<Type>,
 
@@ -470,7 +473,7 @@ pub struct Args {
     #[arg(long)]
     pub device_path: Option<String>,
 
-    /// Adopt an existing TUN file descriptor (Android VpnService). Cannot be used with TAP.
+    /// Adopt an existing TUN file descriptor (Android VpnService or iOS Packet Tunnel). Cannot be used with TAP.
     #[arg(long = "tun-fd")]
     pub tun_fd: Option<i32>,
 
@@ -1059,6 +1062,15 @@ fn clap_help_says_android_tap_needs_root() {
     let help = Args::command().render_long_help().to_string();
     assert!(help.to_lowercase().contains("rooted"), "{}", help);
     assert!(help.contains("tun") || help.contains("TUN"), "{}", help);
+}
+
+#[test]
+fn clap_help_says_ios_tap_unavailable() {
+    use clap::CommandFactory;
+    let help = Args::command().render_long_help().to_string();
+    assert!(help.contains("iOS"), "{}", help);
+    assert!(help.to_lowercase().contains("packet tunnel") || help.contains("Packet Tunnel"), "{}", help);
+    assert!(help.contains("tap") || help.contains("TAP"), "{}", help);
 }
 
 #[test]

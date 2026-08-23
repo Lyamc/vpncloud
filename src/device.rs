@@ -23,7 +23,9 @@ use std::os::windows::io::{AsRawHandle, RawHandle};
 use getifaddrs::getifaddrs;
 use log::info;
 use serde::{Deserialize, Serialize};
-use tun_rs::{DeviceBuilder, Layer, SyncDevice};
+use tun_rs::SyncDevice;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use tun_rs::{DeviceBuilder, Layer};
 
 use crate::error::Error;
 
@@ -61,6 +63,7 @@ impl FromStr for Type {
 ///
 /// Linux accepts `vpncloud%d` (kernel fills in the number). macOS TUN devices are always
 /// `utunN`; TAP uses `feth` pairs. Linux-style names are ignored there so the OS can assign one.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 fn platform_device_name(ifname: &str, type_: Type) -> Option<String> {
     if ifname.is_empty() {
         return None;
@@ -123,6 +126,11 @@ pub struct TunTapDevice {
 pub const ANDROID_TAP_HELP: &str = "\
 TAP/L2 on Android is only supported on rooted devices (needs /dev/net/tun). \
 Unrooted devices can only use TUN via VpnService. See --help.";
+
+/// Shown in `--help` and in the error when TAP is requested on iOS.
+pub const IOS_TAP_HELP: &str = "\
+TAP/L2 is not available on iOS. Packet Tunnel Provider is TUN-only (IP packets). \
+There is no /dev/net/tun or Ethernet bridging on iOS. See --help.";
 
 pub fn android_tap_needs_root() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, ANDROID_TAP_HELP)
@@ -193,11 +201,7 @@ mod android_tun {
         let mut req: libc::ifreq = unsafe { mem::zeroed() };
         let flags = (if tap { IFF_TAP } else { IFF_TUN }) | IFF_NO_PI;
         req.ifr_ifru.ifru_flags = flags;
-        let want = if ifname.is_empty() || ifname.contains('%') {
-            String::new()
-        } else {
-            ifname.to_string()
-        };
+        let want = if ifname.is_empty() || ifname.contains('%') { String::new() } else { ifname.to_string() };
         if !want.is_empty() {
             let bytes = want.as_bytes();
             let n = bytes.len().min(IFNAMSIZ - 1);
@@ -267,16 +271,23 @@ mod android_tun {
 }
 
 impl TunTapDevice {
-    /// Adopt a TUN file descriptor from Android `VpnService.Builder.establish()`.
+    /// Adopt a TUN file descriptor from Android `VpnService` or iOS Packet Tunnel.
     ///
-    /// The fd is owned by this device afterwards. TAP cannot come from VpnService.
+    /// The fd is owned by this device afterwards. TAP cannot come from those APIs.
     #[cfg(unix)]
     pub fn from_tun_fd(fd: i32, type_: Type) -> io::Result<Self> {
         if type_ == Type::Tap {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "TAP cannot use a VpnService TUN fd. TAP on Android requires a rooted device and opens /dev/net/tun. See --help."
-            ));
+            #[cfg(target_os = "ios")]
+            {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, IOS_TAP_HELP));
+            }
+            #[cfg(not(target_os = "ios"))]
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "TAP cannot use a TUN file descriptor (VpnService / Packet Tunnel are TUN-only). See --help."
+                ));
+            }
         }
         let device = unsafe { SyncDevice::from_fd(fd) }?;
         device.set_nonblocking(true)?;
@@ -305,61 +316,72 @@ impl TunTapDevice {
             let (device, actual) = android_tun::create(ifname, type_ == Type::Tap, _device_path)?;
             return Ok(Self { device: std::sync::Arc::new(device), ifname: actual, type_ });
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
         {
-        let mut builder = DeviceBuilder::new();
-
-        if let Some(name) = platform_device_name(ifname, type_) {
-            builder = builder.name(name);
-        }
-
-        match type_ {
-            Type::Tun => builder = builder.layer(Layer::L3),
-            Type::Tap => {
-                builder = builder.layer(Layer::L2);
-                // Kernel/tun-rs defaults can collide across nodes (#381). Assign a unique LAA.
-                let mut mac = rand::random::<[u8; 6]>();
-                mac[0] = (mac[0] & 0xfe) | 0x02;
-                builder = builder.mac_addr(mac);
+            let _ = (ifname, _device_path);
+            if type_ == Type::Tap {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, IOS_TAP_HELP));
             }
-        };
-
-        // vpncloud speaks raw IP / Ethernet frames. On macOS utun, tun-rs will strip the
-        // 4-byte address-family header when packet information is disabled (the default).
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "linux",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd"
-        ))]
-        {
-            builder = builder.packet_information(false);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "On iOS, TUN must come from a Packet Tunnel Provider (--tun-fd). Direct utun creation is not allowed."
+            ));
         }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let mut builder = DeviceBuilder::new();
 
-        let device = builder.build_sync().map_err(|e| {
-            if e.kind() == io::ErrorKind::PermissionDenied {
+            if let Some(name) = platform_device_name(ifname, type_) {
+                builder = builder.name(name);
+            }
+
+            match type_ {
+                Type::Tun => builder = builder.layer(Layer::L3),
+                Type::Tap => {
+                    builder = builder.layer(Layer::L2);
+                    // Kernel/tun-rs defaults can collide across nodes (#381). Assign a unique LAA.
+                    let mut mac = rand::random::<[u8; 6]>();
+                    mac[0] = (mac[0] & 0xfe) | 0x02;
+                    builder = builder.mac_addr(mac);
+                }
+            };
+
+            // vpncloud speaks raw IP / Ethernet frames. On macOS utun, tun-rs will strip the
+            // 4-byte address-family header when packet information is disabled (the default).
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd"
+            ))]
+            {
+                builder = builder.packet_information(false);
+            }
+
+            let device = builder.build_sync().map_err(|e| {
+                if e.kind() == io::ErrorKind::PermissionDenied {
+                    #[cfg(windows)]
+                    let hint = "try running as Administrator; TUN needs wintun.dll, TAP needs tap-windows6";
+                    #[cfg(not(windows))]
+                    let hint = "try running as root/sudo";
+                    io::Error::new(e.kind(), format!("Permission denied creating {} device ({}): {}", type_, hint, e))
+                } else {
+                    e
+                }
+            })?;
+            // mio requires non-blocking file descriptors. wintun/tap-windows6 are waited separately.
+            #[cfg(unix)]
+            device.set_nonblocking(true)?;
+            let actual_ifname = device.name()?.to_string();
+
+            Ok(Self {
+                device: std::sync::Arc::new(device),
+                ifname: actual_ifname,
+                type_,
                 #[cfg(windows)]
-                let hint = "try running as Administrator; TUN needs wintun.dll, TAP needs tap-windows6";
-                #[cfg(not(windows))]
-                let hint = "try running as root/sudo";
-                io::Error::new(e.kind(), format!("Permission denied creating {} device ({}): {}", type_, hint, e))
-            } else {
-                e
-            }
-        })?;
-        // mio requires non-blocking file descriptors. wintun/tap-windows6 are waited separately.
-        #[cfg(unix)]
-        device.set_nonblocking(true)?;
-        let actual_ifname = device.name()?.to_string();
-
-        Ok(Self {
-            device: std::sync::Arc::new(device),
-            ifname: actual_ifname,
-            type_,
-            #[cfg(windows)]
-            incoming: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
-        })
+                incoming: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
+            })
         }
     }
 
@@ -368,11 +390,11 @@ impl TunTapDevice {
         let value = match value {
             Some(value) => value,
             None => {
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_os = "ios"))]
                 {
                     1400
                 }
-                #[cfg(not(target_os = "android"))]
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 {
                     // Leave headroom for VpnCloud encapsulation on top of the kernel MTU.
                     self.device.mtu().map(|m| (m as usize).saturating_sub(100).max(576)).unwrap_or(1400)
@@ -385,7 +407,12 @@ impl TunTapDevice {
         {
             android_tun::run_ip(&["link", "set", "dev", &self.ifname, "mtu", &value.to_string()])
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
+        {
+            // Packet Tunnel Provider sets MTU via NEPacketTunnelNetworkSettings.
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             self.device
                 .set_mtu(value as u16)
@@ -414,9 +441,16 @@ impl TunTapDevice {
                 }
             }
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "ios")]
         {
-            self.device.enabled(true).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Enable failed: {}", e)))?;
+            let _ = (addr, netmask, prefix_len);
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            self.device
+                .enabled(true)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Enable failed: {}", e)))?;
             match addr {
                 IpAddr::V4(ip) => {
                     let netmask =
@@ -759,6 +793,15 @@ mod tests {
         assert!(msg.contains("rooted"), "{}", msg);
         assert!(msg.contains("--help"), "{}", msg);
         assert!(msg.contains("TUN") || msg.contains("tun"), "{}", msg);
+    }
+
+    #[test]
+    fn ios_tap_error_says_unavailable() {
+        let msg = IOS_TAP_HELP;
+        assert!(msg.contains("iOS"), "{}", msg);
+        assert!(msg.contains("TAP") || msg.contains("tap"), "{}", msg);
+        assert!(msg.contains("TUN") || msg.contains("tun") || msg.contains("Packet Tunnel"), "{}", msg);
+        assert!(msg.contains("--help"), "{}", msg);
     }
 
     #[cfg(unix)]

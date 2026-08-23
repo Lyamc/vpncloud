@@ -12,7 +12,7 @@ edition = "2021"
 
 [lib]
 name = "vpncloud"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [package.metadata]
 toolchain = "1.75.0"

@@ -295,7 +295,7 @@ impl CtrlC {
         Default::default()
     }
 
-    /// Request the run loop to exit (Android JNI stop, tests).
+    /// Request the run loop to exit (Android JNI / iOS FFI stop, tests).
     pub fn request_stop() {
         STOP_REQUESTED.store(true, Ordering::Relaxed);
     }

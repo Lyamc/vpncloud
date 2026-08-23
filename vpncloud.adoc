@@ -23,6 +23,8 @@ vpncloud - Peer-to-peer VPN
   Ethernet frames *tun* devices process IP packets. [default: *tun*]
   On Android, *tap* is only supported on **rooted** devices (access to
   */dev/net/tun*). Unrooted devices must use *tun* via VpnService.
+  On iOS, only *tun* is available (Packet Tunnel Provider); *tap* is not
+  supported.
 
 *-d <name>*, *--device <name>*::
   Name of the virtual device. Any *%d* will be filled with a free number.
@@ -33,8 +35,8 @@ vpncloud - Peer-to-peer VPN
 
 *--tun-fd <fd>*::
   Adopt an already-open TUN file descriptor instead of creating a device.
-  Used on Android: the Java *VpnService* establishes the TUN and passes the
-  fd here. Cannot be combined with *--type tap* (VpnService is TUN-only).
+  Used on Android (*VpnService*) and iOS (Packet Tunnel *utun*). Cannot be
+  combined with *--type tap* (those APIs are TUN-only).
 
 *--fix-rp-filter*::
   If this option is set, VpnCloud will change the rp_filter settings to protect
@@ -768,6 +770,33 @@ Unrooted TAP::
   Error: *TAP/L2 on Android is only supported on rooted devices (needs
   /dev/net/tun). Unrooted devices can only use TUN via VpnService. See
   --help.*
+
+
+== IOS
+
+*tun* works through a Network Extension **Packet Tunnel Provider** (layer 3
+*utun*). *tap* (layer 2) is **not available**: iOS has no Ethernet virtual
+interface and no */dev/net/tun*.
+
+TUN::
+. Containing app saves an *NETunnelProviderManager* and starts the extension.
+. The extension applies *NEPacketTunnelNetworkSettings* for the overlay
+  subnet only (do not add the default route unless you want a full-tunnel;
+  overlay-only keeps mesh UDP off the tunnel, so no Android-style *protect()*
+  is required).
+. After settings apply, locate the *utun* file descriptor (iOS 16+ control
+  socket scan, with KVO *socket.fileDescriptor* as a fallback) and pass it
+  to the native library (*vpncloud_start*, or *--tun-fd*).
+. *vpncloud_stop* on *stopTunnel*.
+
+TAP::
+  Error: *TAP/L2 is not available on iOS. Packet Tunnel Provider is TUN-only
+  (IP packets). There is no /dev/net/tun or Ethernet bridging on iOS. See
+  --help.*
+
+Build the static library with *ios/build-native.sh* and open
+*ios/VpnCloud.xcodeproj*. The app needs an Apple Developer team with the
+Network Extension and App Groups capabilities. Minimum iOS 16.
 
 
 == CONTAINERS (LXC / PROXMOX)

@@ -156,7 +156,7 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
         }
         cloud.add_reconnect_peer(addr);
     }
-    #[cfg(all(unix, not(target_os = "android")))]
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
     {
         if config.daemonize {
             info!("Running process as daemon");
@@ -182,7 +182,7 @@ fn run<P: Protocol, S: Socket>(config: Config, socket: S) {
         }
     }
 
-    #[cfg(any(not(unix), target_os = "android"))]
+    #[cfg(any(not(unix), target_os = "android", target_os = "ios"))]
     if config.daemonize || config.user.is_some() || config.group.is_some() {
         warn!("Daemonizing and privilege dropping are not supported on this platform.");
     }
@@ -224,6 +224,14 @@ pub fn run_vpn(mut config: Config) {
     #[cfg(target_os = "android")]
     if config.listen.starts_with("ws://") || config.listen.starts_with("ws-listen://") {
         fail!("{}", "Websocket listen is not supported on Android; use UDP (--listen PORT).");
+    }
+    #[cfg(target_os = "ios")]
+    if config.device_type == Type::Tap {
+        fail!("{}", crate::device::IOS_TAP_HELP);
+    }
+    #[cfg(target_os = "ios")]
+    if config.listen.starts_with("ws://") || config.listen.starts_with("ws-listen://") {
+        fail!("{}", "Websocket listen is not supported on iOS; use UDP (--listen PORT).");
     }
 
     run_vpn_worker(config);

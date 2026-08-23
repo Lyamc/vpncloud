@@ -9,6 +9,7 @@ This project follows [semantic versioning](http://semver.org).
 - [added] Optional Windows system tray (Enable / Disable / Exit), chosen at install
 - [added] Windows system service (`vpncloud service install`, LocalSystem auto-start)
 - [added] Android TUN via VpnService; TAP/L2 on rooted devices with /dev/net/tun
+- [added] iOS TUN via Packet Tunnel Provider; TAP is not available
 - [added] Native websocket listen (`ws-listen://` / `ws://0.0.0.0:port`)
 - [added] Configurable device MTU (`--mtu`)
 - [added] Multiple addresses per peer with priority order

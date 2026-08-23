@@ -10,8 +10,8 @@ ChaCha20) and forwarded over a virtual TUN (IP) or TAP (Ethernet) interface.
 
 This repository is [Lyamc/vpncloud](https://github.com/Lyamc/vpncloud), a fork
 of [dswd/vpncloud](https://github.com/dswd/vpncloud). The fork adds **macOS**,
-**Windows**, and **Android (TUN only)** support plus protocol, config, and
-dependency fixes. Upstream documentation lives at
+**Windows**, **Android**, and **iOS (TUN only)** support plus protocol, config,
+and dependency fixes. Upstream documentation lives at
 [vpncloud.ddswd.de](https://vpncloud.ddswd.de).
 
 ```sh
@@ -34,13 +34,14 @@ See `vpncloud.adoc` (the man page) for every option, and
 
 ### Project status
 
-VpnCloud 2.4.0 on this fork is usable on Linux, macOS, Windows, and Android
-(TUN). It includes:
+VpnCloud 2.4.0 on this fork is usable on Linux, macOS, Windows, Android, and
+iOS (TUN). It includes:
 
 * Automatic peer-to-peer meshing, no central servers
 * Automatic reconnect, including several addresses per peer (priority order)
 * TUN (IP) and TAP (Ethernet) virtual interfaces
-* Linux, macOS (`utun` / `feth`), Windows (Wintun / tap-windows6), Android TUN
+* Linux, macOS (`utun` / `feth`), Windows (Wintun / tap-windows6), Android TUN,
+  iOS TUN (Packet Tunnel Provider)
 * Strong end-to-end encryption (Curve25519, AES-128/256, ChaCha20)
 * Hub / switch / router forwarding modes
 * NAT hole punching and UPnP port forwarding
@@ -96,6 +97,19 @@ rustup target add aarch64-linux-android armv7-linux-androideabi
 cargo install cargo-ndk
 ./android/build-native.sh   # writes jniLibs/*.so
 # then open android/ in Android Studio and run the app
+```
+
+**iOS.** TUN only, via a Network Extension **Packet Tunnel Provider**. TAP/L2
+is not available (no Ethernet, no `/dev/net/tun`). The extension installs
+**overlay routes only** so the UDP mesh does not hairpin through the tunnel
+(no Android-style `protect()`). Requires an Apple Developer team with the
+Network Extension capability. iOS 16+.
+
+```sh
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+./ios/build-native.sh       # writes ios/libvpncloud.xcframework
+# then open ios/VpnCloud.xcodeproj, set your team, enable
+# Network Extension + App Groups, and run on a device
 ```
 
 
