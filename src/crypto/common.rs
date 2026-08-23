@@ -1,6 +1,7 @@
 use super::{
     core::{test_speed, CryptoCore},
     init::{self, InitResult, InitState, CLOSING},
+    noise::{self, NoiseInit, NoiseTransport},
     rotate::RotationState
 };
 use crate::{
@@ -61,42 +62,76 @@ pub struct Crypto {
     node_id: NodeId,
     key_pair: Arc<Ed25519KeyPair>,
     trusted_keys: Arc<[Ed25519PublicKey]>,
-    algorithms: Algorithms
+    algorithms: Algorithms,
+    use_noise: bool,
+    dh_private: [u8; 32],
+    dh_public: [u8; 32],
+    trusted_dh: Arc<[[u8; 32]]>
 }
 
 impl Crypto {
-    pub fn parse_algorithms(algos: &[String]) -> Result<(bool, Vec<&'static aead::Algorithm>), Error> {
+    pub fn parse_algorithms(algos: &[String]) -> Result<(bool, bool, Vec<&'static aead::Algorithm>), Error> {
         let algorithms = algos.iter().map(|a| a as &str).collect::<Vec<_>>();
         let allowed = if algorithms.is_empty() { &DEFAULT_ALGORITHMS } else { &algorithms as &[&str] };
         let mut algos = vec![];
         let mut unencrypted = false;
+        let mut use_noise = false;
         for name in allowed {
-            let algo = match &name.to_uppercase() as &str {
+            let upper = name.to_uppercase();
+            match &upper as &str {
                 "UNENCRYPTED" | "NONE" | "PLAIN" => {
                     unencrypted = true;
-                    continue;
                 }
-                "AES128" | "AES128_GCM" | "AES_128" | "AES_128_GCM" => &aead::AES_128_GCM,
-                "AES256" | "AES256_GCM" | "AES_256" | "AES_256_GCM" => &aead::AES_256_GCM,
-                "CHACHA" | "CHACHA20" | "CHACHA20_POLY1305" => &aead::CHACHA20_POLY1305,
+                "NOISE" | "NOISEXX" | "NOISE_XX" | "NOISE-XX" => {
+                    use_noise = true;
+                }
+                "AES128" | "AES128_GCM" | "AES_128" | "AES_128_GCM" => algos.push(&aead::AES_128_GCM),
+                "AES256" | "AES256_GCM" | "AES_256" | "AES_256_GCM" => algos.push(&aead::AES_256_GCM),
+                "CHACHA" | "CHACHA20" | "CHACHA20_POLY1305" => algos.push(&aead::CHACHA20_POLY1305),
                 _ => return Err(Error::InvalidConfig("Unknown crypto method"))
-            };
-            algos.push(algo)
+            }
         }
-        Ok((unencrypted, algos))
+        if use_noise && unencrypted {
+            return Err(Error::InvalidConfig("Noise cannot be combined with plain/unencrypted"));
+        }
+        Ok((unencrypted, use_noise, algos))
+    }
+
+    fn identity_seed(config: &Config) -> Result<[u8; 32], Error> {
+        if let Some(priv_key) = &config.private_key {
+            let privkey = from_base62(priv_key).map_err(|_| Error::InvalidConfig("Failed to parse private key"))?;
+            if privkey.len() != 32 {
+                return Err(Error::InvalidConfig("Failed to parse private key"));
+            }
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&privkey);
+            Ok(seed)
+        } else if let Some(password) = &config.password {
+            let mut key = [0; 32];
+            pbkdf2::derive(
+                pbkdf2::PBKDF2_HMAC_SHA256,
+                NonZeroU32::new(4096).unwrap(),
+                SALT,
+                password.as_bytes(),
+                &mut key
+            );
+            Ok(key)
+        } else {
+            Err(Error::InvalidConfig("Either private_key or password must be set"))
+        }
     }
 
     pub fn new(node_id: NodeId, config: &Config) -> Result<Self, Error> {
+        let seed = Self::identity_seed(config)?;
         let key_pair = if let Some(priv_key) = &config.private_key {
             if let Some(pub_key) = &config.public_key {
                 Self::parse_keypair(priv_key, pub_key)?
             } else {
                 Self::parse_private_key(priv_key)?
             }
-        } else if let Some(password) = &config.password {
-            Self::keypair_from_password(password)
         } else {
-            return Err(Error::InvalidConfig("Either private_key or password must be set"));
+            Ed25519KeyPair::from_seed_unchecked(&seed)
+                .map_err(|_| Error::InvalidConfig("Key rejected by crypto library"))?
         };
         let mut trusted_keys = vec![];
         for tn in &config.trusted_keys {
@@ -108,17 +143,27 @@ impl Crypto {
             key.clone_from_slice(key_pair.public_key().as_ref());
             trusted_keys.push(key);
         }
-        let (unencrypted, allowed_algos) = Self::parse_algorithms(&config.algorithms)?;
+        let (unencrypted, use_noise, allowed_algos) = Self::parse_algorithms(&config.algorithms)?;
         if unencrypted {
             warn!("Crypto settings allow unencrypted connections")
+        }
+        let (dh_private, dh_public) = noise::dh_keypair_from_seed(&seed);
+        if use_noise {
+            info!("Using {} (X25519 / ChaCha20-Poly1305 / SHA-256)", noise::PATTERN);
+            info!("Noise static public key: {}", to_base62(&dh_public));
+            if !allowed_algos.is_empty() {
+                info!("Noise handshake selected; AES/ChaCha algorithm list is unused for this node");
+            }
         }
         let mut algos = Algorithms { algorithm_speeds: smallvec![], allow_unencrypted: unencrypted };
         let duration = Duration::from_secs_f32(SPEED_TEST_TIME);
         let mut speeds = Vec::new();
-        for algo in allowed_algos {
-            let speed = test_speed(algo, &duration);
-            algos.algorithm_speeds.push((algo, speed as f32));
-            speeds.push((format!("{:?}", algo), speed as f32));
+        if !use_noise {
+            for algo in allowed_algos {
+                let speed = test_speed(algo, &duration);
+                algos.algorithm_speeds.push((algo, speed as f32));
+                speeds.push((format!("{:?}", algo), speed as f32));
+            }
         }
         if !speeds.is_empty() {
             info!(
@@ -126,11 +171,17 @@ impl Crypto {
                 speeds.into_iter().map(|(a, s)| format!("{}: {:.1} MiB/s", a, s)).collect::<Vec<_>>().join(", ")
             );
         }
+        let trusted_dh: Arc<[[u8; 32]]> =
+            if config.trusted_keys.is_empty() { Arc::from(vec![dh_public]) } else { Arc::from(trusted_keys.clone()) };
         Ok(Self {
             node_id,
             key_pair: Arc::new(key_pair),
             trusted_keys: trusted_keys.into_boxed_slice().into(),
-            algorithms: algos
+            algorithms: algos,
+            use_noise,
+            dh_private,
+            dh_public,
+            trusted_dh
         })
     }
 
@@ -157,6 +208,7 @@ impl Crypto {
         (privkey, pubkey)
     }
 
+    #[allow(dead_code)]
     fn keypair_from_password(password: &str) -> Ed25519KeyPair {
         let mut key = [0; 32];
         pbkdf2::derive(pbkdf2::PBKDF2_HMAC_SHA256, NonZeroU32::new(4096).unwrap(), SALT, password.as_bytes(), &mut key);
@@ -199,7 +251,11 @@ impl Crypto {
             payload,
             self.key_pair.clone(),
             self.trusted_keys.clone(),
-            self.algorithms.clone()
+            self.algorithms.clone(),
+            self.use_noise,
+            self.dh_private,
+            self.dh_public,
+            self.trusted_dh.clone()
         )
     }
 }
@@ -217,24 +273,42 @@ pub struct PeerCrypto<P: Payload> {
     #[allow(dead_code)]
     node_id: NodeId,
     init: Option<InitState<P>>,
+    noise: Option<NoiseInit<P>>,
     rotation: Option<RotationState>,
     unencrypted: bool,
     core: Option<CryptoCore>,
+    noise_transport: Option<NoiseTransport>,
     rotate_counter: usize
 }
 
 impl<P: Payload> PeerCrypto<P> {
     pub fn new(
         node_id: NodeId, init_payload: P, key_pair: Arc<Ed25519KeyPair>, trusted_keys: Arc<[Ed25519PublicKey]>,
-        algorithms: Algorithms
+        algorithms: Algorithms, use_noise: bool, dh_private: [u8; 32], dh_public: [u8; 32],
+        trusted_dh: Arc<[[u8; 32]]>
     ) -> Self {
-        Self {
-            node_id,
-            init: Some(InitState::new(node_id, init_payload, key_pair, trusted_keys, algorithms)),
-            rotation: None,
-            unencrypted: false,
-            core: None,
-            rotate_counter: 0
+        if use_noise {
+            Self {
+                node_id,
+                init: None,
+                noise: Some(NoiseInit::new(node_id, init_payload, dh_private, dh_public, trusted_dh)),
+                rotation: None,
+                unencrypted: false,
+                core: None,
+                noise_transport: None,
+                rotate_counter: 0
+            }
+        } else {
+            Self {
+                node_id,
+                init: Some(InitState::new(node_id, init_payload, key_pair, trusted_keys, algorithms)),
+                noise: None,
+                rotation: None,
+                unencrypted: false,
+                core: None,
+                noise_transport: None,
+                rotate_counter: 0
+            }
         }
     }
 
@@ -263,6 +337,14 @@ impl<P: Payload> PeerCrypto<P> {
     }
 
     pub fn initialize(&mut self, out: &mut MsgBuffer) -> Result<(), Error> {
+        if let Some(noise) = &mut self.noise {
+            if noise.stage() != init::STAGE_PING {
+                return Err(Error::InvalidCryptoState("Initialization already ongoing"));
+            }
+            noise.send_ping(out);
+            out.prepend_byte(INIT_MESSAGE_FIRST_BYTE);
+            return Ok(());
+        }
         let init = self.get_init()?;
         if init.stage() != init::STAGE_PING {
             Err(Error::InvalidCryptoState("Initialization already ongoing"))
@@ -274,15 +356,17 @@ impl<P: Payload> PeerCrypto<P> {
     }
 
     pub fn has_init(&self) -> bool {
-        self.init.is_some()
+        self.init.is_some() || self.noise.is_some()
     }
 
     pub fn is_ready(&self) -> bool {
-        self.core.is_some()
+        self.core.is_some() || self.noise_transport.is_some()
     }
 
     pub fn algorithm_name(&self) -> &'static str {
-        if let Some(ref core) = self.core {
+        if self.noise_transport.is_some() {
+            "NOISE"
+        } else if let Some(ref core) = self.core {
             let algo = core.algorithm();
             if algo == &aead::CHACHA20_POLY1305 {
                 "CHACHA20"
@@ -299,6 +383,32 @@ impl<P: Payload> PeerCrypto<P> {
     }
 
     fn handle_init_message(&mut self, buffer: &mut MsgBuffer) -> Result<MessageResult<P>, Error> {
+        if self.noise.is_some() {
+            if !noise::is_noise_frame(buffer.buffer()) {
+                return Err(Error::CryptoInit("Peer is not using Noise"));
+            }
+            let result = self.noise.as_mut().unwrap().handle(buffer)?;
+            if !buffer.is_empty() {
+                buffer.prepend_byte(INIT_MESSAGE_FIRST_BYTE);
+            }
+            return match result {
+                InitResult::Continue => Ok(MessageResult::Reply),
+                InitResult::Success { peer_payload, is_initiator } => {
+                    self.noise_transport = self.noise.as_mut().unwrap().take_transport();
+                    if self.noise.as_ref().map(|n| n.stage()).unwrap_or(CLOSING) == CLOSING {
+                        self.noise = None;
+                    }
+                    if is_initiator {
+                        Ok(MessageResult::InitializedWithReply(peer_payload))
+                    } else {
+                        Ok(MessageResult::Initialized(peer_payload))
+                    }
+                }
+            };
+        }
+        if noise::is_noise_frame(buffer.buffer()) {
+            return Err(Error::CryptoInit("Peer requires Noise; this node does not"));
+        }
         let result = self.get_init()?.handle_init(buffer)?;
         if !buffer.is_empty() {
             buffer.prepend_byte(INIT_MESSAGE_FIRST_BYTE);
@@ -346,6 +456,9 @@ impl<P: Payload> PeerCrypto<P> {
         if self.unencrypted {
             return Ok(());
         }
+        if let Some(ref mut noise) = self.noise_transport {
+            return noise.encrypt(buffer);
+        }
         self.get_core()?.encrypt(buffer);
         Ok(())
     }
@@ -354,6 +467,9 @@ impl<P: Payload> PeerCrypto<P> {
         // HOT PATH
         if self.unencrypted {
             return Ok(());
+        }
+        if let Some(ref mut noise) = self.noise_transport {
+            return noise.decrypt(buffer);
         }
         self.get_core()?.decrypt(buffer)
     }
@@ -400,12 +516,21 @@ impl<P: Payload> PeerCrypto<P> {
         if let Some(ref mut init) = self.init {
             init.every_second(out)?;
         }
+        if let Some(ref mut noise) = self.noise {
+            noise.every_second(out)?;
+        }
         if self.init.as_ref().map(|i| i.stage()).unwrap_or(CLOSING) == CLOSING {
             self.init = None
+        }
+        if self.noise.as_ref().map(|n| n.stage()).unwrap_or(CLOSING) == CLOSING {
+            self.noise = None
         }
         if !out.is_empty() {
             out.prepend_byte(INIT_MESSAGE_FIRST_BYTE);
             return Ok(MessageResult::Reply);
+        }
+        if self.noise_transport.is_some() {
+            return Ok(MessageResult::None);
         }
         if let Some(ref mut rotate) = self.rotation {
             self.rotate_counter += 1;
@@ -503,5 +628,40 @@ mod tests {
                 other => assert_eq!(other, MessageResult::None)
             }
         }
+    }
+
+    #[test]
+    fn noise_handshake_and_messages() {
+        let config =
+            Config { password: Some("test".to_string()), algorithms: vec!["noise".to_string()], ..Default::default() };
+        let mut node1 = create_node(&config);
+        let mut node2 = create_node(&config);
+        let mut msg = MsgBuffer::new(16);
+
+        node1.initialize(&mut msg).unwrap();
+        assert!(super::is_init_message(msg.buffer()));
+
+        let res = node2.handle_message(&mut msg).unwrap();
+        assert_eq!(res, MessageResult::Reply);
+
+        let res = node1.handle_message(&mut msg).unwrap();
+        assert_eq!(res, MessageResult::InitializedWithReply(vec![]));
+        assert!(!msg.is_empty());
+
+        let res = node2.handle_message(&mut msg).unwrap();
+        assert_eq!(res, MessageResult::Initialized(vec![]));
+        assert!(msg.is_empty());
+
+        assert_eq!(node1.algorithm_name(), "NOISE");
+        assert_eq!(node2.algorithm_name(), "NOISE");
+
+        let mut buffer = MsgBuffer::new(16);
+        buffer.set_length(64);
+        node1.send_message(1, &mut buffer).unwrap();
+        let res = node2.handle_message(&mut buffer).unwrap();
+        assert_eq!(res, MessageResult::Message(1));
+        node2.send_message(2, &mut buffer).unwrap();
+        let res = node1.handle_message(&mut buffer).unwrap();
+        assert_eq!(res, MessageResult::Message(2));
     }
 }

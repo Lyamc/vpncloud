@@ -5,6 +5,7 @@
 mod common;
 mod core;
 mod init;
+mod noise;
 mod rotate;
 
 pub use self::core::{EXTRA_LEN, TAG_LEN};

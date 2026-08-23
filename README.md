@@ -42,7 +42,7 @@ iOS (TUN). It includes:
 * TUN (IP) and TAP (Ethernet) virtual interfaces
 * Linux, macOS (`utun` / `feth`), Windows (Wintun / tap-windows6), Android TUN,
   iOS TUN (Packet Tunnel Provider)
-* Strong end-to-end encryption (Curve25519, AES-128/256, ChaCha20)
+* Strong end-to-end encryption (Curve25519, AES-128/256, ChaCha20, optional Noise_XX)
 * Hub / switch / router forwarding modes
 * NAT hole punching and UPnP port forwarding
 * IPv6 transport (`[2001:db8::1]:3210`) and IPv6 overlay (`--ip fd00:1::1/64`)

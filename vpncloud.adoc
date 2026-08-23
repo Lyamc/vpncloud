@@ -103,11 +103,13 @@ vpncloud - Peer-to-peer VPN
   info.
 
 *--algo <method>*, *--algorithm <method>*::
-  Supported encryption algorithms ("plain", "aes128", "aes256", or "chacha20").
-  Nodes exchange the supported algorithms and select the one that is fastest on
-  both ends. This parameter can be given multiple times to enable multiple 
-  algorithms. *Warning:* "plain" means unencrypted and needs to be enabled 
-  explicitly. As default, all algorithms except "plain" are enabled.
+  Supported encryption algorithms ("plain", "aes128", "aes256", "chacha20", or
+  "noise"). Nodes exchange the supported algorithms and select the one that is
+  fastest on both ends, except for *noise*: if *noise* is listed, this node uses
+  a Noise_XX handshake (X25519, ChaCha20-Poly1305, SHA-256) instead of the
+  classic ping/pong/peng negotiation. Both peers must enable *noise*.
+  *Warning:* "plain" means unencrypted and needs to be enabled
+  explicitly. As default, all algorithms except "plain" and "noise" are enabled.
 
 *--peer-timeout <secs>*::
   Peer timeout in seconds. The peers will exchange information periodically
@@ -496,8 +498,16 @@ can opt out of encryption altogether by enabling the *plain* algorithm. (Note:
 both nodes in a connection must support this, otherwise encryption will take 
 place.)
 
-The temporary encryption keys are rotated periodically so they are never used 
+The temporary encryption keys are rotated periodically so they are never used
 for a longer time.
+
+With *--algorithm noise*, peers run a three-message
+*Noise_XX_25519_ChaChaPoly_SHA256* handshake (same number of flights as the
+classic init). The X25519 static key is derived from the same seed as the
+Ed25519 identity (password or *--private-key*). If *trusted-keys* is unset,
+only peers that share that seed are accepted. The Noise public key is logged at
+startup. Enable *noise* on every node in the mesh; mixed Noise/classic peers
+will not connect.
 
 Please refer to the security whitepaper for more details.
 
