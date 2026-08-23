@@ -255,7 +255,11 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             next_beacon: now,
             next_own_address_reset: now + OWN_ADDRESS_RESET_INTERVAL,
             port_forwarding,
-            traffic: TrafficStats::default(),
+            traffic: {
+                let mut t = TrafficStats::default();
+                t.set_track_payload(config.stats_file.is_some() || config.statsd_server.is_some());
+                t
+            },
             init_limit: InitRateLimit::new(config.init_rate_limit, 10),
             stun_txid: [0; 12],
             stun_reflexive: SmallVec::new(),
@@ -304,15 +308,19 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         self.buf_spare.pop().unwrap_or_else(|| MsgBuffer::new(SPACE_BEFORE))
     }
 
+    pub fn restart_crypto_pool(&mut self) {
+        self.crypto_pool.restart();
+    }
+
     #[inline]
     fn send_to(&mut self, addr: SocketAddr, msg: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
         debug!("Sending msg with {} bytes to {}", msg.len(), addr);
         self.traffic.count_out_traffic(addr, msg.len());
         let mut owned = self.take_spare();
-        owned.clear();
-        owned.clone_from(msg.message());
+        mem::swap(msg, &mut owned);
         self.outbox.push((addr, owned));
+        msg.clear();
         Ok(())
     }
 
@@ -325,7 +333,10 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
         if type_ == MESSAGE_TYPE_DATA {
             if self.peers.get(&addr).and_then(|p| p.crypto.shared_handle()).is_some() {
-                self.pending_encrypt.entry(addr).or_default().push((type_, msg.clone()));
+                let mut owned = self.take_spare();
+                mem::swap(msg, &mut owned);
+                self.pending_encrypt.entry(addr).or_default().push((type_, owned));
+                msg.clear();
                 return Ok(());
             }
         }
@@ -414,6 +425,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 Ok(val) => {
                     if let Err(e) = self.handle_message(src, val, &mut data) {
                         error!("{}", e);
+                    }
+                    if data.is_empty() {
+                        self.buf_spare.push(data);
                     }
                 }
                 Err(e @ Error::CryptoInitFatal(_)) => {
@@ -1068,15 +1082,14 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         let len = data.len();
         debug!("Writing data to device: {} bytes", len);
         self.traffic.count_in_payload(src, dst, len);
-        let mut owned = self.take_spare();
-        owned.clear();
-        owned.clone_from(data.message());
-        self.tun_out.push(owned);
         if self.learning {
-            // Learn single address
             let nid = self.peers.get(&peer).map(|p| p.node_id).unwrap_or([0; 16]);
             self.table.cache(src, peer, nid);
         }
+        let mut owned = self.take_spare();
+        mem::swap(data, &mut owned);
+        self.tun_out.push(owned);
+        data.clear();
         Ok(())
     }
 

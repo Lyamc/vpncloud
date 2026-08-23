@@ -71,11 +71,23 @@ impl TrafficEntry {
     }
 }
 
-#[derive(Default)]
 pub struct TrafficStats {
     peers: HashMap<SocketAddr, TrafficEntry, Hash>,
     payload: HashMap<(Address, Address), TrafficEntry, Hash>,
-    pub dropped: TrafficEntry
+    pub dropped: TrafficEntry,
+    /// Per-flow overlay stats (expensive HashMap). Off unless stats-file / statsd is set.
+    track_payload: bool
+}
+
+impl Default for TrafficStats {
+    fn default() -> Self {
+        Self {
+            peers: HashMap::default(),
+            payload: HashMap::default(),
+            dropped: TrafficEntry::default(),
+            track_payload: true
+        }
+    }
 }
 
 impl TrafficStats {
@@ -91,15 +103,28 @@ impl TrafficStats {
         self.peers.entry(peer).or_default().count_in(bytes);
     }
 
+    pub fn set_track_payload(&mut self, on: bool) {
+        self.track_payload = on;
+        if !on {
+            self.payload.clear();
+        }
+    }
+
     #[inline]
     pub fn count_out_payload(&mut self, remote: Address, local: Address, bytes: usize) {
         // HOT PATH
+        if !self.track_payload {
+            return;
+        }
         self.payload.entry((remote, local)).or_default().count_out(bytes);
     }
 
     #[inline]
     pub fn count_in_payload(&mut self, remote: Address, local: Address, bytes: usize) {
         // HOT PATH
+        if !self.track_payload {
+            return;
+        }
         self.payload.entry((remote, local)).or_default().count_in(bytes);
     }
 

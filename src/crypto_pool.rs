@@ -37,6 +37,7 @@ pub enum CryptoDone {
 }
 
 pub struct CryptoPool {
+    workers: usize,
     jobs: Option<Sender<CryptoJob>>,
     done: Mutex<Receiver<CryptoDone>>,
     done_tx: Sender<CryptoDone>
@@ -45,14 +46,21 @@ pub struct CryptoPool {
 impl CryptoPool {
     pub fn new(workers: usize) -> Self {
         let (done_tx, done_rx) = mpsc::channel();
-        if workers == 0 {
-            return Self { jobs: None, done: Mutex::new(done_rx), done_tx };
+        let mut pool = Self { workers, jobs: None, done: Mutex::new(done_rx), done_tx };
+        pool.spawn_workers();
+        pool
+    }
+
+    fn spawn_workers(&mut self) {
+        if self.workers == 0 {
+            self.jobs = None;
+            return;
         }
         let (job_tx, job_rx) = mpsc::channel::<CryptoJob>();
         let job_rx = Arc::new(Mutex::new(job_rx));
-        for i in 0..workers {
+        for i in 0..self.workers {
             let rx = job_rx.clone();
-            let done = done_tx.clone();
+            let done = self.done_tx.clone();
             thread::Builder::new()
                 .name(format!("vpncloud-crypto-{i}"))
                 .spawn(move || {
@@ -66,7 +74,16 @@ impl CryptoPool {
                 })
                 .ok();
         }
-        Self { jobs: Some(job_tx), done: Mutex::new(done_rx), done_tx }
+        self.jobs = Some(job_tx);
+    }
+
+    /// Recreate workers after `fork` (`--daemon`). mpsc channels are not fork-safe.
+    pub fn restart(&mut self) {
+        self.jobs = None;
+        let (done_tx, done_rx) = mpsc::channel();
+        self.done = Mutex::new(done_rx);
+        self.done_tx = done_tx;
+        self.spawn_workers();
     }
 
     pub fn enabled(&self) -> bool {
@@ -136,5 +153,16 @@ mod tests {
     fn zero_workers_is_inline() {
         assert!(!CryptoPool::new(0).enabled());
         assert!(CryptoPool::new(2).enabled());
+    }
+
+    #[test]
+    fn restart_keeps_worker_pool() {
+        let mut pool = CryptoPool::new(2);
+        assert!(pool.enabled());
+        pool.restart();
+        assert!(pool.enabled());
+        let mut none = CryptoPool::new(0);
+        none.restart();
+        assert!(!none.enabled());
     }
 }

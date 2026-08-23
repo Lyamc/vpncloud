@@ -25,7 +25,7 @@ use tun_rs::SyncDevice;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tun_rs::{DeviceBuilder, Layer};
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-use tun_rs::{GROTable, VIRTIO_NET_HDR_LEN};
+use tun_rs::{ExpandBuffer, GROTable, VIRTIO_NET_HDR_LEN};
 
 use crate::error::Error;
 
@@ -595,6 +595,38 @@ impl TunTapDevice {
         Ok(1)
     }
 
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn write_batch_copy(&mut self, bufs: &mut [crate::util::MsgBuffer]) -> Result<usize, Error> {
+        while self.tun_batch.len() < bufs.len() {
+            self.tun_batch.push(vec![0u8; VIRTIO_NET_HDR_LEN + 2048]);
+        }
+        for (i, b) in bufs.iter_mut().enumerate() {
+            crate::payload::fix_ipv4_checksums(b.message_mut());
+            let msg = b.message();
+            let need = VIRTIO_NET_HDR_LEN + msg.len();
+            self.tun_batch[i].clear();
+            self.tun_batch[i].resize(need, 0);
+            self.tun_batch[i][VIRTIO_NET_HDR_LEN..].copy_from_slice(msg);
+        }
+        match self.device.send_multiple(&mut self.gro_table, &mut self.tun_batch[..bufs.len()], VIRTIO_NET_HDR_LEN) {
+            Ok(_) => Ok(bufs.len()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                Err(Error::DeviceIo("IO error when sending to device", e))
+            }
+            Err(_) => {
+                for b in bufs.iter_mut() {
+                    let slice = b.message();
+                    match self.device.send(slice) {
+                        Ok(written) if written == slice.len() => {}
+                        Ok(_) => return Err(Error::Socket("Sent out truncated packet")),
+                        Err(io_err) => return Err(Error::DeviceIo("IO error when sending to device", io_err))
+                    }
+                }
+                Ok(bufs.len())
+            }
+        }
+    }
+
     // NOTE: MsgBuffer-aware helpers are implemented as trait methods (see `impl Device for TunTapDevice`)
     // to avoid ambiguity with the std::io::Read/Write trait methods and to make them available
     // through the `Device` trait object / type parameter.
@@ -629,11 +661,15 @@ impl Device for TunTapDevice {
             Type::Tun => crate::payload::fix_ipv4_checksums(data.message_mut())
         }
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-        if self.tun_offload && self.type_ == Type::Tun {
-            let msg = data.message();
-            let mut pkt = vec![0u8; VIRTIO_NET_HDR_LEN + msg.len()];
-            pkt[VIRTIO_NET_HDR_LEN..].copy_from_slice(msg);
-            match self.device.send_multiple(&mut self.gro_table, std::slice::from_mut(&mut pkt), VIRTIO_NET_HDR_LEN) {
+        if self.tun_offload && self.type_ == Type::Tun && data.get_start() >= VIRTIO_NET_HDR_LEN {
+            let old = data.get_start();
+            data.prepend_zero(VIRTIO_NET_HDR_LEN);
+            let send = {
+                let mut wrap = MsgVirtio(data);
+                self.device.send_multiple(&mut self.gro_table, std::slice::from_mut(&mut wrap), VIRTIO_NET_HDR_LEN)
+            };
+            data.set_start(old);
+            match send {
                 Ok(_) => return Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     return Err(Error::DeviceIo("IO error when sending to device", e));
@@ -738,24 +774,28 @@ impl Device for TunTapDevice {
             }
             return Ok(bufs.len());
         }
-        while self.tun_batch.len() < bufs.len() {
-            self.tun_batch.push(vec![0u8; VIRTIO_NET_HDR_LEN + 2048]);
+        if bufs.iter().any(|b| b.get_start() < VIRTIO_NET_HDR_LEN) {
+            return self.write_batch_copy(bufs);
         }
-        for (i, b) in bufs.iter_mut().enumerate() {
+        for b in bufs.iter_mut() {
             crate::payload::fix_ipv4_checksums(b.message_mut());
-            let msg = b.message();
-            let need = VIRTIO_NET_HDR_LEN + msg.len();
-            self.tun_batch[i].clear();
-            self.tun_batch[i].resize(need, 0);
-            self.tun_batch[i][VIRTIO_NET_HDR_LEN..].copy_from_slice(msg);
+            b.prepend_zero(VIRTIO_NET_HDR_LEN);
         }
-        match self.device.send_multiple(&mut self.gro_table, &mut self.tun_batch[..bufs.len()], VIRTIO_NET_HDR_LEN) {
-            Ok(_) => Ok(bufs.len()),
+        let nbufs = bufs.len();
+        let mut wraps: Vec<MsgVirtio<'_>> = bufs.iter_mut().map(MsgVirtio).collect();
+        match self.device.send_multiple(&mut self.gro_table, &mut wraps, VIRTIO_NET_HDR_LEN) {
+            Ok(_) => Ok(nbufs),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                drop(wraps);
+                for b in bufs.iter_mut() {
+                    b.skip(VIRTIO_NET_HDR_LEN);
+                }
                 Err(Error::DeviceIo("IO error when sending to device", e))
             }
             Err(_) => {
+                drop(wraps);
                 for b in bufs.iter_mut() {
+                    b.skip(VIRTIO_NET_HDR_LEN);
                     let slice = b.message();
                     match self.device.send(slice) {
                         Ok(written) if written == slice.len() => {}
@@ -766,6 +806,45 @@ impl Device for TunTapDevice {
                 Ok(bufs.len())
             }
         }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+struct MsgVirtio<'a>(&'a mut crate::util::MsgBuffer);
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+impl AsRef<[u8]> for MsgVirtio<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.0.message()
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+impl AsMut<[u8]> for MsgVirtio<'_> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.0.message_mut()
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+impl ExpandBuffer for MsgVirtio<'_> {
+    fn buf_capacity(&self) -> usize {
+        self.0.remaining_capacity()
+    }
+
+    fn buf_resize(&mut self, new_len: usize, value: u8) {
+        let old = self.0.len();
+        self.0.set_length(new_len.min(self.0.remaining_capacity()));
+        if self.0.len() > old {
+            self.0.message_mut()[old..].fill(value);
+        }
+    }
+
+    fn buf_extend_from_slice(&mut self, src: &[u8]) {
+        let old = self.0.len();
+        let add = src.len().min(self.0.remaining_capacity().saturating_sub(old));
+        self.0.set_length(old + add);
+        self.0.message_mut()[old..].copy_from_slice(&src[..add]);
     }
 }
 

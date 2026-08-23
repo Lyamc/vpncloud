@@ -86,6 +86,20 @@ impl MsgBuffer {
         self.message_mut().clone_from_slice(other);
     }
 
+    /// Insert `n` zero bytes before the current payload. Panics if `start < n`.
+    pub fn prepend_zero(&mut self, n: usize) {
+        self.start = self.start.checked_sub(n).expect("MsgBuffer prepend");
+        self.buffer[self.start..self.start + n].fill(0);
+    }
+
+    pub fn skip(&mut self, n: usize) {
+        self.start += n;
+    }
+
+    pub fn remaining_capacity(&self) -> usize {
+        self.buffer.len().saturating_sub(self.start)
+    }
+
     pub fn len(&self) -> usize {
         self.end - self.start
     }
@@ -482,6 +496,16 @@ pub fn run_cmd(mut cmd: Command) {
         }
         Err(e) => error!("Failed to execute command {:?}: {}", cmd, e)
     }
+}
+
+#[test]
+fn msgbuffer_prepend_zero() {
+    let mut b = MsgBuffer::new(20);
+    b.clone_from(&[1, 2, 3]);
+    b.prepend_zero(4);
+    assert_eq!(b.message(), &[0, 0, 0, 0, 1, 2, 3]);
+    b.skip(4);
+    assert_eq!(b.message(), &[1, 2, 3]);
 }
 
 #[test]

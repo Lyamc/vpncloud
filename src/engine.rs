@@ -157,6 +157,7 @@ fn run<P: Protocol, S: Socket + Pollable>(config: Config, socket: S) {
         if config.daemonize {
             info!("Running process as daemon");
             try_fail!(crate::util::unix_daemonize(), "Failed to daemonize: {}");
+            cloud.restart_crypto_pool();
             if let Some(ref pid_file) = config.pid_file {
                 try_fail!(
                     fs::write(pid_file, format!("{}\n", process::id())),

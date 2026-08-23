@@ -3,7 +3,6 @@
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
 use crate::{error::Error, types::Address};
-use std::io::{Cursor, Read};
 #[cfg(test)] use std::str::FromStr;
 
 pub trait Protocol: Sized {
@@ -25,19 +24,20 @@ impl Protocol for Frame {
     /// This method will fail when the given data is not a valid ethernet frame.
     fn parse(data: &[u8]) -> Result<(Address, Address), Error> {
         // HOT PATH
-        let mut cursor = Cursor::new(data);
+        if data.len() < 14 {
+            return Err(Error::Parse("Frame is too short"));
+        }
         let mut src = [0; 16];
         let mut dst = [0; 16];
-        let mut proto = [0; 2];
-        cursor
-            .read_exact(&mut dst[..6])
-            .and_then(|_| cursor.read_exact(&mut src[..6]))
-            .and_then(|_| cursor.read_exact(&mut proto))
-            .map_err(|_| Error::Parse("Frame is too short"))?;
-        if proto == [0x81, 0x00] {
+        dst[..6].copy_from_slice(&data[0..6]);
+        src[..6].copy_from_slice(&data[6..12]);
+        if data[12] == 0x81 && data[13] == 0x00 {
+            if data.len() < 16 {
+                return Err(Error::Parse("Vlan frame is too short"));
+            }
             src.copy_within(..6, 2);
             dst.copy_within(..6, 2);
-            cursor.read_exact(&mut src[..2]).map_err(|_| Error::Parse("Vlan frame is too short"))?;
+            src[..2].copy_from_slice(&data[14..16]);
             src[0] &= 0x0f; // restrict vlan id to 12 bits
             dst[..2].copy_from_slice(&src[..2]);
             if src[0..1] == [0, 0] {
@@ -324,13 +324,12 @@ fn fix_transport_checksum(pkt: &mut [u8], ihl: usize, check_off: usize) {
     let check = {
         let mut s = sum;
         let l4 = &pkt[ihl..];
-        let mut i = 0;
-        while i + 1 < l4.len() {
-            s += u16::from_be_bytes([l4[i], l4[i + 1]]) as u32;
-            i += 2;
+        let mut chunks = l4.chunks_exact(2);
+        for c in chunks.by_ref() {
+            s += u16::from_be_bytes([c[0], c[1]]) as u32;
         }
-        if i < l4.len() {
-            s += (l4[i] as u32) << 8;
+        if let [b] = chunks.remainder() {
+            s += (*b as u32) << 8;
         }
         fold_checksum(s)
     };
@@ -339,13 +338,12 @@ fn fix_transport_checksum(pkt: &mut [u8], ihl: usize, check_off: usize) {
 
 fn internet_checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
-    let mut i = 0;
-    while i + 1 < data.len() {
-        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
-        i += 2;
+    let mut chunks = data.chunks_exact(2);
+    for c in chunks.by_ref() {
+        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
     }
-    if i < data.len() {
-        sum += (data[i] as u32) << 8;
+    if let [b] = chunks.remainder() {
+        sum += (*b as u32) << 8;
     }
     fold_checksum(sum)
 }

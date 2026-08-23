@@ -10,6 +10,9 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
+use std::cell::RefCell;
+
+#[cfg(target_os = "linux")]
 use std::net::Ipv4Addr;
 
 #[cfg(unix)] use std::sync::Mutex;
@@ -263,67 +266,96 @@ fn split_gro_payload(payload: &[u8], gro: usize) -> Vec<&[u8]> {
 }
 
 #[cfg(target_os = "linux")]
+struct RecvMmsgScratch {
+    names: Vec<libc::sockaddr_storage>,
+    iov: Vec<libc::iovec>,
+    hdrs: Vec<libc::mmsghdr>,
+    cbufs: Vec<[u8; 64]>
+}
+
+#[cfg(target_os = "linux")]
+struct SendMmsgScratch {
+    names: Vec<(libc::sockaddr_storage, u32)>,
+    iov: Vec<libc::iovec>,
+    hdrs: Vec<libc::mmsghdr>
+}
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    static RECV_MMSG: RefCell<RecvMmsgScratch> =
+        RefCell::new(RecvMmsgScratch { names: Vec::new(), iov: Vec::new(), hdrs: Vec::new(), cbufs: Vec::new() });
+    static SEND_MMSG: RefCell<SendMmsgScratch> =
+        RefCell::new(SendMmsgScratch { names: Vec::new(), iov: Vec::new(), hdrs: Vec::new() });
+    static GSO_CONCAT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+}
+
+#[cfg(target_os = "linux")]
 fn linux_recvmmsg(fd: RawFd, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -> io::Result<usize> {
     let n = bufs.len().min(addrs.len()).min(64);
     if n == 0 {
         return Ok(0);
     }
-    let mut names = vec![unsafe { std::mem::zeroed::<libc::sockaddr_storage>() }; n];
-    let mut iov = Vec::with_capacity(n);
-    let mut hdrs = Vec::with_capacity(n);
-    let mut cbufs = vec![[0u8; 64]; n];
-    for i in 0..n {
-        bufs[i].clear();
-        let buf = bufs[i].buffer();
-        iov.push(libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: buf.len() });
-    }
-    for i in 0..n {
-        hdrs.push(libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: &mut names[i] as *mut _ as *mut _,
-                msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as u32,
-                msg_iov: &mut iov[i],
-                msg_iovlen: 1,
-                msg_control: cbufs[i].as_mut_ptr() as *mut _,
-                msg_controllen: cbufs[i].len(),
-                msg_flags: 0
-            },
-            msg_len: 0
-        });
-    }
-    let got = unsafe { libc::recvmmsg(fd, hdrs.as_mut_ptr(), n as u32, libc::MSG_DONTWAIT, std::ptr::null_mut()) };
-    if got < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let got = got as usize;
-    let mut extras: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
-    for i in 0..got {
-        let len = hdrs[i].msg_len as usize;
-        bufs[i].set_length(len);
-        addrs[i] = sockaddr_to_std(&names[i], hdrs[i].msg_hdr.msg_namelen)?;
-        let gro = gro_segment_size(&hdrs[i].msg_hdr);
-        if gro > 0 && gro < len {
-            let payload = bufs[i].message().to_vec();
-            let segs = split_gro_payload(&payload, gro);
-            bufs[i].set_length(segs[0].len());
-            bufs[i].message_mut().copy_from_slice(segs[0]);
-            for seg in segs.iter().skip(1) {
-                extras.push((addrs[i], seg.to_vec()));
+    RECV_MMSG.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.names.resize_with(n, || unsafe { std::mem::zeroed() });
+        s.iov.resize(n, libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 });
+        s.hdrs.resize_with(n, || unsafe { std::mem::zeroed() });
+        if s.cbufs.len() < n {
+            s.cbufs.resize(n, [0u8; 64]);
+        }
+        for i in 0..n {
+            bufs[i].clear();
+            let buf = bufs[i].buffer();
+            s.iov[i] = libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: buf.len() };
+            s.hdrs[i] = libc::mmsghdr {
+                msg_hdr: libc::msghdr {
+                    msg_name: &mut s.names[i] as *mut _ as *mut _,
+                    msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as u32,
+                    msg_iov: &mut s.iov[i],
+                    msg_iovlen: 1,
+                    msg_control: s.cbufs[i].as_mut_ptr() as *mut _,
+                    msg_controllen: s.cbufs[i].len(),
+                    msg_flags: 0
+                },
+                msg_len: 0
+            };
+        }
+        let got =
+            unsafe { libc::recvmmsg(fd, s.hdrs.as_mut_ptr(), n as u32, libc::MSG_DONTWAIT, std::ptr::null_mut()) };
+        if got < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let got = got as usize;
+        let mut gro_sizes = [0usize; 64];
+        for i in 0..got {
+            let len = s.hdrs[i].msg_len as usize;
+            bufs[i].set_length(len);
+            addrs[i] = sockaddr_to_std(&s.names[i], s.hdrs[i].msg_hdr.msg_namelen)?;
+            gro_sizes[i] = gro_segment_size(&s.hdrs[i].msg_hdr);
+        }
+        drop(s);
+        let cap = bufs.len().min(addrs.len());
+        let mut w = got;
+        for i in 0..got {
+            let gro = gro_sizes[i];
+            let total = bufs[i].len();
+            if gro == 0 || gro >= total {
+                continue;
             }
+            let mut off = gro;
+            while off < total && w < cap {
+                let seglen = (total - off).min(gro);
+                let tmp = bufs[i].message()[off..off + seglen].to_vec();
+                bufs[w].clear();
+                bufs[w].clone_from(&tmp);
+                addrs[w] = addrs[i];
+                w += 1;
+                off += seglen;
+            }
+            bufs[i].set_length(gro);
         }
-    }
-    let mut w = got;
-    for (addr, data) in extras {
-        if w >= bufs.len().min(addrs.len()) {
-            break;
-        }
-        bufs[w].clear();
-        bufs[w].set_length(data.len());
-        bufs[w].message_mut().copy_from_slice(&data);
-        addrs[w] = addr;
-        w += 1;
-    }
-    Ok(w)
+        Ok(w)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -342,40 +374,55 @@ fn linux_sendmmsg(fd: RawFd, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usi
         }
     }
     let n = packets.len().min(64);
-    let mut names = Vec::with_capacity(n);
-    let mut iov = Vec::with_capacity(n);
-    let mut hdrs = Vec::with_capacity(n);
-    for (addr, data) in packets.iter().take(n) {
-        names.push(std_to_sockaddr(**addr));
-        iov.push(libc::iovec { iov_base: data.as_ptr() as *mut _, iov_len: data.len() });
-    }
-    for i in 0..n {
-        hdrs.push(libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: &mut names[i].0 as *mut _ as *mut _,
-                msg_namelen: names[i].1,
-                msg_iov: &mut iov[i],
-                msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0
-            },
-            msg_len: 0
-        });
-    }
-    let got = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), n as u32, 0) };
-    if got < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(got as usize)
+    SEND_MMSG.with(|cell| {
+        let mut s = cell.borrow_mut();
+        s.names.clear();
+        s.iov.clear();
+        s.hdrs.clear();
+        for (addr, data) in packets.iter().take(n) {
+            s.names.push(std_to_sockaddr(**addr));
+            s.iov.push(libc::iovec { iov_base: data.as_ptr() as *mut _, iov_len: data.len() });
+        }
+        for i in 0..n {
+            s.hdrs.push(libc::mmsghdr {
+                msg_hdr: libc::msghdr {
+                    msg_name: &mut s.names[i].0 as *mut _ as *mut _,
+                    msg_namelen: s.names[i].1,
+                    msg_iov: &mut s.iov[i],
+                    msg_iovlen: 1,
+                    msg_control: std::ptr::null_mut(),
+                    msg_controllen: 0,
+                    msg_flags: 0
+                },
+                msg_len: 0
+            });
+        }
+        let got = unsafe { libc::sendmmsg(fd, s.hdrs.as_mut_ptr(), n as u32, 0) };
+        if got < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(got as usize)
+    })
 }
 
 #[cfg(target_os = "linux")]
 fn linux_gso_send(fd: RawFd, dest: &SocketAddr, packets: &[(&SocketAddr, &[u8])], seg: usize) -> io::Result<usize> {
-    let mut concat = Vec::with_capacity(seg * packets.len());
-    for (_, d) in packets {
-        concat.extend_from_slice(d);
-    }
+    GSO_CONCAT.with(|cell| {
+        let mut concat = cell.borrow_mut();
+        concat.clear();
+        let need = seg.saturating_mul(packets.len());
+        if concat.capacity() < need {
+            concat.reserve(need);
+        }
+        for (_, d) in packets {
+            concat.extend_from_slice(d);
+        }
+        linux_gso_send_concat(fd, dest, packets.len(), seg, &concat)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_gso_send_concat(fd: RawFd, dest: &SocketAddr, n: usize, seg: usize, concat: &[u8]) -> io::Result<usize> {
     let mut name = std_to_sockaddr(*dest);
     let mut iov = libc::iovec { iov_base: concat.as_ptr() as *mut _, iov_len: concat.len() };
     let mut cbuf = [0u8; 32];
@@ -402,7 +449,7 @@ fn linux_gso_send(fd: RawFd, dest: &SocketAddr, packets: &[(&SocketAddr, &[u8])]
             return Err(io::Error::last_os_error());
         }
     }
-    Ok(packets.len())
+    Ok(n)
 }
 
 #[cfg(target_os = "linux")]
