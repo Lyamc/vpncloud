@@ -384,8 +384,11 @@ fn linux_sendmmsg(fd: RawFd, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usi
             s.names.push(std_to_sockaddr(**addr));
             s.iov.push(libc::iovec { iov_base: data.as_ptr() as *mut _, iov_len: data.len() });
         }
+        // Index-assign so names/iov and hdrs are distinct field borrows (push() would
+        // mutably borrow the whole scratch struct and fail on stable).
+        s.hdrs.resize_with(n, || unsafe { std::mem::zeroed() });
         for i in 0..n {
-            s.hdrs.push(libc::mmsghdr {
+            s.hdrs[i] = libc::mmsghdr {
                 msg_hdr: libc::msghdr {
                     msg_name: &mut s.names[i].0 as *mut _ as *mut _,
                     msg_namelen: s.names[i].1,
@@ -396,7 +399,7 @@ fn linux_sendmmsg(fd: RawFd, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usi
                     msg_flags: 0
                 },
                 msg_len: 0
-            });
+            };
         }
         let got = unsafe { libc::sendmmsg(fd, s.hdrs.as_mut_ptr(), n as u32, 0) };
         if got < 0 {
