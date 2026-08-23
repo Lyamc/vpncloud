@@ -9,9 +9,9 @@ self-healing network. Traffic is encrypted end-to-end (Curve25519, AES-256 /
 ChaCha20) and forwarded over a virtual TUN (IP) or TAP (Ethernet) interface.
 
 This repository is [Lyamc/vpncloud](https://github.com/Lyamc/vpncloud), a fork
-of [dswd/vpncloud](https://github.com/dswd/vpncloud). The fork adds **macOS**
-and **Windows** TUN/TAP support plus a set of protocol, config, and dependency
-fixes. Upstream documentation lives at
+of [dswd/vpncloud](https://github.com/dswd/vpncloud). The fork adds **macOS**,
+**Windows**, and **Android (TUN only)** support plus protocol, config, and
+dependency fixes. Upstream documentation lives at
 [vpncloud.ddswd.de](https://vpncloud.ddswd.de).
 
 ```sh
@@ -34,13 +34,13 @@ See `vpncloud.adoc` (the man page) for every option, and
 
 ### Project status
 
-VpnCloud 2.4.0 on this fork is usable on Linux, macOS, and Windows. It
-includes:
+VpnCloud 2.4.0 on this fork is usable on Linux, macOS, Windows, and Android
+(TUN). It includes:
 
 * Automatic peer-to-peer meshing, no central servers
 * Automatic reconnect, including several addresses per peer (priority order)
 * TUN (IP) and TAP (Ethernet) virtual interfaces
-* Linux, macOS (`utun` / `feth`), and Windows (Wintun / tap-windows6)
+* Linux, macOS (`utun` / `feth`), Windows (Wintun / tap-windows6), Android TUN
 * Strong end-to-end encryption (Curve25519, AES-128/256, ChaCha20)
 * Hub / switch / router forwarding modes
 * NAT hole punching and UPnP port forwarding
@@ -68,6 +68,19 @@ with sudo; `--ip` configures the address. Dual-stack UDP listen works
 **Windows.** TUN uses [Wintun](https://www.wintun.net/) (`wintun.dll` next to
 `vpncloud.exe`). TAP uses [tap-windows6](https://github.com/OpenVPN/tap-windows6)
 (NdisWan / `tap0901`). Run as Administrator.
+
+**Android.** TUN only. `VpnService` cannot create a TAP/L2 device (no Ethernet,
+ARP, or bridging). The `android/` app asks for VPN permission, builds a TUN,
+passes the fd into Rust (`--tun-fd` / JNI), and calls `VpnService.protect()` on
+the UDP socket so the mesh does not hairpin. Join TUN peers (`--ip 10.0.0.x/24`);
+do not point Android at a TAP cloud.
+
+```sh
+rustup target add aarch64-linux-android armv7-linux-androideabi
+cargo install cargo-ndk
+./android/build-native.sh   # writes jniLibs/*.so
+# then open android/ in Android Studio and run the app
+```
 
 
 ### Installing

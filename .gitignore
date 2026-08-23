@@ -16,3 +16,7 @@ __pycache__
 ._.DS_Store
 **/.DS_Store
 **/._.DS_Store
+android/.gradle
+android/local.properties
+android/app/build
+android/app/src/main/jniLibs

@@ -283,6 +283,8 @@ impl fmt::Display for Bytes {
     }
 }
 
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 pub struct CtrlC {
     flag: Arc<AtomicBool>
 }
@@ -292,8 +294,17 @@ impl CtrlC {
         Default::default()
     }
 
+    /// Request the run loop to exit (Android JNI stop, tests).
+    pub fn request_stop() {
+        STOP_REQUESTED.store(true, Ordering::Relaxed);
+    }
+
+    pub fn clear_stop() {
+        STOP_REQUESTED.store(false, Ordering::Relaxed);
+    }
+
     pub fn was_pressed(&mut self) -> bool {
-        self.flag.swap(false, Ordering::Relaxed)
+        self.flag.swap(false, Ordering::Relaxed) || STOP_REQUESTED.swap(false, Ordering::Relaxed)
     }
 }
 

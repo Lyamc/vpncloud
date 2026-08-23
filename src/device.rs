@@ -116,10 +116,54 @@ pub struct TunTapDevice {
     incoming: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>
 }
 
+pub fn android_tap_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "TAP/L2 is not supported on Android. VpnService only provides a TUN (layer-3) interface."
+    )
+}
+
 impl TunTapDevice {
+    /// Adopt a TUN file descriptor from Android `VpnService.Builder.establish()`.
+    ///
+    /// The fd is owned by this device afterwards. TAP is rejected: the platform has no L2 API.
+    #[cfg(unix)]
+    pub fn from_tun_fd(fd: i32, type_: Type) -> io::Result<Self> {
+        if type_ == Type::Tap {
+            return Err(android_tap_unsupported());
+        }
+        let device = unsafe { SyncDevice::from_fd(fd) }?;
+        device.set_nonblocking(true)?;
+        Ok(Self {
+            device: std::sync::Arc::new(device),
+            ifname: format!("tun{}", fd),
+            type_,
+            #[cfg(windows)]
+            incoming: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub fn from_tun_fd(_fd: i32, _type_: Type) -> io::Result<Self> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "TUN file descriptors are only supported on Unix"))
+    }
+
     // Keep the third parameter for compatibility with callers that pass an optional device path.
     // Linux uses it for `/dev/net/tun`; tun-rs manages that itself, so the path is ignored.
     pub fn new(ifname: &str, type_: Type, _device_path: Option<&str>) -> io::Result<Self> {
+        #[cfg(target_os = "android")]
+        {
+            let _ = ifname;
+            if type_ == Type::Tap {
+                return Err(android_tap_unsupported());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Android cannot create a TUN device in-process. Pass a VpnService TUN fd with --tun-fd."
+            ));
+        }
+        #[cfg(not(target_os = "android"))]
+        {
         let mut builder = DeviceBuilder::new();
 
         if let Some(name) = platform_device_name(ifname, type_) {
@@ -173,6 +217,7 @@ impl TunTapDevice {
             #[cfg(windows)]
             incoming: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
         })
+        }
     }
 
     // Set MTU (delegates to tun device).
@@ -528,6 +573,23 @@ mod tests {
     fn platform_name_explicit_utun() {
         let name = platform_device_name("utun8", Type::Tun);
         assert_eq!(name.as_deref(), Some("utun8"));
+    }
+
+    #[test]
+    fn android_tap_is_unsupported() {
+        let err = android_tap_unsupported();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("TUN"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_tun_fd_rejects_tap_without_touching_fd() {
+        let err = match TunTapDevice::from_tun_fd(-1, Type::Tap) {
+            Err(e) => e,
+            Ok(_) => panic!("TAP fd adopt must fail")
+        };
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]

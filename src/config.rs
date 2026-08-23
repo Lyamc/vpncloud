@@ -60,6 +60,8 @@ pub struct Config {
     pub device_type: Type,
     pub device_name: String,
     pub device_path: Option<String>,
+    /// TUN file descriptor from Android VpnService (owned). TAP is rejected.
+    pub tun_fd: Option<i32>,
     pub fix_rp_filter: bool,
     pub mtu: Option<usize>,
 
@@ -100,6 +102,7 @@ impl Default for Config {
             device_type: Type::Tun,
             device_name: "vpncloud%d".to_string(),
             device_path: None,
+            tun_fd: None,
             fix_rp_filter: false,
             mtu: None,
             ip: None,
@@ -256,6 +259,9 @@ impl Config {
         }
         if let Some(val) = args.device_path {
             self.device_path = Some(val);
+        }
+        if let Some(val) = args.tun_fd {
+            self.tun_fd = Some(val);
         }
         if args.fix_rp_filter {
             self.fix_rp_filter = true;
@@ -439,6 +445,10 @@ pub struct Args {
     /// Set the path of the base device
     #[arg(long)]
     pub device_path: Option<String>,
+
+    /// Adopt an existing TUN file descriptor (Android VpnService). TAP is not supported.
+    #[arg(long = "tun-fd")]
+    pub tun_fd: Option<i32>,
 
     /// MTU of the virtual device (default: auto)
     #[arg(long)]
@@ -896,6 +906,7 @@ fn config_merge() {
         device_type: Type::Tap,
         device_name: "vpncloud0".to_string(),
         device_path: Some("/dev/null".to_string()),
+        tun_fd: None,
         fix_rp_filter: false,
         mtu: None,
         ip: None,

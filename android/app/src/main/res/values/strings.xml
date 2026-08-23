@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">VpnCloud</string>
+    <string name="password">Password</string>
+    <string name="overlay_ip">Overlay IP (TUN)</string>
+    <string name="peer">Peer host:port</string>
+    <string name="listen">Listen port</string>
+    <string name="connect">Connect</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="tap_note">Android only supports TUN (layer 3). TAP/L2 is not available.</string>
+    <string name="notification_channel">VpnCloud</string>
+    <string name="notification_text">Mesh VPN connected</string>
+</resources>

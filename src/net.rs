@@ -10,6 +10,9 @@ use std::{
 };
 
 #[cfg(unix)]
+use std::sync::Mutex;
+
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 
 #[cfg(windows)]
@@ -90,6 +93,23 @@ pub fn parse_listen(addr: &str, default_port: u16) -> SocketAddr {
     }
 }
 
+#[cfg(unix)]
+static SOCKET_PROTECT: Mutex<Option<fn(RawFd) -> io::Result<()>>> = Mutex::new(None);
+
+/// Install a hook invoked on every newly bound UDP socket (Android `VpnService.protect`).
+#[cfg(unix)]
+pub fn set_socket_protect(hook: Option<fn(RawFd) -> io::Result<()>>) {
+    *SOCKET_PROTECT.lock().expect("socket protect lock") = hook;
+}
+
+#[cfg(unix)]
+fn protect_socket(fd: RawFd) -> io::Result<()> {
+    if let Some(hook) = *SOCKET_PROTECT.lock().expect("socket protect lock") {
+        hook(fd)?;
+    }
+    Ok(())
+}
+
 impl Socket for UdpSocket {
     fn listen(addr: &str) -> Result<Self, io::Error> {
         let addr = mapped_addr(parse_listen(addr, DEFAULT_PORT));
@@ -102,7 +122,10 @@ impl Socket for UdpSocket {
             sock.set_only_v6(false)?;
         }
         sock.bind(&addr.into())?;
-        Ok(sock.into())
+        let sock: UdpSocket = sock.into();
+        #[cfg(unix)]
+        protect_socket(sock.as_raw_fd())?;
+        Ok(sock)
     }
 
     fn receive(&mut self, buffer: &mut MsgBuffer) -> Result<SocketAddr, io::Error> {

@@ -29,6 +29,11 @@ vpncloud - Peer-to-peer VPN
 *--device-path <path>*::
   The path of the base device inode, e.g. /dev/net/tun.
 
+*--tun-fd <fd>*::
+  Adopt an already-open TUN file descriptor instead of creating a device.
+  Used on Android: the Java *VpnService* establishes the TUN and passes the
+  fd here. TAP/L2 is not available on Android.
+
 *--fix-rp-filter*::
   If this option is set, VpnCloud will change the rp_filter settings to protect
   against a potential system vulnerability. See *SECURITY* for more info.
@@ -705,6 +710,27 @@ interface.
 If the node is behind NAT, either enable UPnP (*--no-port-forwarding* not
 set), configure a static UDP port forward to the listen port, or use the
 websocket proxy (see *WEBSOCKET PROXY*).
+
+
+== ANDROID
+
+Android support is **TUN (layer 3) only**. The public *VpnService* API
+always creates a TUN interface: raw IP packets, no Ethernet header, no MAC,
+no ARP. TAP/L2, bridging, and VLAN switching are not possible on stock
+Android (see also Google issue 302924870).
+
+Use the host app in *android/* (or any *VpnService* wrapper):
+
+. Request VPN permission via *VpnService.prepare*.
+. *Builder.addAddress* / *addRoute* for the overlay subnet only
+  (do not add *0.0.0.0/0* unless you want a full-tunnel).
+. *establish()*, then *detachFd()* and pass the fd to the native library
+  (JNI *NativeEngine.nativeStart*, or *--tun-fd* for a command-line build).
+. *protect()* the VpnCloud UDP socket so mesh packets bypass the TUN.
+
+The overlay must match other **TUN** nodes (*--ip 10.0.0.2/24*). An Android
+node cannot join a TAP Ethernet mesh without a userspace Ethernet shim, which
+this project does not provide.
 
 
 == CONTAINERS (LXC / PROXMOX)

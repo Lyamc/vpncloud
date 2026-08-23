@@ -1,0 +1,1 @@
+-keep class ca.witherow.vpncloud.NativeEngine { *; }
