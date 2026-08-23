@@ -4,13 +4,12 @@ This project follows [semantic versioning](http://semver.org).
 
 ### UNRELEASED
 
-- [changed] Datapath: move packets into TUN/UDP queues without an extra payload copy; reuse recvmmsg/sendmmsg/GSO scratch; Linux TUN `send_multiple` writes from `MsgBuffer` (virtio header prepend)
-- [fixed] Crypto worker threads are recreated after `--daemon` (fork)
-- [changed] Per-flow overlay stats HashMap is off unless `stats-file` / statsd is set
-
 ### v2.4.1 (2026-08-23)
 
 - [changed] Datapath: reuse packet buffers (no 64 KiB zero / `to_vec` per packet); skip crypto mutex when `--crypto-threads` is 0; Linux TUN GSO/GRO offload; queue TUN writes and `send_multiple` after a UDP/TUN batch
+- [changed] Datapath: move packets into TUN/UDP queues without an extra payload copy; reuse recvmmsg/sendmmsg/GSO scratch; Linux TUN `send_multiple` writes from `MsgBuffer` (virtio header prepend)
+- [fixed] Crypto worker threads are recreated after `--daemon` (fork)
+- [changed] Per-flow overlay stats HashMap is off unless `stats-file` / statsd is set
 - [changed] `--crypto-threads` defaults to extra cores minus one (capped at 4) outside tests; tests stay at 0
 - [added] Optional AES-GCM backend `aws-lc-rs` (`--features aws-lc`; `ring` remains default, Noise still uses `ring`)
 - [changed] Release builds use thin LTO, abort-on-panic, and symbol stripping; packaged binaries can use `--profile dist` (fat LTO)

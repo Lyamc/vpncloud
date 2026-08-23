@@ -6,6 +6,8 @@ vpncloud (2.4.1) stable; urgency=medium
  * [added] STUN, NAT-PMP, TCP fallback, overlay ACLs, signed configs, Linux seccomp
  * [added] Linux recvmmsg/sendmmsg, UDP GSO/GRO, configurable socket buffers
  * [added] FreeBSD TUN/TAP and rc.d; macOS LaunchDaemon install
+ * [changed] Datapath: queue packets without an extra payload copy; reuse recvmmsg/sendmmsg/GSO scratch
+ * [fixed] Crypto workers are recreated after --daemon (fork)
  * Mesh protocol remains compatible with 2.4.0 peers
 
  -- Lyam Witherow <lyam@witherow.ca>  Sun, 23 Aug 2026 01:00:00 -0600
