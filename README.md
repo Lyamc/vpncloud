@@ -135,7 +135,9 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 
 Prerequisites: Rust/Cargo (edition 2021, toolchain 1.75+). On Linux, install
 `asciidoctor` if you want the man page. The `install` subcommand is compiled
-only with `--features installer`.
+only with `--features installer`. AES-GCM can use AWS-LC instead of `ring`
+(`cargo build --release --features aws-lc`; needs cmake). Noise still uses
+`ring` via `snow`.
 
 ```sh
 git clone https://github.com/Lyamc/vpncloud.git

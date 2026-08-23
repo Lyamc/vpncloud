@@ -174,6 +174,7 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     rx_bufs: Vec<MsgBuffer>,
     rx_addrs: Vec<SocketAddr>,
     tun_bufs: Vec<MsgBuffer>,
+    tun_out: Vec<MsgBuffer>,
     next_peers: Time,
     peer_timeout_publish: u16,
     update_freq: u16,
@@ -267,6 +268,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             rx_bufs: (0..BATCH_SIZE).map(|_| MsgBuffer::new(SPACE_BEFORE)).collect(),
             rx_addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)); BATCH_SIZE],
             tun_bufs: (0..BATCH_SIZE).map(|_| MsgBuffer::new(SPACE_BEFORE)).collect(),
+            tun_out: Vec::with_capacity(BATCH_SIZE),
             acl: try_fail!(crate::acl::Acl::parse(&config.acl), "Invalid ACL: {}"),
             config: config.clone(),
             _dummy_p: PhantomData,
@@ -390,6 +392,18 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             Ok(_) => Ok(()),
             Err(e) => Err(Error::SocketIo("IOError when sending", e))
         }
+    }
+
+    fn flush_tun_out(&mut self) -> Result<(), Error> {
+        if self.tun_out.is_empty() {
+            return Ok(());
+        }
+        let mut pkts = mem::take(&mut self.tun_out);
+        let res = self.device.write_batch(&mut pkts);
+        for buf in pkts {
+            self.buf_spare.push(buf);
+        }
+        res.map(|_| ())
     }
 
     fn apply_decrypted(
@@ -715,6 +729,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             self.send_stun_probes();
         }
         self.flush_pending_crypto()?;
+        self.flush_tun_out()?;
         self.flush_outbox()?;
         Ok(())
     }
@@ -1053,10 +1068,10 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         let len = data.len();
         debug!("Writing data to device: {} bytes", len);
         self.traffic.count_in_payload(src, dst, len);
-        if let Err(e) = self.device.write_msg(data) {
-            error!("Failed to send via device: {}", e);
-            return Err(e);
-        }
+        let mut owned = self.take_spare();
+        owned.clear();
+        owned.clone_from(data.message());
+        self.tun_out.push(owned);
         if self.learning {
             // Learn single address
             let nid = self.peers.get(&peer).map(|p| p.node_id).unwrap_or([0; 16]);
@@ -1293,6 +1308,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         self.rx_bufs = bufs;
         self.rx_addrs = addrs;
         let _ = self.flush_pending_crypto();
+        if let Err(e) = self.flush_tun_out() {
+            error!("{}", e);
+        }
         let _ = self.flush_outbox();
     }
 
@@ -1312,6 +1330,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
         self.tun_bufs = bufs;
         let _ = self.flush_pending_crypto();
+        if let Err(e) = self.flush_tun_out() {
+            error!("{}", e);
+        }
         let _ = self.flush_outbox();
     }
 

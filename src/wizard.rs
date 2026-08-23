@@ -1,11 +1,11 @@
 use crate::{
     config::{load_config_file, resolve_config_path, write_config_file, Config},
     crypto::Crypto,
+    crypto_ring::aead,
     device,
     types::Mode
 };
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
-use ring::aead;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{

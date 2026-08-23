@@ -4,7 +4,7 @@
 
 //! Ed25519 signatures over config file bodies (signature lines stripped).
 
-use ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
+use crate::crypto_ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
 
 use crate::{
     crypto::Crypto,

@@ -263,7 +263,8 @@ vpncloud - Peer-to-peer VPN
 
 *--crypto-threads <n>*::
   Worker threads for DATA encrypt/decrypt. *0* keeps crypto on the wait
-  thread. Control messages always stay on the wait thread. [default: *0*]
+  thread. Control messages always stay on the wait thread.
+  [default: *0* in tests; otherwise extra cores minus one, capped at *4*]
 
 *--socket-buffer <bytes>*::
   `SO_RCVBUF` and `SO_SNDBUF` for the mesh UDP socket.
@@ -888,6 +889,13 @@ toolkit.
 cargo build --release --features gui --bin vpncloud-gui
 vpncloud-gui
 vpncloud-gui /path/to/mynet.yaml
+----
+
+Optional AES-GCM via AWS-LC (needs cmake; *ring* remains the default, and
+Noise still uses *ring*):
+
+----
+cargo build --release --features aws-lc
 ----
 
 Connect still needs the same privileges as the CLI (root/Administrator,

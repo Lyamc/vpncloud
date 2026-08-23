@@ -4,7 +4,9 @@ This project follows [semantic versioning](http://semver.org).
 
 ### UNRELEASED
 
-- [changed] Datapath: reuse packet buffers (no 64 KiB zero / `to_vec` per packet); skip crypto mutex when `--crypto-threads` is 0; Linux TUN GSO/GRO offload
+- [changed] Datapath: reuse packet buffers (no 64 KiB zero / `to_vec` per packet); skip crypto mutex when `--crypto-threads` is 0; Linux TUN GSO/GRO offload; queue TUN writes and `send_multiple` after a UDP/TUN batch
+- [changed] `--crypto-threads` defaults to extra cores minus one (capped at 4) outside tests; tests stay at 0
+- [added] Optional AES-GCM backend `aws-lc-rs` (`--features aws-lc`; `ring` remains default, Noise still uses `ring`)
 - [changed] Release builds use thin LTO, abort-on-panic, and symbol stripping; packaged binaries can use `--profile dist` (fat LTO)
 - [changed] Optional crates are feature-gated (`noise`, `installer`/`service-manager`, GUI Iced). Host lib crate-type is `rlib` only
 - [changed] Service install uses the `service-manager` crate (systemd, launchd, Windows `sc.exe`); the Windows service *process* is unchanged

@@ -55,18 +55,23 @@
 // last message. After 5 seconds, the initialization is aborted as failed.
 
 use super::{
+    agree_ephemeral,
     core::{CryptoCore, EXTRA_LEN},
     Algorithms, EcdhPrivateKey, EcdhPublicKey, Ed25519PublicKey, Payload
 };
-use crate::{error::Error, types::NodeId, util::MsgBuffer};
-use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
-use ring::{
-    aead::{Algorithm, LessSafeKey, UnboundKey, AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305},
-    agreement::{agree_ephemeral, X25519},
-    digest,
-    rand::{SecureRandom, SystemRandom},
-    signature::{self, Ed25519KeyPair, KeyPair, ED25519, ED25519_PUBLIC_KEY_LEN}
+use crate::{
+    crypto_ring::{
+        aead::{Algorithm, LessSafeKey, UnboundKey, AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305},
+        agreement::X25519,
+        digest,
+        rand::{SecureRandom, SystemRandom},
+        signature::{self, Ed25519KeyPair, KeyPair, ED25519, ED25519_PUBLIC_KEY_LEN}
+    },
+    error::Error,
+    types::NodeId,
+    util::MsgBuffer
 };
+use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use smallvec::{smallvec, SmallVec};
 use std::{
     cmp, f32,

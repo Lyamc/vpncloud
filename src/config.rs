@@ -24,6 +24,18 @@ pub const DEFAULT_PEER_TIMEOUT: u16 = 300;
 pub const DEFAULT_PORT: u16 = 3210;
 pub const DEFAULT_SOCKET_BUFFER: usize = 2 * 1024 * 1024;
 
+/// DATA crypto workers. Tests stay on the wait thread. Otherwise use extra cores, capped at 4.
+pub fn default_crypto_threads() -> usize {
+    if cfg!(test) {
+        return 0;
+    }
+    match std::thread::available_parallelism() {
+        Ok(n) if n.get() >= 3 => n.get().saturating_sub(1).min(4),
+        Ok(n) if n.get() == 2 => 1,
+        _ => 0
+    }
+}
+
 /// System-wide config directory (`/usr/local/etc/vpncloud` on FreeBSD, `/etc/vpncloud` elsewhere).
 pub fn system_config_dir() -> &'static Path {
     #[cfg(target_os = "freebsd")]
@@ -213,7 +225,7 @@ impl Default for Config {
             init_rate_limit: 20,
             acl: vec![],
             tcp_fallback: !cfg!(test),
-            crypto_threads: 0,
+            crypto_threads: default_crypto_threads(),
             require_signed_config: false,
             seccomp: !cfg!(test),
             socket_buffer_bytes: DEFAULT_SOCKET_BUFFER
@@ -844,7 +856,7 @@ pub struct Args {
     /// Disable TCP fallback
     #[arg(long, conflicts_with = "tcp_fallback")]
     pub no_tcp_fallback: bool,
-    /// Worker threads for DATA encrypt/decrypt (0 = wait thread)
+    /// Worker threads for DATA encrypt/decrypt (0 = wait thread; default extra cores-1, max 4)
     #[arg(long = "crypto-threads")]
     pub crypto_threads: Option<usize>,
     /// Refuse unsigned config files
@@ -1591,4 +1603,10 @@ fn system_config_dir_is_os_default() {
         assert_eq!(system_bin_path(), Path::new("/usr/bin/vpncloud"));
         assert_eq!(system_man_path(), Path::new("/usr/share/man/man1/vpncloud.1.gz"));
     }
+}
+
+#[test]
+fn crypto_threads_default_is_zero_in_tests() {
+    assert_eq!(default_crypto_threads(), 0);
+    assert_eq!(Config::default().crypto_threads, 0);
 }

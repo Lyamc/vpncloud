@@ -6,16 +6,16 @@ use super::{
     rotate::RotationState
 };
 use crate::{
+    crypto_ring::{
+        aead::{self, Algorithm, LessSafeKey, UnboundKey},
+        agreement::{EphemeralPrivateKey, UnparsedPublicKey},
+        pbkdf2,
+        rand::{SecureRandom, SystemRandom},
+        signature::{Ed25519KeyPair, KeyPair, ED25519_PUBLIC_KEY_LEN}
+    },
     error::Error,
     types::NodeId,
     util::{from_base62, to_base62, MsgBuffer}
-};
-use ring::{
-    aead::{self, Algorithm, LessSafeKey, UnboundKey},
-    agreement::{EphemeralPrivateKey, UnparsedPublicKey},
-    pbkdf2,
-    rand::{SecureRandom, SystemRandom},
-    signature::{Ed25519KeyPair, KeyPair, ED25519_PUBLIC_KEY_LEN}
 };
 use smallvec::{smallvec, SmallVec};
 use std::{fmt::Debug, io::Read, num::NonZeroU32, sync::Arc, time::Duration};

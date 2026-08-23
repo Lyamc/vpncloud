@@ -37,6 +37,7 @@ rand = "0.10.2"
 
 fnv = "1.0.7"
 ring = "0.17.14"
+aws-lc-rs = { version = "1", optional = true }
 snow = { version = "0.10", optional = true, default-features = false, features = ["std", "default-resolver", "default-resolver-crypto"] }
 x25519-dalek = { version = "2", optional = true, default-features = false, features = ["static_secrets"] }
 byteorder = "1.5.0"
@@ -105,6 +106,8 @@ wizard = ["dep:dialoguer"]
 installer = ["dep:service-manager"]
 gui = ["dep:iced"]
 noise = ["dep:snow", "dep:x25519-dalek"]
+# AES-GCM via AWS-LC instead of ring. Needs cmake. Noise still uses ring.
+aws-lc = ["dep:aws-lc-rs"]
 
 [[bin]]
 name = "vpncloud-gui"

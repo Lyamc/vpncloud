@@ -29,13 +29,16 @@
 //
 // The whole communication is sent via the crypto stream and is therefore encrypted and protected against tampering.
 
-use super::Key;
-use crate::{error::Error, util::MsgBuffer};
-use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
-use ring::{
-    agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, X25519},
-    rand::SystemRandom
+use super::{agree_ephemeral, Key};
+use crate::{
+    crypto_ring::{
+        agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519},
+        rand::SystemRandom
+    },
+    error::Error,
+    util::MsgBuffer
 };
+use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use smallvec::{smallvec, SmallVec};
 use std::io::{self, Cursor, Read, Write};
 

@@ -7,6 +7,13 @@ extern crate log;
 #[macro_use]
 extern crate serde;
 
+/// Crypto backend: `ring` by default, `aws-lc-rs` with `--features aws-lc`.
+/// Noise still uses `ring` (via `snow`) even when this alias is `aws-lc-rs`.
+#[cfg(feature = "aws-lc")]
+pub use aws_lc_rs as crypto_ring;
+#[cfg(not(feature = "aws-lc"))]
+pub use ring as crypto_ring;
+
 #[cfg(test)]
 extern crate tempfile;
 

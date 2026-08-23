@@ -146,6 +146,17 @@ pub trait Device: io::Read + io::Write {
         }
         Ok(n)
     }
+
+    /// Write `bufs` to the overlay device. Linux TUN with offload uses `send_multiple`.
+    fn write_batch(&mut self, bufs: &mut [crate::util::MsgBuffer]) -> Result<usize, Error> {
+        if bufs.is_empty() {
+            return Ok(0);
+        }
+        for b in bufs.iter_mut() {
+            self.write_msg(b)?;
+        }
+        Ok(bufs.len())
+    }
 }
 
 pub struct TunTapDevice {
@@ -619,8 +630,10 @@ impl Device for TunTapDevice {
         }
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if self.tun_offload && self.type_ == Type::Tun {
-            let mut pkt = data.message().to_vec();
-            match self.device.send_multiple(&mut self.gro_table, std::slice::from_mut(&mut pkt), 0) {
+            let msg = data.message();
+            let mut pkt = vec![0u8; VIRTIO_NET_HDR_LEN + msg.len()];
+            pkt[VIRTIO_NET_HDR_LEN..].copy_from_slice(msg);
+            match self.device.send_multiple(&mut self.gro_table, std::slice::from_mut(&mut pkt), VIRTIO_NET_HDR_LEN) {
                 Ok(_) => return Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     return Err(Error::DeviceIo("IO error when sending to device", e));
@@ -711,6 +724,47 @@ impl Device for TunTapDevice {
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted => Ok(0),
             Err(e) => Err(Error::DeviceIo("IO error when reading from device", e))
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn write_batch(&mut self, bufs: &mut [crate::util::MsgBuffer]) -> Result<usize, Error> {
+        if bufs.is_empty() {
+            return Ok(0);
+        }
+        if !self.tun_offload || self.type_ != Type::Tun {
+            for b in bufs.iter_mut() {
+                self.write_msg(b)?;
+            }
+            return Ok(bufs.len());
+        }
+        while self.tun_batch.len() < bufs.len() {
+            self.tun_batch.push(vec![0u8; VIRTIO_NET_HDR_LEN + 2048]);
+        }
+        for (i, b) in bufs.iter_mut().enumerate() {
+            crate::payload::fix_ipv4_checksums(b.message_mut());
+            let msg = b.message();
+            let need = VIRTIO_NET_HDR_LEN + msg.len();
+            self.tun_batch[i].clear();
+            self.tun_batch[i].resize(need, 0);
+            self.tun_batch[i][VIRTIO_NET_HDR_LEN..].copy_from_slice(msg);
+        }
+        match self.device.send_multiple(&mut self.gro_table, &mut self.tun_batch[..bufs.len()], VIRTIO_NET_HDR_LEN) {
+            Ok(_) => Ok(bufs.len()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                Err(Error::DeviceIo("IO error when sending to device", e))
+            }
+            Err(_) => {
+                for b in bufs.iter_mut() {
+                    let slice = b.message();
+                    match self.device.send(slice) {
+                        Ok(written) if written == slice.len() => {}
+                        Ok(_) => return Err(Error::Socket("Sent out truncated packet")),
+                        Err(io_err) => return Err(Error::DeviceIo("IO error when sending to device", io_err))
+                    }
+                }
+                Ok(bufs.len())
+            }
         }
     }
 }

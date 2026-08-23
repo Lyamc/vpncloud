@@ -41,11 +41,11 @@
 // one second ago plus 1 becomes the minimum nonce that is accepted for that key. That means, that reordering can
 // happen within one second but after a second, old messages will not be accepted anymore.
 
-use byteorder::{ReadBytesExt, WriteBytesExt};
-use ring::{
+use crate::crypto_ring::{
     aead::{self, LessSafeKey, UnboundKey},
     rand::{SecureRandom, SystemRandom}
 };
+use byteorder::{ReadBytesExt, WriteBytesExt};
 
 use std::{
     io::{Cursor, Read, Write},
@@ -259,7 +259,7 @@ pub fn test_speed(algo: &'static aead::Algorithm, max_time: &Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ring::aead::{self, LessSafeKey, UnboundKey};
+    use crate::crypto_ring::aead::{self, LessSafeKey, UnboundKey};
 
     #[test]
     fn test_nonce() {
@@ -430,7 +430,12 @@ mod tests {
 
     #[test]
     fn test_core_size() {
-        assert_eq!(2384, mem::size_of::<CryptoCore>());
+        let size = mem::size_of::<CryptoCore>();
+        #[cfg(not(feature = "aws-lc"))]
+        assert_eq!(size, 2384);
+        // aws-lc-rs stores a smaller handle than ring's in-process key material.
+        #[cfg(feature = "aws-lc")]
+        assert!((200..512).contains(&size), "unexpected CryptoCore size {size}");
     }
 
     #[test]

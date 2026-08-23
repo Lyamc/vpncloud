@@ -26,13 +26,11 @@ UDP is `recvmmsg`/`sendmmsg` + GSO/GRO. The overlay device is still one `read`/`
 ### 4. TUN write batch from the decrypt path
 After a UDP batch, decrypted DATA is written to TUN one-by-one. Queue and `send_multiple` at the end of the socket event (same offload path as 3).
 
-## Measure, then maybe
-
 ### 5. `--crypto-threads` default
-Keep default 0 (one fat TCP flow serializes on per-peer nonces anyway). Revisit defaulting to `nproc` only after 1–4 are in and vpn-bench is re-run with many peers.
+Keep tests at 0. Production defaults to extra cores minus one, capped at 4 (one fat TCP flow still serializes on per-peer nonces; extra workers help with many peers).
 
 ### 6. `aws-lc-rs` instead of `ring` (Linux AES-GCM)
-Possible tens of percent on AES-only bulk. ChaCha20 would not care. Only after a profile shows AEAD in the top stacks.
+Optional `--features aws-lc`. Possible tens of percent on AES-only bulk. ChaCha20 would not care. Noise still uses `ring` via `snow`.
 
 ## Out of product shape (do not do)
 
@@ -47,6 +45,6 @@ Possible tens of percent on AES-only bulk. ChaCha20 would not care. Only after a
 | 1 | No 64 KiB zero / outbox `to_vec` | done (reuse `rx_bufs` / `buf_spare`; `MsgBuffer` clone copies payload only) |
 | 2 | Direct `PeerCrypto` when pool off | done (`PeerCryptoSlot::Direct`) |
 | 3 | Linux TUN offload + `recv_multiple` | done (TUN `offload(true)` + `read_batch`) |
-| 4 | Linux TUN `send_multiple` after UDP batch | partial (`write_msg` uses `send_multiple` per packet; no queued batch yet) |
-| 5 | Crypto-thread default | later |
-| 6 | aws-lc-rs | later |
+| 4 | Linux TUN `send_multiple` after UDP batch | done (`tun_out` queue + `write_batch` with virtio header offset) |
+| 5 | Crypto-thread default | done (tests 0; otherwise extra cores-1, cap 4) |
+| 6 | aws-lc-rs | done (`--features aws-lc`; ring remains default) |
