@@ -141,7 +141,7 @@ fn configure_crypto(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
         config.crypto.public_key = Some(pub_key);
     }
     if mode == MODE_EXPERT {
-        let (unencrypted, allowed_algos) = Crypto::parse_algorithms(&config.crypto.algorithms)
+        let (unencrypted, use_noise, allowed_algos) = Crypto::parse_algorithms(&config.crypto.algorithms)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid crypto algorithms"))?;
         let algos = MultiSelect::with_theme(theme)
             .with_prompt("Allowed encryption algorithms (select multiple)")
@@ -149,11 +149,12 @@ fn configure_crypto(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
                 ("Unencrypted (dangerous)", unencrypted),
                 ("AES-128 in GCM mode", allowed_algos.contains(&&aead::AES_128_GCM)),
                 ("AES-256 in GCM mode", allowed_algos.contains(&&aead::AES_256_GCM)),
-                ("ChaCha20-Poly1305 (RFC 7539)", allowed_algos.contains(&&aead::CHACHA20_POLY1305))
+                ("ChaCha20-Poly1305 (RFC 7539)", allowed_algos.contains(&&aead::CHACHA20_POLY1305)),
+                ("Noise_XX (X25519 / ChaChaPoly / SHA-256)", use_noise)
             ])
             .interact()?;
         config.crypto.algorithms = vec![];
-        for (id, name) in &[(0, "PLAIN"), (1, "AES128"), (2, "AES256"), (3, "CHACHA20")] {
+        for (id, name) in &[(0, "PLAIN"), (1, "AES128"), (2, "AES256"), (3, "CHACHA20"), (4, "NOISE")] {
             if algos.contains(id) {
                 config.crypto.algorithms.push(name.to_string());
             }

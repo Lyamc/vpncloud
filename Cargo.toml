@@ -35,6 +35,8 @@ rand = "0.10.2"
 
 fnv = "1.0.7"
 ring = "0.17.14"
+snow = { version = "0.10", default-features = false, features = ["std", "default-resolver", "default-resolver-crypto"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 byteorder = "1.5.0"
 thiserror = "2.0.20"
 smallvec = "1.15.2"

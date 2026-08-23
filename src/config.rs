@@ -523,8 +523,8 @@ pub struct Args {
     #[arg(long = "trusted-key", alias = "trust", value_delimiter = ',')]
     pub trusted_keys: Vec<String>,
 
-    /// Algorithms to allow [possible values: plain, aes128, aes256, chacha20]
-    #[arg(long = "algorithm", alias = "algo", value_delimiter = ',', ignore_case = true, value_parser = ["plain", "aes128", "aes256", "chacha20"])]
+    /// Algorithms to allow [possible values: plain, aes128, aes256, chacha20, noise]
+    #[arg(long = "algorithm", alias = "algo", value_delimiter = ',', ignore_case = true, value_parser = ["plain", "aes128", "aes256", "chacha20", "noise"])]
     pub algorithms: Vec<String>,
 
     /// The local subnets to claim (IP or IP/prefix)

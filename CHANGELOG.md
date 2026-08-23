@@ -11,6 +11,7 @@ This project follows [semantic versioning](http://semver.org).
 - [added] Android TUN via VpnService; TAP/L2 on rooted devices with /dev/net/tun
 - [added] iOS TUN via Packet Tunnel Provider; TAP is not available
 - [added] Optional Iced desktop GUI (`vpncloud-gui`, `--features gui`)
+- [added] Noise protocol handshake (`--algorithm noise`: Noise_XX_25519_ChaChaPoly_SHA256)
 - [added] Native websocket listen (`ws-listen://` / `ws://0.0.0.0:port`)
 - [added] Configurable device MTU (`--mtu`)
 - [added] Multiple addresses per peer with priority order
