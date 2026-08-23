@@ -2,6 +2,7 @@ vpncloud (2.4.0) stable; urgency=medium
 
  * [added] macOS, Windows, Android, and iOS (TUN) support
  * [added] Windows tray, Windows service, optional desktop GUI
+ * [added] Optional Noise_XX handshake (--algorithm noise)
  * [added] Native websocket listen
  * [added] TOML config files (YAML still wins if both exist)
  * [added] Configurable MTU, IPv6 --ip, multi-address peers
