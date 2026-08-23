@@ -11,8 +11,8 @@ android {
         applicationId = "ca.witherow.vpncloud"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "2.4.0"
+        versionCode = 2
+        versionName = "2.4.1"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }

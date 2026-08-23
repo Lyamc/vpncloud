@@ -1,3 +1,15 @@
+vpncloud (2.4.1) stable; urgency=medium
+
+ * [changed] Faster datapath: reused packet buffers, no crypto mutex when idle, Linux TUN GSO/GRO
+ * [changed] --crypto-threads defaults to extra cores-1 (max 4) outside tests
+ * [added] Optional aws-lc-rs AES-GCM backend (--features aws-lc)
+ * [added] STUN, NAT-PMP, TCP fallback, overlay ACLs, signed configs, Linux seccomp
+ * [added] Linux recvmmsg/sendmmsg, UDP GSO/GRO, configurable socket buffers
+ * [added] FreeBSD TUN/TAP and rc.d; macOS LaunchDaemon install
+ * Mesh protocol remains compatible with 2.4.0 peers
+
+ -- Lyam Witherow <lyam@witherow.ca>  Sun, 23 Aug 2026 01:00:00 -0600
+
 vpncloud (2.4.0) stable; urgency=medium
 
  * [added] macOS, Windows, Android, and iOS (TUN) support

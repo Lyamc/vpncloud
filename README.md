@@ -44,7 +44,7 @@ for a commented YAML template, and `assets/example.toml.disabled` for TOML.
 
 ### Project status
 
-VpnCloud 2.4.0 on this fork is usable on Linux, macOS, FreeBSD, Windows,
+VpnCloud 2.4.1 on this fork is usable on Linux, macOS, FreeBSD, Windows,
 Android, and iOS (TUN). It includes:
 
 * Automatic peer-to-peer meshing, no central servers

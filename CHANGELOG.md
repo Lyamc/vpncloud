@@ -2,7 +2,7 @@
 
 This project follows [semantic versioning](http://semver.org).
 
-### UNRELEASED
+### v2.4.1 (2026-08-23)
 
 - [changed] Datapath: reuse packet buffers (no 64 KiB zero / `to_vec` per packet); skip crypto mutex when `--crypto-threads` is 0; Linux TUN GSO/GRO offload; queue TUN writes and `send_multiple` after a UDP/TUN batch
 - [changed] `--crypto-threads` defaults to extra cores minus one (capped at 4) outside tests; tests stay at 0
@@ -22,6 +22,7 @@ This project follows [semantic versioning](http://semver.org).
 - [added] Optional DATA crypto worker pool (`--crypto-threads N`)
 - [added] Ed25519 config signatures (`vpncloud sign-config`, `--require-signed-config`)
 - [added] Linux seccomp blacklist after bind/TUN/privdrop (`--seccomp` / `--no-seccomp`)
+- Mesh protocol remains compatible with 2.4.0 peers
 
 ### v2.4.0 (2026-08-22)
 
