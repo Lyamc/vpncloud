@@ -10,9 +10,14 @@ ChaCha20) and forwarded over a virtual TUN (IP) or TAP (Ethernet) interface.
 
 This repository is [Lyamc/vpncloud](https://github.com/Lyamc/vpncloud), a fork
 of [dswd/vpncloud](https://github.com/dswd/vpncloud). The fork adds **macOS**,
-**Windows**, **Android**, and **iOS (TUN only)** support plus protocol, config,
-and dependency fixes. Upstream documentation lives at
+**Windows**, **FreeBSD**, **Android**, and **iOS (TUN only)** support plus
+protocol, config, and dependency fixes. Upstream documentation lives at
 [vpncloud.ddswd.de](https://vpncloud.ddswd.de).
+
+Prebuilt **2.4.1** binaries are on
+[GitHub Releases](https://github.com/Lyamc/vpncloud/releases/tag/v2.4.1)
+(`SHA256SUMS` in the same release). Mesh protocol is compatible with 2.4.0
+peers.
 
 ```sh
 vpncloud -c REMOTE_HOST:PORT -p 'mypassword' --ip 10.0.0.1/24
@@ -62,8 +67,9 @@ Android, and iOS (TUN). It includes:
 
 Known limits: on macOS, TAP L2/ARP works but ICMP through `feth` is often
 lossy — prefer TUN there. Windows still needs `wintun.dll` (TUN) or
-tap-windows6 (TAP) installed, and a Windows build host or a working MinGW
-`cc` for `ring`.
+tap-windows6 (TAP) installed. The published **2.4.1 Linux** binary turns
+seccomp on by default; that build SIGSYS-kills `write()` — pass
+`--no-seccomp` (fixed on `master`).
 
 
 ### Platforms
@@ -133,11 +139,34 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 
 ### Installing
 
-Prerequisites: Rust/Cargo (edition 2021, toolchain 1.75+). On Linux, install
-`asciidoctor` if you want the man page. The `install` subcommand is compiled
-only with `--features installer`. AES-GCM can use AWS-LC instead of `ring`
-(`cargo build --release --features aws-lc`; needs cmake). Noise still uses
-`ring` via `snow`.
+Download a 2.4.1 binary from
+[GitHub Releases](https://github.com/Lyamc/vpncloud/releases/tag/v2.4.1)
+(checksums in `SHA256SUMS`):
+
+| File | Platform |
+|---|---|
+| `vpncloud-2.4.1-linux-x86_64` | Linux CLI, x86_64, static musl |
+| `vpncloud-2.4.1-linux-aarch64` | Linux CLI, ARM64, static musl |
+| `vpncloud-2.4.1-freebsd-x86_64` | FreeBSD CLI, x86_64 (FreeBSD 15 `libc.so.7`) |
+| `vpncloud-2.4.1-macos-universal` | macOS CLI, Intel + Apple silicon |
+| `vpncloud-gui-2.4.1-macos-universal` | macOS GUI |
+| `vpncloud-2.4.1-windows-x86_64.exe` | Windows CLI, x86_64 |
+| `vpncloud-2.4.1-windows-aarch64.exe` | Windows CLI, ARM64 |
+| `vpncloud-gui-2.4.1-windows-x86_64.exe` | Windows GUI, x86_64 |
+| `vpncloud-gui-2.4.1-windows-aarch64.exe` | Windows GUI, ARM64 |
+| `vpncloud-2.4.1-android-debug.apk` | Android, signed debug, arm64-v8a + armeabi-v7a |
+| `vpncloud-2.4.1-android-release-unsigned.apk` | Android, unsigned release |
+| `libvpncloud-2.4.1.xcframework.tar.gz` | iOS static lib (device + simulator arm64) |
+
+There is no Windows fat/universal PE and no FreeBSD ARM64 build. The Android
+release APK must be signed before distribution. The iOS artifact is an
+xcframework for a Packet Tunnel extension, not a signed IPA.
+
+To build from source: Rust/Cargo (edition 2021, toolchain 1.75+). On Linux,
+install `asciidoctor` if you want the man page. The `install` subcommand is
+compiled only with `--features installer`. AES-GCM can use AWS-LC instead of
+`ring` (`cargo build --release --features aws-lc`; needs cmake). Noise still
+uses `ring` via `snow`.
 
 ```sh
 git clone https://github.com/Lyamc/vpncloud.git
@@ -146,6 +175,16 @@ cargo test
 ```
 
 #### Linux
+
+Static musl binaries from the release run on most distributions (no glibc
+version pin). Example:
+
+```sh
+chmod +x vpncloud-2.4.1-linux-x86_64
+sudo ./vpncloud-2.4.1-linux-x86_64 --no-seccomp --help
+```
+
+Or build from source:
 
 ```sh
 cargo build --release --features installer
@@ -171,6 +210,9 @@ Debian/RPM packaging helpers live in `maskfile.md` (requires
 
 #### macOS
 
+Universal CLI/GUI binaries are on the GitHub release (`x86_64` + `arm64`).
+Or build from source:
+
 ```sh
 cargo build --release --features installer
 sudo ./target/release/vpncloud install
@@ -188,8 +230,9 @@ Uninstall: `sudo ./target/release/vpncloud install --uninstall`.
 
 #### FreeBSD
 
-Needs a FreeBSD host (or VM) with Rust. The `if_tuntap` module is in GENERIC
-on recent releases; otherwise `kldload if_tuntap`.
+The `if_tuntap` module is in GENERIC on recent releases; otherwise
+`kldload if_tuntap`. A prebuilt x86_64 binary is on the GitHub release
+(linked against FreeBSD 15 `libc.so.7`). To build on a FreeBSD host:
 
 ```sh
 pkg install rust
@@ -217,6 +260,12 @@ Windows has no in-box TUN/TAP. **TUN** needs [Wintun](https://www.wintun.net/)
 (`wintun.dll` next to `vpncloud.exe`). **TAP** needs the
 [tap-windows6](https://github.com/OpenVPN/tap-windows6) driver. Creating the
 virtual interface requires **Administrator**.
+
+Prebuilt `vpncloud-2.4.1-windows-x86_64.exe` and
+`vpncloud-2.4.1-windows-aarch64.exe` (plus GUI builds) are on the GitHub
+release. Put `wintun.dll` next to the exe for TUN.
+
+To build from source:
 
 1. Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
    with the **Desktop development with C++** workload. The GNU Rust toolchain
