@@ -11,6 +11,9 @@ use std::{
     str::FromStr
 };
 
+#[cfg(target_os = "android")]
+use std::process::Command;
+
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 
@@ -116,21 +119,164 @@ pub struct TunTapDevice {
     incoming: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>
 }
 
-pub fn android_tap_unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "TAP/L2 is not supported on Android. VpnService only provides a TUN (layer-3) interface."
-    )
+/// Shown in `--help` and in the error when TAP is requested without root.
+pub const ANDROID_TAP_HELP: &str = "\
+TAP/L2 on Android is only supported on rooted devices (needs /dev/net/tun). \
+Unrooted devices can only use TUN via VpnService. See --help.";
+
+pub fn android_tap_needs_root() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, ANDROID_TAP_HELP)
+}
+
+/// True if this process can open `/dev/net/tun` (uid 0, or chmod via `su`).
+#[cfg(target_os = "android")]
+pub fn android_has_tuntap_access() -> bool {
+    android_tun::has_access()
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn android_has_tuntap_access() -> bool {
+    false
+}
+
+#[cfg(target_os = "android")]
+mod android_tun {
+    use super::*;
+    use std::{
+        ffi::CString,
+        io::{Error, ErrorKind},
+        mem,
+        os::unix::io::RawFd
+    };
+
+    const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+    const IFF_TUN: libc::c_short = 0x0001;
+    const IFF_TAP: libc::c_short = 0x0002;
+    const IFF_NO_PI: libc::c_short = 0x1000;
+    const IFNAMSIZ: usize = 16;
+
+    pub fn has_access() -> bool {
+        if unsafe { libc::geteuid() } == 0 {
+            return true;
+        }
+        if open_dev().is_ok() {
+            return true;
+        }
+        let _ = Command::new("su").args(["-c", "chmod 666 /dev/net/tun"]).status();
+        open_dev().is_ok()
+    }
+
+    fn open_dev() -> io::Result<std::fs::File> {
+        std::fs::OpenOptions::new().read(true).write(true).open("/dev/net/tun")
+    }
+
+    pub fn create(ifname: &str, tap: bool, device_path: Option<&str>) -> io::Result<(SyncDevice, String)> {
+        if tap && !has_access() {
+            return Err(android_tap_needs_root());
+        }
+        if !tap && !has_access() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "cannot open /dev/net/tun; pass a VpnService TUN fd with --tun-fd, or run as root"
+            ));
+        }
+        let path = device_path.unwrap_or("/dev/net/tun");
+        let c_path = CString::new(path).map_err(|_| Error::new(ErrorKind::InvalidInput, "device path"))?;
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd < 0 {
+            let err = Error::last_os_error();
+            if tap {
+                return Err(Error::new(err.kind(), format!("{} ({})", ANDROID_TAP_HELP, err)));
+            }
+            return Err(err);
+        }
+        let mut req: libc::ifreq = unsafe { mem::zeroed() };
+        let flags = (if tap { IFF_TAP } else { IFF_TUN }) | IFF_NO_PI;
+        req.ifr_ifru.ifru_flags = flags;
+        let want = if ifname.is_empty() || ifname.contains('%') {
+            String::new()
+        } else {
+            ifname.to_string()
+        };
+        if !want.is_empty() {
+            let bytes = want.as_bytes();
+            let n = bytes.len().min(IFNAMSIZ - 1);
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const libc::c_char, req.ifr_name.as_mut_ptr(), n);
+            }
+        }
+        let rc = unsafe { libc::ioctl(fd, TUNSETIFF as _, &mut req as *mut _) };
+        if rc < 0 {
+            let err = Error::last_os_error();
+            unsafe { libc::close(fd) };
+            if tap {
+                return Err(Error::new(err.kind(), format!("TAP ioctl failed: {} ({})", err, ANDROID_TAP_HELP)));
+            }
+            return Err(err);
+        }
+        let actual = unsafe { std::ffi::CStr::from_ptr(req.ifr_name.as_ptr()) }.to_string_lossy().into_owned();
+        if tap {
+            let mut mac = rand::random::<[u8; 6]>();
+            mac[0] = (mac[0] & 0xfe) | 0x02;
+            let _ = set_mac(&actual, mac);
+        }
+        let device = unsafe { SyncDevice::from_fd(fd as RawFd) }?;
+        device.set_nonblocking(true)?;
+        Ok((device, actual))
+    }
+
+    fn set_mac(ifname: &str, mac: [u8; 6]) -> io::Result<()> {
+        // SIOCSIFHWADDR
+        const SIOCSIFHWADDR: libc::c_ulong = 0x8924;
+        const ARPHRD_ETHER: libc::c_ushort = 1;
+        let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if sock < 0 {
+            return Err(Error::last_os_error());
+        }
+        let mut req: libc::ifreq = unsafe { mem::zeroed() };
+        let bytes = ifname.as_bytes();
+        let n = bytes.len().min(IFNAMSIZ - 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const libc::c_char, req.ifr_name.as_mut_ptr(), n);
+            req.ifr_ifru.ifru_hwaddr.sa_family = ARPHRD_ETHER;
+            std::ptr::copy_nonoverlapping(mac.as_ptr(), req.ifr_ifru.ifru_hwaddr.sa_data.as_mut_ptr() as *mut u8, 6);
+        }
+        let rc = unsafe { libc::ioctl(sock, SIOCSIFHWADDR as _, &mut req as *mut _) };
+        unsafe { libc::close(sock) };
+        if rc < 0 {
+            Err(Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn run_ip(args: &[&str]) -> io::Result<()> {
+        let joined = args.join(" ");
+        let try_ip = Command::new("ip").args(args).status();
+        match try_ip {
+            Ok(s) if s.success() => return Ok(()),
+            _ => {}
+        }
+        let status = Command::new("su").args(["-c", &format!("ip {}", joined)]).status();
+        match status {
+            Ok(s) if s.success() => Ok(()),
+            Ok(s) => Err(Error::new(ErrorKind::Other, format!("ip {} failed: {:?}", joined, s.code()))),
+            Err(e) => Err(e)
+        }
+    }
 }
 
 impl TunTapDevice {
     /// Adopt a TUN file descriptor from Android `VpnService.Builder.establish()`.
     ///
-    /// The fd is owned by this device afterwards. TAP is rejected: the platform has no L2 API.
+    /// The fd is owned by this device afterwards. TAP cannot come from VpnService.
     #[cfg(unix)]
     pub fn from_tun_fd(fd: i32, type_: Type) -> io::Result<Self> {
         if type_ == Type::Tap {
-            return Err(android_tap_unsupported());
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TAP cannot use a VpnService TUN fd. TAP on Android requires a rooted device and opens /dev/net/tun. See --help."
+            ));
         }
         let device = unsafe { SyncDevice::from_fd(fd) }?;
         device.set_nonblocking(true)?;
@@ -153,14 +299,11 @@ impl TunTapDevice {
     pub fn new(ifname: &str, type_: Type, _device_path: Option<&str>) -> io::Result<Self> {
         #[cfg(target_os = "android")]
         {
-            let _ = ifname;
-            if type_ == Type::Tap {
-                return Err(android_tap_unsupported());
+            if type_ == Type::Tap && !android_tun::has_access() {
+                return Err(android_tap_needs_root());
             }
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Android cannot create a TUN device in-process. Pass a VpnService TUN fd with --tun-fd."
-            ));
+            let (device, actual) = android_tun::create(ifname, type_ == Type::Tap, _device_path)?;
+            return Ok(Self { device: std::sync::Arc::new(device), ifname: actual, type_ });
         }
         #[cfg(not(target_os = "android"))]
         {
@@ -225,15 +368,29 @@ impl TunTapDevice {
         let value = match value {
             Some(value) => value,
             None => {
-                // Leave headroom for VpnCloud encapsulation on top of the kernel MTU.
-                self.device.mtu().map(|m| (m as usize).saturating_sub(100).max(576)).unwrap_or(1400)
+                #[cfg(target_os = "android")]
+                {
+                    1400
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    // Leave headroom for VpnCloud encapsulation on top of the kernel MTU.
+                    self.device.mtu().map(|m| (m as usize).saturating_sub(100).max(576)).unwrap_or(1400)
+                }
             }
         };
 
         info!("Setting MTU {} on device {}", value, self.ifname);
-        self.device
-            .set_mtu(value as u16)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to set mtu: {}", e)))
+        #[cfg(target_os = "android")]
+        {
+            android_tun::run_ip(&["link", "set", "dev", &self.ifname, "mtu", &value.to_string()])
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            self.device
+                .set_mtu(value as u16)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to set mtu: {}", e)))
+        }
     }
 
     pub fn configure(&mut self, addr: Ipv4Addr, netmask: Ipv4Addr) -> io::Result<()> {
@@ -241,22 +398,42 @@ impl TunTapDevice {
     }
 
     pub fn configure_ip(&mut self, addr: IpAddr, netmask: Option<Ipv4Addr>, prefix_len: Option<u8>) -> io::Result<()> {
-        self.device.enabled(true).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Enable failed: {}", e)))?;
-        match addr {
-            IpAddr::V4(ip) => {
-                let netmask = netmask.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "IPv4 netmask required"))?;
-                self.device
-                    .set_network_address(ip, netmask, None)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Set address failed: {}", e)))?;
-            }
-            IpAddr::V6(ip) => {
-                let prefix = prefix_len.unwrap_or(64);
-                self.device
-                    .add_address_v6(ip, prefix)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Set IPv6 address failed: {}", e)))?;
+        #[cfg(target_os = "android")]
+        {
+            android_tun::run_ip(&["link", "set", "dev", &self.ifname, "up"])?;
+            match addr {
+                IpAddr::V4(ip) => {
+                    let prefix = prefix_len.unwrap_or_else(|| {
+                        netmask.map(|m| m.octets().iter().fold(0u8, |a, b| a + b.count_ones() as u8)).unwrap_or(24)
+                    });
+                    android_tun::run_ip(&["addr", "add", &format!("{}/{}", ip, prefix), "dev", &self.ifname])
+                }
+                IpAddr::V6(ip) => {
+                    let prefix = prefix_len.unwrap_or(64);
+                    android_tun::run_ip(&["addr", "add", &format!("{}/{}", ip, prefix), "dev", &self.ifname])
+                }
             }
         }
-        Ok(())
+        #[cfg(not(target_os = "android"))]
+        {
+            self.device.enabled(true).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Enable failed: {}", e)))?;
+            match addr {
+                IpAddr::V4(ip) => {
+                    let netmask =
+                        netmask.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "IPv4 netmask required"))?;
+                    self.device
+                        .set_network_address(ip, netmask, None)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Set address failed: {}", e)))?;
+                }
+                IpAddr::V6(ip) => {
+                    let prefix = prefix_len.unwrap_or(64);
+                    self.device
+                        .add_address_v6(ip, prefix)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Set IPv6 address failed: {}", e)))?;
+                }
+            }
+            Ok(())
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -576,10 +753,12 @@ mod tests {
     }
 
     #[test]
-    fn android_tap_is_unsupported() {
-        let err = android_tap_unsupported();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        assert!(err.to_string().contains("TUN"));
+    fn android_tap_error_tells_user_to_use_root_and_help() {
+        let err = android_tap_needs_root();
+        let msg = err.to_string();
+        assert!(msg.contains("rooted"), "{}", msg);
+        assert!(msg.contains("--help"), "{}", msg);
+        assert!(msg.contains("TUN") || msg.contains("tun"), "{}", msg);
     }
 
     #[cfg(unix)]

@@ -2,12 +2,16 @@
 <resources>
     <string name="app_name">VpnCloud</string>
     <string name="password">Password</string>
-    <string name="overlay_ip">Overlay IP (TUN)</string>
+    <string name="overlay_ip">Overlay IP</string>
     <string name="peer">Peer host:port</string>
     <string name="listen">Listen port</string>
+    <string name="device_type">Device type</string>
+    <string name="type_tun">TUN (all devices)</string>
+    <string name="type_tap">TAP (rooted only)</string>
     <string name="connect">Connect</string>
     <string name="disconnect">Disconnect</string>
-    <string name="tap_note">Android only supports TUN (layer 3). TAP/L2 is not available.</string>
+    <string name="tap_note">TUN works through VpnService on any device. TAP/L2 needs a rooted device with /dev/net/tun.</string>
+    <string name="tap_needs_root">TAP/L2 on Android is only supported on rooted devices (needs /dev/net/tun). Unrooted devices can only use TUN via VpnService. See --help.</string>
     <string name="notification_channel">VpnCloud</string>
     <string name="notification_text">Mesh VPN connected</string>
 </resources>

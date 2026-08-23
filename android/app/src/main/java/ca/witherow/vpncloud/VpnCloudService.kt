@@ -24,7 +24,12 @@ class VpnCloudService : VpnService() {
         val yaml = intent?.getStringExtra(EXTRA_YAML) ?: return START_NOT_STICKY
         val overlay = intent.getStringExtra(EXTRA_OVERLAY) ?: "10.0.0.2/24"
         val mtu = intent.getIntExtra(EXTRA_MTU, 1400)
-        startVpn(yaml, overlay, mtu)
+        val tap = intent.getBooleanExtra(EXTRA_TAP, false)
+        if (tap) {
+            startRootedTap(yaml)
+        } else {
+            startVpn(yaml, overlay, mtu)
+        }
         return START_STICKY
     }
 
@@ -36,6 +41,30 @@ class VpnCloudService : VpnService() {
     override fun onRevoke() {
         stopVpn()
         super.onRevoke()
+    }
+
+    private fun startRootedTap(yaml: String) {
+        if (running.getAndSet(true)) {
+            return
+        }
+        if (!NativeEngine.nativeIsRooted()) {
+            Log.e(TAG, "TAP requires a rooted device")
+            running.set(false)
+            stopSelf()
+            return
+        }
+        startForeground(NOTIF_ID, notification())
+        worker = thread(name = "vpncloud-native-tap") {
+            try {
+                NativeEngine.nativeStart(yaml, -1, this)
+            } catch (e: Throwable) {
+                Log.e(TAG, "nativeStart TAP failed", e)
+            } finally {
+                running.set(false)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
     }
 
     private fun startVpn(yaml: String, overlay: String, mtu: Int) {
@@ -108,6 +137,7 @@ class VpnCloudService : VpnService() {
         const val EXTRA_YAML = "yaml"
         const val EXTRA_OVERLAY = "overlay"
         const val EXTRA_MTU = "mtu"
+        const val EXTRA_TAP = "tap"
         private const val TAG = "VpnCloudService"
         private const val CHANNEL_ID = "vpncloud"
         private const val NOTIF_ID = 1

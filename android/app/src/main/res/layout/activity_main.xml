@@ -16,6 +16,32 @@
             android:text="@string/tap_note"
             android:textAppearance="?attr/textAppearanceBodyMedium" />
 
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/device_type" />
+
+        <RadioGroup
+            android:id="@+id/device_type"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:paddingBottom="8dp">
+
+            <RadioButton
+                android:id="@+id/type_tun"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:checked="true"
+                android:text="@string/type_tun" />
+
+            <RadioButton
+                android:id="@+id/type_tap"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/type_tap" />
+        </RadioGroup>
+
         <com.google.android.material.textfield.TextInputLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

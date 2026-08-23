@@ -21,6 +21,8 @@ vpncloud - Peer-to-peer VPN
 *-t <type>*, *--type <type>*::
   Set the type of network. There are two options: *tap* devices process
   Ethernet frames *tun* devices process IP packets. [default: *tun*]
+  On Android, *tap* is only supported on **rooted** devices (access to
+  */dev/net/tun*). Unrooted devices must use *tun* via VpnService.
 
 *-d <name>*, *--device <name>*::
   Name of the virtual device. Any *%d* will be filled with a free number.
@@ -32,7 +34,7 @@ vpncloud - Peer-to-peer VPN
 *--tun-fd <fd>*::
   Adopt an already-open TUN file descriptor instead of creating a device.
   Used on Android: the Java *VpnService* establishes the TUN and passes the
-  fd here. TAP/L2 is not available on Android.
+  fd here. Cannot be combined with *--type tap* (VpnService is TUN-only).
 
 *--fix-rp-filter*::
   If this option is set, VpnCloud will change the rp_filter settings to protect
@@ -714,23 +716,29 @@ websocket proxy (see *WEBSOCKET PROXY*).
 
 == ANDROID
 
-Android support is **TUN (layer 3) only**. The public *VpnService* API
-always creates a TUN interface: raw IP packets, no Ethernet header, no MAC,
-no ARP. TAP/L2, bridging, and VLAN switching are not possible on stock
-Android (see also Google issue 302924870).
+*tun* works on every device through *VpnService* (layer 3). *tap* (layer 2)
+is only supported on **rooted** devices that can open */dev/net/tun* with
+*IFF_TAP*. On an unrooted phone, *--type tap* fails with an error that points
+at *--help*.
 
-Use the host app in *android/* (or any *VpnService* wrapper):
-
+TUN (all devices)::
 . Request VPN permission via *VpnService.prepare*.
 . *Builder.addAddress* / *addRoute* for the overlay subnet only
   (do not add *0.0.0.0/0* unless you want a full-tunnel).
 . *establish()*, then *detachFd()* and pass the fd to the native library
-  (JNI *NativeEngine.nativeStart*, or *--tun-fd* for a command-line build).
+  (JNI *NativeEngine.nativeStart*, or *--tun-fd*).
 . *protect()* the VpnCloud UDP socket so mesh packets bypass the TUN.
 
-The overlay must match other **TUN** nodes (*--ip 10.0.0.2/24*). An Android
-node cannot join a TAP Ethernet mesh without a userspace Ethernet shim, which
-this project does not provide.
+TAP (rooted only)::
+  VpnCloud opens */dev/net/tun* itself (same driver as Linux). The process
+  must run as root or otherwise have rw access to that device (Magisk *su*
+  may *chmod 666 /dev/net/tun*). Do not pass a VpnService fd. Ethernet/ARP
+  work like Linux TAP; other apps still will not see a system VPN.
+
+Unrooted TAP::
+  Error: *TAP/L2 on Android is only supported on rooted devices (needs
+  /dev/net/tun). Unrooted devices can only use TUN via VpnService. See
+  --help.*
 
 
 == CONTAINERS (LXC / PROXMOX)

@@ -9,7 +9,7 @@ use super::{
 };
 pub use crate::crypto::Config as CryptoConfig;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use std::{cmp::max, collections::HashMap, ffi::OsStr, process, thread};
 
@@ -431,22 +431,33 @@ impl Config {
     }
 }
 
+const ANDROID_AFTER_HELP: &str = "\
+Android:
+  tun    Works on all devices through VpnService (--tun-fd).
+  tap    Only on rooted devices with /dev/net/tun. Unrooted TAP fails with an error; see --type.
+";
+
 #[derive(Parser, Debug, Default)]
-#[command(name = "vpncloud", disable_version_flag = true)]
+#[command(name = "vpncloud", disable_version_flag = true, after_help = ANDROID_AFTER_HELP)]
 pub struct Args {
     /// Read configuration options from the specified file.
     #[arg(long)]
     pub config: Option<String>,
 
     /// Set the type of network [possible values: tun, tap]
-    #[arg(short, long, value_name = "type")]
+    #[arg(
+        short,
+        long,
+        value_name = "type",
+        long_help = "Set the type of network: tun (IP packets) or tap (Ethernet frames).\n\nOn Android, tap is only supported on rooted devices (needs /dev/net/tun). Unrooted devices must use tun via VpnService."
+    )]
     pub type_: Option<Type>,
 
     /// Set the path of the base device
     #[arg(long)]
     pub device_path: Option<String>,
 
-    /// Adopt an existing TUN file descriptor (Android VpnService). TAP is not supported.
+    /// Adopt an existing TUN file descriptor (Android VpnService). Cannot be used with TAP.
     #[arg(long = "tun-fd")]
     pub tun_fd: Option<i32>,
 
@@ -966,4 +977,11 @@ peers:
         config.peers,
         vec!["172.16.0.1:3210".to_string(), "192.168.0.3:3210,172.16.0.3:3210".to_string()]
     );
+}
+
+#[test]
+fn clap_help_says_android_tap_needs_root() {
+    let help = Args::command().render_long_help().to_string();
+    assert!(help.to_lowercase().contains("rooted"), "{}", help);
+    assert!(help.contains("tun") || help.contains("TUN"), "{}", help);
 }

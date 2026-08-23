@@ -69,11 +69,11 @@ with sudo; `--ip` configures the address. Dual-stack UDP listen works
 `vpncloud.exe`). TAP uses [tap-windows6](https://github.com/OpenVPN/tap-windows6)
 (NdisWan / `tap0901`). Run as Administrator.
 
-**Android.** TUN only. `VpnService` cannot create a TAP/L2 device (no Ethernet,
-ARP, or bridging). The `android/` app asks for VPN permission, builds a TUN,
-passes the fd into Rust (`--tun-fd` / JNI), and calls `VpnService.protect()` on
-the UDP socket so the mesh does not hairpin. Join TUN peers (`--ip 10.0.0.x/24`);
-do not point Android at a TAP cloud.
+**Android.** TUN works on all devices through `VpnService` (`--tun-fd` / JNI,
+`protect()` so the UDP mesh does not hairpin). **TAP/L2 is rooted-only:** it
+opens `/dev/net/tun` with `IFF_TAP`. On an unrooted phone, `--type tap` errors
+and `--help` states that TAP needs root. The app shows the same message if you
+select TAP without `/dev/net/tun` access.
 
 ```sh
 rustup target add aarch64-linux-android armv7-linux-androideabi

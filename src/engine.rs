@@ -201,10 +201,15 @@ pub fn run_vpn(mut config: Config) {
     }
     #[cfg(target_os = "android")]
     if config.device_type == Type::Tap {
-        fail!(
-            "{}",
-            "TAP/L2 is not supported on Android. VpnService only provides a TUN (layer-3) interface."
-        );
+        if config.tun_fd.is_some() {
+            fail!(
+                "{}",
+                "TAP cannot use --tun-fd (VpnService is TUN-only). TAP on Android requires a rooted device. See --help."
+            );
+        }
+        if !crate::device::android_has_tuntap_access() {
+            fail!("{}", crate::device::ANDROID_TAP_HELP);
+        }
     }
     #[cfg(target_os = "android")]
     if config.listen.starts_with("ws://") || config.listen.starts_with("ws-listen://") {

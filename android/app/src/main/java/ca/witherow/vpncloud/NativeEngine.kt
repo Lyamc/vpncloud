@@ -12,4 +12,7 @@ object NativeEngine {
 
     @JvmStatic
     external fun nativeStop()
+
+    @JvmStatic
+    external fun nativeIsRooted(): Boolean
 }

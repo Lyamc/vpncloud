@@ -5,6 +5,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.widget.Button
+import android.widget.RadioButton
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -34,6 +35,15 @@ class MainActivity : AppCompatActivity() {
             findViewById<Button>(R.id.toggle).text = getString(R.string.connect)
             return
         }
+        val tap = findViewById<RadioButton>(R.id.type_tap).isChecked
+        if (tap) {
+            if (!NativeEngine.nativeIsRooted()) {
+                Toast.makeText(this, getString(R.string.tap_needs_root), Toast.LENGTH_LONG).show()
+                return
+            }
+            startVpn()
+            return
+        }
         val prepare = VpnService.prepare(this)
         if (prepare != null) {
             prepareVpn.launch(prepare)
@@ -51,13 +61,18 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Password is required", Toast.LENGTH_SHORT).show()
             return
         }
+        val tap = findViewById<RadioButton>(R.id.type_tap).isChecked
+        if (tap && !NativeEngine.nativeIsRooted()) {
+            Toast.makeText(this, getString(R.string.tap_needs_root), Toast.LENGTH_LONG).show()
+            return
+        }
         val yaml = buildString {
             appendLine("crypto:")
             appendLine("  password: \"${password.replace("\"", "\\\"")}\"")
             appendLine("ip: $overlay")
             appendLine("listen: $listen")
             appendLine("device:")
-            appendLine("  type: tun")
+            appendLine("  type: ${if (tap) "tap" else "tun"}")
             if (peer.isNotBlank()) {
                 appendLine("peers:")
                 appendLine("  - $peer")
@@ -66,6 +81,7 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(this, VpnCloudService::class.java)
             .putExtra(VpnCloudService.EXTRA_YAML, yaml)
             .putExtra(VpnCloudService.EXTRA_OVERLAY, overlay)
+            .putExtra(VpnCloudService.EXTRA_TAP, tap)
         if (Build.VERSION.SDK_INT >= 26) {
             startForegroundService(intent)
         } else {
