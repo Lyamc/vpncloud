@@ -44,14 +44,14 @@ for a commented YAML template, and `assets/example.toml.disabled` for TOML.
 
 ### Project status
 
-VpnCloud 2.4.0 on this fork is usable on Linux, macOS, Windows, Android, and
-iOS (TUN). It includes:
+VpnCloud 2.4.0 on this fork is usable on Linux, macOS, FreeBSD, Windows,
+Android, and iOS (TUN). It includes:
 
 * Automatic peer-to-peer meshing, no central servers
 * Automatic reconnect, including several addresses per peer (priority order)
 * TUN (IP) and TAP (Ethernet) virtual interfaces
-* Linux, macOS (`utun` / `feth`), Windows (Wintun / tap-windows6), Android TUN,
-  iOS TUN (Packet Tunnel Provider)
+* Linux, macOS (`utun` / `feth`), FreeBSD (`tun` / `tap`), Windows (Wintun /
+  tap-windows6), Android TUN, iOS TUN (Packet Tunnel Provider)
 * Strong end-to-end encryption (Curve25519, AES-128/256, ChaCha20, optional Noise_XX)
 * Hub / switch / router forwarding modes
 * NAT hole punching and UPnP port forwarding
@@ -76,6 +76,11 @@ unprivileged LXC/Proxmox, bind-mount `/dev/net` and allow cgroup device
 with sudo; `--ip` configures the address. Dual-stack UDP listen works
 (`--listen 3210` binds IPv4 and IPv6). `vpncloud install` (installer feature)
 registers a LaunchDaemon (`ca.witherow.vpncloud`).
+
+**FreeBSD.** TUN uses `tun(4)`, TAP uses `tap(4)` (both via tun-rs). Default
+`vpncloud%d` names are ignored; the kernel assigns `tunN` / `tapN`. Dual-stack
+UDP listen works (`IPV6_V6ONLY` is cleared). `vpncloud install` writes
+`/usr/local/bin/vpncloud`, `/usr/local/etc/vpncloud/`, and an rc.d script.
 
 **Windows.** TUN uses [Wintun](https://www.wintun.net/) (`wintun.dll` next to
 `vpncloud.exe`). TAP uses [tap-windows6](https://github.com/OpenVPN/tap-windows6)
@@ -175,6 +180,31 @@ Edit that config, then:
 
 ```sh
 sudo launchctl start ca.witherow.vpncloud
+```
+
+Uninstall: `sudo ./target/release/vpncloud install --uninstall`.
+
+#### FreeBSD
+
+Needs a FreeBSD host (or VM) with Rust. The `if_tuntap` module is in GENERIC
+on recent releases; otherwise `kldload if_tuntap`.
+
+```sh
+pkg install rust
+git clone https://github.com/Lyamc/vpncloud.git
+cd vpncloud
+cargo build --release --features installer
+sudo ./target/release/vpncloud install
+```
+
+Copies `/usr/local/bin/vpncloud`, writes `/usr/local/etc/vpncloud/`, and
+installs `/usr/local/etc/rc.d/vpncloud`. Edit
+`/usr/local/etc/vpncloud/vpncloud.yaml`, then:
+
+```sh
+sudo sysrc vpncloud_enable=YES
+sudo sysrc vpncloud_config=/usr/local/etc/vpncloud/vpncloud.yaml
+sudo service vpncloud start
 ```
 
 Uninstall: `sudo ./target/release/vpncloud install --uninstall`.

@@ -6,6 +6,7 @@
 
 #[cfg(unix)]
 pub use self::epoll::{EpollWait as WaitImpl, Pollable};
+// mio uses epoll on Linux and kqueue on macOS/FreeBSD.
 
 #[cfg(windows)] mod windows;
 

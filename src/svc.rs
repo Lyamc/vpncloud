@@ -21,8 +21,8 @@ use std::{
 };
 
 use service_manager::{
-    LaunchdServiceManager, RestartPolicy, ScServiceManager, ServiceInstallCtx, ServiceLabel, ServiceManager,
-    ServiceStartCtx, ServiceStopCtx, ServiceUninstallCtx, SystemdServiceManager, TypedServiceManager
+    LaunchdServiceManager, RcdServiceManager, RestartPolicy, ScServiceManager, ServiceInstallCtx, ServiceLabel,
+    ServiceManager, ServiceStartCtx, ServiceStopCtx, ServiceUninstallCtx, SystemdServiceManager, TypedServiceManager
 };
 
 use crate::error::Error;
@@ -31,6 +31,7 @@ pub const WIN_SERVICE: &str = "VpnCloud";
 pub const WIN_DISPLAY: &str = "VpnCloud P2P VPN";
 pub const WIN_DESC: &str = "Peer-to-peer mesh VPN over UDP.";
 pub const MAC_LABEL: &str = "ca.witherow.vpncloud";
+pub const BSD_LABEL: &str = "vpncloud";
 pub const LINUX_TEMPLATE: &str = "vpncloud@";
 pub const LINUX_WSPROXY: &str = "vpncloud-wsproxy";
 
@@ -157,6 +158,60 @@ pub fn uninstall_launchd() -> Result<(), Error> {
         .map_err(|e| map_err("Failed to uninstall LaunchDaemon", e))
 }
 
+fn rcd_script(program: &Path, config: &Path) -> String {
+    format!(
+        r#"#!/bin/sh
+#
+# PROVIDE: vpncloud
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="vpncloud"
+desc="Peer-to-peer VPN"
+rcvar="vpncloud_enable"
+
+load_rc_config $name
+
+: ${{vpncloud_enable:="NO"}}
+: ${{vpncloud_config="{config}"}}
+: ${{vpncloud_flags:=""}}
+
+pidfile="/var/run/${{name}}.pid"
+procname="{program}"
+command="/usr/sbin/daemon"
+command_args="-c -f -p ${{pidfile}} ${{procname}} --config ${{vpncloud_config}} ${{vpncloud_flags}}"
+
+vpncloud_prestart()
+{{
+	kldstat -q -m if_tuntap || kldstat -q -m if_tun || kldload if_tuntap || kldload if_tun || true
+}}
+start_precmd="vpncloud_prestart"
+
+run_rc_command "$1"
+"#,
+        program = program.display(),
+        config = config.display()
+    )
+}
+
+/// FreeBSD rc.d script under `/usr/local/etc/rc.d`. Does not enable or start the service.
+pub fn install_rcd(program: PathBuf, config: PathBuf) -> Result<(), Error> {
+    let mgr = RcdServiceManager::system();
+    let script = rcd_script(&program, &config);
+    let args = vec![OsString::from("--config"), config.into_os_string()];
+    mgr.install(ctx(BSD_LABEL, program, args, Some(script), false, never()))
+        .map_err(|e| map_err("Failed to install rc.d script", e))
+}
+
+pub fn uninstall_rcd() -> Result<(), Error> {
+    let mgr = RcdServiceManager::system();
+    let _ = mgr.uninstall(ServiceUninstallCtx { label: label(BSD_LABEL) });
+    let _ = std::fs::remove_file("/usr/local/etc/rc.d/vpncloud");
+    Ok(())
+}
+
 /// Windows `sc.exe` create/start/stop/delete. Display name and description are extra `sc` calls
 /// because the crate's `sc create` has no field for them. Uninstall first so reinstall works.
 pub fn install_windows(program: PathBuf, args: Vec<OsString>) -> Result<(), Error> {
@@ -212,6 +267,10 @@ pub fn native_kind_is_launchd() -> bool {
     TypedServiceManager::native().map(|m| m.is_launchd()).unwrap_or(false)
 }
 
+pub fn native_kind_is_rcd() -> bool {
+    TypedServiceManager::native().map(|m| m.is_rc_d()).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +291,26 @@ mod tests {
     fn macos_label_is_reverse_dns() {
         let l = label(MAC_LABEL);
         assert_eq!(l.to_qualified_name(), "ca.witherow.vpncloud");
+    }
+
+    #[test]
+    fn freebsd_label_is_bare_name() {
+        let l = label(BSD_LABEL);
+        assert_eq!(l.to_script_name(), "vpncloud");
+    }
+
+    #[test]
+    fn rcd_script_is_rc_subr() {
+        let script =
+            rcd_script(Path::new("/usr/local/bin/vpncloud"), Path::new("/usr/local/etc/vpncloud/vpncloud.yaml"));
+        assert!(script.contains("PROVIDE: vpncloud"));
+        assert!(script.contains("/etc/rc.subr"));
+        assert!(script.contains("vpncloud_enable"));
+        assert!(script.contains("/usr/sbin/daemon"));
+        assert!(script.contains("/usr/local/bin/vpncloud"));
+        assert!(script.contains("/usr/local/etc/vpncloud/vpncloud.yaml"));
+        assert!(script.contains("kldload if_tuntap"));
+        assert!(!script.contains("--daemon"));
     }
 
     #[test]
@@ -262,5 +341,13 @@ mod tests {
     fn native_manager_is_launchd_on_macos() {
         assert!(native_kind_is_launchd());
         assert!(!native_kind_is_systemd());
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn native_manager_is_rcd_on_freebsd() {
+        assert!(native_kind_is_rcd());
+        assert!(!native_kind_is_systemd());
+        assert!(!native_kind_is_launchd());
     }
 }

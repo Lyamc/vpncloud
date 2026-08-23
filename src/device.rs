@@ -18,7 +18,6 @@ use std::process::Command;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 
-
 use getifaddrs::getifaddrs;
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -61,7 +60,8 @@ impl FromStr for Type {
 /// Pick a tun-rs interface name for the current OS.
 ///
 /// Linux accepts `vpncloud%d` (kernel fills in the number). macOS TUN devices are always
-/// `utunN`; TAP uses `feth` pairs. Linux-style names are ignored there so the OS can assign one.
+/// `utunN`; TAP uses `feth` pairs. FreeBSD/other BSD TUN/TAP units are `tunN` / `tapN`;
+/// Linux-style names are ignored there so the OS can clone a free unit.
 #[cfg_attr(target_os = "ios", allow(dead_code))]
 fn platform_device_name(ifname: &str, type_: Type) -> Option<String> {
     if ifname.is_empty() {
@@ -79,6 +79,18 @@ fn platform_device_name(ifname: &str, type_: Type) -> Option<String> {
         }
         Some(ifname.to_string())
     }
+    #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))]
+    {
+        if ifname.contains('%') || ifname.starts_with("vpncloud") {
+            return None;
+        }
+        match type_ {
+            Type::Tun if !ifname.starts_with("tun") => return None,
+            Type::Tap if !ifname.starts_with("tap") => return None,
+            _ => {}
+        }
+        Some(ifname.to_string())
+    }
     #[cfg(target_os = "windows")]
     {
         let _ = type_;
@@ -90,7 +102,14 @@ fn platform_device_name(ifname: &str, type_: Type) -> Option<String> {
             Some(name)
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
     {
         let _ = type_;
         Some(ifname.to_string())
@@ -774,8 +793,25 @@ mod tests {
         assert_eq!(name, None);
         #[cfg(target_os = "windows")]
         assert_eq!(name.as_deref(), Some("vpncloud0"));
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))]
+        assert_eq!(name, None);
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        )))]
         assert_eq!(name.as_deref(), Some("vpncloud%d"));
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))]
+    #[test]
+    fn platform_name_bsd_uses_tun_tap_units() {
+        assert_eq!(platform_device_name("tun0", Type::Tun).as_deref(), Some("tun0"));
+        assert_eq!(platform_device_name("tap1", Type::Tap).as_deref(), Some("tap1"));
+        assert_eq!(platform_device_name("feth0", Type::Tap), None);
     }
 
     #[test]
@@ -818,6 +854,8 @@ mod tests {
         let mut dev = TunTapDevice::new("vpncloud%d", Type::Tun, None).expect("open tun");
         #[cfg(target_os = "macos")]
         assert!(dev.ifname().starts_with("utun"), "unexpected ifname {}", dev.ifname());
+        #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))]
+        assert!(dev.ifname().starts_with("tun"), "unexpected ifname {}", dev.ifname());
         dev.set_mtu(None).expect("set mtu");
         dev.configure(Ipv4Addr::new(10, 250, 0, 1), Ipv4Addr::new(255, 255, 255, 0)).expect("configure");
         assert_eq!(dev.address().unwrap(), Ipv4Addr::new(10, 250, 0, 1));

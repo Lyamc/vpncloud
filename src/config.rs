@@ -15,15 +15,49 @@ use std::{
     cmp::max,
     collections::HashMap,
     ffi::OsStr,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
-    process,
-    thread
+    process, thread
 };
 
 pub const DEFAULT_PEER_TIMEOUT: u16 = 300;
 pub const DEFAULT_PORT: u16 = 3210;
+
+/// System-wide config directory (`/usr/local/etc/vpncloud` on FreeBSD, `/etc/vpncloud` elsewhere).
+pub fn system_config_dir() -> &'static Path {
+    #[cfg(target_os = "freebsd")]
+    {
+        Path::new("/usr/local/etc/vpncloud")
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        Path::new("/etc/vpncloud")
+    }
+}
+
+/// System-wide binary path (`/usr/local/bin/vpncloud` on FreeBSD, `/usr/bin/vpncloud` elsewhere).
+pub fn system_bin_path() -> &'static Path {
+    #[cfg(target_os = "freebsd")]
+    {
+        Path::new("/usr/local/bin/vpncloud")
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        Path::new("/usr/bin/vpncloud")
+    }
+}
+
+/// System-wide man page path.
+pub fn system_man_path() -> &'static Path {
+    #[cfg(target_os = "freebsd")]
+    {
+        Path::new("/usr/local/share/man/man1/vpncloud.1.gz")
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        Path::new("/usr/share/man/man1/vpncloud.1.gz")
+    }
+}
 
 /// One configured peer: a single address, or several alternatives in priority order.
 ///
@@ -60,8 +94,7 @@ impl PeerAddr {
     }
 
     pub fn from_config_string(s: String) -> Self {
-        let parts: Vec<String> =
-            s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+        let parts: Vec<String> = s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
         if parts.len() > 1 {
             PeerAddr::Group(parts)
         } else {
@@ -543,7 +576,8 @@ pub struct Args {
     #[arg(short, long)]
     pub listen: Option<String>,
 
-    /// Address of a peer to connect to. Comma-separated addresses are tried in order as alternatives for the same peer.
+    /// Address of a peer to connect to. Comma-separated addresses are tried in order as alternatives for the same
+    /// peer.
     #[arg(short = 'c', long = "peer", alias = "connect")]
     pub peers: Vec<String>,
 
@@ -701,7 +735,8 @@ pub enum Command {
         #[arg(short, long)]
         name: Option<String>,
 
-        /// Path where the configuration file will be written/installed (overrides default /etc/vpncloud/<name>.net)
+        /// Path where the configuration file will be written/installed (overrides default
+        /// /etc/vpncloud/<name>.net, or /usr/local/etc/vpncloud/<name>.net on FreeBSD)
         /// Example: --config /etc/vpncloud/myvpn.net
         #[arg(long = "config")]
         config_file: Option<String>
@@ -919,20 +954,26 @@ pub fn parse_config_contents(raw: &str, format: ConfigFormat) -> Result<ConfigFi
 pub fn parse_config_auto(raw: &str) -> Result<ConfigFile, String> {
     match serde_norway::from_str(raw) {
         Ok(file) => Ok(file),
-        Err(yaml_err) => toml::from_str(raw)
-            .map_err(|toml_err| format!("not valid YAML ({}); not valid TOML ({})", yaml_err, toml_err))
+        Err(yaml_err) => {
+            toml::from_str(raw)
+                .map_err(|toml_err| format!("not valid YAML ({}); not valid TOML ({})", yaml_err, toml_err))
+        }
     }
 }
 
 /// Read and parse a config file. Resolves YAML-over-TOML siblings when `path` is missing.
 pub fn load_config_file(path: &Path) -> Result<(PathBuf, ConfigFile), crate::error::Error> {
     let resolved = resolve_config_path(path);
-    let raw = fs::read_to_string(&resolved).map_err(|e| crate::error::Error::FileIo("Failed to open config file", e))?;
+    let raw =
+        fs::read_to_string(&resolved).map_err(|e| crate::error::Error::FileIo("Failed to open config file", e))?;
     let format = config_format_from_path(&resolved);
     match parse_config_contents(&raw, format) {
         Ok(file) => Ok((resolved, file)),
         Err(err) => {
-            Err(crate::error::Error::FileIo("Failed to parse config file", io::Error::new(io::ErrorKind::InvalidData, err)))
+            Err(crate::error::Error::FileIo(
+                "Failed to parse config file",
+                io::Error::new(io::ErrorKind::InvalidData, err)
+            ))
         }
     }
 }
@@ -1060,7 +1101,7 @@ fn config_merge() {
         listen: None,
         peers: Some(vec![
             PeerAddr::Single("remote.machine.foo:3210".to_string()),
-            PeerAddr::Single("remote.machine.bar:3210".to_string())
+            PeerAddr::Single("remote.machine.bar:3210".to_string()),
         ]),
         peer_timeout: Some(600),
         keepalive: Some(840),
@@ -1204,10 +1245,7 @@ peers:
     );
     let mut config = Config::default();
     config.merge_file(file);
-    assert_eq!(
-        config.peers,
-        vec!["172.16.0.1:3210".to_string(), "192.168.0.3:3210,172.16.0.3:3210".to_string()]
-    );
+    assert_eq!(config.peers, vec!["172.16.0.1:3210".to_string(), "192.168.0.3:3210,172.16.0.3:3210".to_string()]);
 }
 
 #[test]
@@ -1328,4 +1366,20 @@ fn write_and_reload_toml() {
     let loaded = parse_config_contents(&raw, ConfigFormat::Toml).unwrap();
     assert_eq!(loaded.ip, file.ip);
     assert_eq!(loaded.crypto.password, file.crypto.password);
+}
+
+#[test]
+fn system_config_dir_is_os_default() {
+    #[cfg(target_os = "freebsd")]
+    {
+        assert_eq!(system_config_dir(), Path::new("/usr/local/etc/vpncloud"));
+        assert_eq!(system_bin_path(), Path::new("/usr/local/bin/vpncloud"));
+        assert_eq!(system_man_path(), Path::new("/usr/local/share/man/man1/vpncloud.1.gz"));
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        assert_eq!(system_config_dir(), Path::new("/etc/vpncloud"));
+        assert_eq!(system_bin_path(), Path::new("/usr/bin/vpncloud"));
+        assert_eq!(system_man_path(), Path::new("/usr/share/man/man1/vpncloud.1.gz"));
+    }
 }

@@ -30,7 +30,10 @@ vpncloud - Peer-to-peer VPN
   supported.
 
 *-d <name>*, *--device <name>*::
-  Name of the virtual device. Any *%d* will be filled with a free number.
+  Name of the virtual device. On Linux, any *%d* will be filled with a free
+  number. On macOS, TUN is *utunN* and TAP is *fethN*; Linux-style names are
+  ignored. On FreeBSD, TUN is *tunN* and TAP is *tapN*; Linux-style names are
+  ignored so the kernel can clone a free unit.
   [default: *vpncloud%d*]
 
 *--device-path <path>*::
@@ -306,6 +309,9 @@ subcommands.
   *systemctl enable --now vpncloud@<name>*.
   macOS: LaunchDaemon *ca.witherow.vpncloud* running
   */usr/bin/vpncloud --config /etc/vpncloud/vpncloud.yaml*.
+  FreeBSD: rc.d script */usr/local/etc/rc.d/vpncloud*, binary
+  */usr/local/bin/vpncloud*, config */usr/local/etc/vpncloud/vpncloud.yaml*.
+  Enable with *sysrc vpncloud_enable=YES* and *service vpncloud start*.
   Windows: optional tray / autostart / *--service* (see *service* above).
   *--uninstall* removes the installed files and service.
 

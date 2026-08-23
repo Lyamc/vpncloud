@@ -473,9 +473,9 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
     let name = if let Some(name) = name {
         name
     } else {
-        // Try to list existing networks from /etc/vpncloud; if directory doesn't exist treat as empty
+        // Try to list existing networks from the system config dir; if missing treat as empty
         let mut names = BTreeSet::new();
-        if let Ok(entries) = fs::read_dir("/etc/vpncloud") {
+        if let Ok(entries) = fs::read_dir(crate::config::system_config_dir()) {
             for file in entries {
                 if let Ok(entry) = file {
                     if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
@@ -498,12 +498,12 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
 
     // Resolve target path for config file:
     // - If user provided --config, use that path (YAML wins over TOML for the same stem)
-    // - Otherwise default to /etc/vpncloud/<name>.net, or an existing .yaml/.toml
+    // - Otherwise default to <system-config-dir>/<name>.net, or an existing .yaml/.toml
     use std::path::PathBuf;
     let mut file: PathBuf = if let Some(p) = config_path {
         resolve_config_path(Path::new(&p))
     } else {
-        let base = Path::new("/etc/vpncloud").join(&name);
+        let base = crate::config::system_config_dir().join(&name);
         let resolved = resolve_config_path(&base);
         if resolved.is_file() {
             resolved
@@ -515,7 +515,10 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
     // If file exists, attempt to read and merge it
     if file.exists() {
         let (_path, config_file) = load_config_file(&file).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse config file '{}': {}", file.display(), e))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse config file '{}': {}", file.display(), e)
+            )
         })?;
         config.merge_file(config_file);
     }
@@ -606,11 +609,34 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
                 println!();
                 println!("Configuration written to '{}'", file.display());
                 println!("Use the following commands to control your VPN:");
-                println!("  start the VPN:   sudo service vpncloud@{0} start", name);
-                println!("  stop the VPN:    sudo service vpncloud@{0} stop", name);
-                println!("  get the status:  sudo service vpncloud@{0} status", name);
-                println!("  add VPN to autostart:       sudo systemctl enable vpncloud@{0}", name);
-                println!("  remove VPN from autostart:  sudo systemctl disable vpncloud@{0}", name);
+                #[cfg(target_os = "freebsd")]
+                {
+                    println!("  start the VPN:   sudo service vpncloud start");
+                    println!("  stop the VPN:    sudo service vpncloud stop");
+                    println!("  get the status:  sudo service vpncloud status");
+                    println!("  add VPN to autostart:       sudo sysrc vpncloud_enable=YES");
+                    println!("  remove VPN from autostart:  sudo sysrc vpncloud_enable=NO");
+                    println!("  set config path:            sudo sysrc vpncloud_config={}", file.display());
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    println!("  start the VPN:   sudo launchctl start {}", crate::svc::MAC_LABEL);
+                    println!("  stop the VPN:    sudo launchctl stop {}", crate::svc::MAC_LABEL);
+                }
+                #[cfg(windows)]
+                {
+                    println!("  install service: vpncloud service install --config {} --start", file.display());
+                    println!("  start the VPN:   vpncloud service start");
+                    println!("  stop the VPN:    vpncloud service stop");
+                }
+                #[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
+                {
+                    println!("  start the VPN:   sudo service vpncloud@{0} start", name);
+                    println!("  stop the VPN:    sudo service vpncloud@{0} stop", name);
+                    println!("  get the status:  sudo service vpncloud@{0} status", name);
+                    println!("  add VPN to autostart:       sudo systemctl enable vpncloud@{0}", name);
+                    println!("  remove VPN from autostart:  sudo systemctl disable vpncloud@{0}", name);
+                }
             }
             Err(e) => {
                 // If permission denied, offer alternatives interactively
