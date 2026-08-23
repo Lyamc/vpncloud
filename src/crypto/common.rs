@@ -262,7 +262,7 @@ impl Crypto {
         Ok(keypair)
     }
 
-    fn date_expired(ymd: &str) -> bool {
+    pub(crate) fn date_expired(ymd: &str) -> bool {
         let Ok(parts) = ymd.split('-').map(|s| s.parse::<u32>()).collect::<Result<Vec<_>, _>>() else {
             return true;
         };

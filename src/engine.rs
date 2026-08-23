@@ -4,14 +4,13 @@
 
 use std::{
     fs::{self, File},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
     process,
     str::FromStr
 };
 
-#[cfg(unix)]
-use std::fs::Permissions;
+#[cfg(unix)] use std::fs::Permissions;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -19,6 +18,7 @@ use crate::{
     cloud::GenericCloud,
     config::{Config, DEFAULT_PORT},
     device::{Device, TunTapDevice, Type},
+    mesh::MeshSocket,
     net::Socket,
     payload,
     payload::Protocol,
@@ -42,11 +42,8 @@ pub fn parse_ip_netmask(addr: &str) -> Result<(IpAddr, Option<Ipv4Addr>, Option<
         if prefix_len > 32 {
             return Err(format!("Invalid prefix length: {}", prefix_len));
         }
-        let netmask = if prefix_len == 0 {
-            Ipv4Addr::UNSPECIFIED
-        } else {
-            Ipv4Addr::from(u32::MAX << (32 - prefix_len as u32))
-        };
+        let netmask =
+            if prefix_len == 0 { Ipv4Addr::UNSPECIFIED } else { Ipv4Addr::from(u32::MAX << (32 - prefix_len as u32)) };
         return Ok((IpAddr::V4(ip), Some(netmask), Some(prefix_len)));
     }
     if let Ok(ip) = Ipv6Addr::from_str(ip_str) {
@@ -84,11 +81,7 @@ fn run_script(script: &str, ifname: &str) {
 fn setup_device(config: &Config) -> TunTapDevice {
     let from_fd = config.tun_fd.is_some();
     let mut device = if let Some(fd) = config.tun_fd {
-        try_fail!(
-            TunTapDevice::from_tun_fd(fd, config.device_type),
-            "Failed to adopt TUN fd {}: {}",
-            fd
-        )
+        try_fail!(TunTapDevice::from_tun_fd(fd, config.device_type), "Failed to adopt TUN fd {}: {}", fd)
     } else {
         try_fail!(
             TunTapDevice::new(&config.device_name, config.device_type, config.device_path.as_ref().map(|s| s as &str)),
@@ -189,6 +182,9 @@ fn run<P: Protocol, S: Socket + Pollable>(config: Config, socket: S) {
     if config.daemonize || config.user.is_some() || config.group.is_some() {
         warn!("Daemonizing and privilege dropping are not supported on this platform.");
     }
+    if config.seccomp {
+        crate::seccomp::apply();
+    }
     cloud.run();
     if let Some(script) = config.ifdown {
         run_script(&script, cloud.ifname());
@@ -264,7 +260,8 @@ pub(crate) fn run_vpn_worker(config: Config) {
         }
         return;
     }
-    let socket = try_fail!(UdpSocket::listen(&config.listen), "Failed to open socket {}: {}", config.listen);
+    let socket =
+        try_fail!(MeshSocket::open(&config.listen, config.tcp_fallback), "Failed to open socket {}: {}", config.listen);
     match config.device_type {
         Type::Tap => run::<payload::Frame, _>(config, socket),
         Type::Tun => run::<payload::Packet, _>(config, socket)

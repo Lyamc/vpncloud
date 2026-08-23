@@ -5,6 +5,26 @@
 use super::common::*;
 
 #[test]
+fn switch_delivers_crypto_pool() {
+    let config = Config { device_type: Type::Tap, crypto_threads: 2, ..Config::default() };
+    let mut sim = TapSimulator::new();
+    let node1 = sim.add_node(false, &config);
+    let node2 = sim.add_node(false, &config);
+
+    sim.connect(node1, node2);
+    sim.simulate_all_messages();
+    assert!(sim.is_connected(node1, node2));
+    assert!(sim.is_connected(node2, node1));
+
+    let payload = vec![2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 2, 3, 4, 5];
+
+    sim.put_payload(node1, payload.clone());
+    sim.simulate_all_messages();
+
+    assert_eq!(Some(payload), sim.pop_payload(node2));
+}
+
+#[test]
 fn switch_delivers() {
     let config = Config { device_type: Type::Tap, ..Config::default() };
     let mut sim = TapSimulator::new();

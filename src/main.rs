@@ -3,6 +3,7 @@
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
 use clap::{CommandFactory, Parser};
+use ring::signature::KeyPair;
 
 use std::{
     fs::{self, File},
@@ -15,20 +16,18 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use vpncloud::{
-    config::{
-        config_format_from_path, load_config_file, write_config_file, Args, Command, Config, ConfigFormat
-    },
+    config::{config_format_from_path, load_config_file, write_config_file, Args, Command, Config, ConfigFormat},
     crypto::Crypto,
     engine::run_vpn,
-    oldconfig::OldConfigFile
+    oldconfig::OldConfigFile,
+    sign
 };
 
 #[cfg(feature = "installer")]
 use vpncloud::installer;
+#[cfg(feature = "wizard")] use vpncloud::wizard;
 #[cfg(feature = "websocket")]
 use vpncloud::wsproxy;
-#[cfg(feature = "wizard")]
-use vpncloud::wizard;
 
 struct DualLogger {
     file: Option<Mutex<File>>
@@ -79,6 +78,41 @@ impl log::Log for DualLogger {
     }
 }
 
+fn verify_loaded_config(config: &Config, raw: Option<&str>) -> Result<(), String> {
+    let signed = raw.and_then(sign::extract_signature);
+    if config.require_signed_config {
+        let raw = raw.ok_or(" --require-signed-config needs a --config file")?;
+        if signed.is_none() {
+            return Err("Config file is not signed (--require-signed-config)".into());
+        }
+        verify_signature(config, raw)
+    } else if let (Some(raw), Some(_)) = (raw, signed) {
+        verify_signature(config, raw)
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_signature(config: &Config, raw: &str) -> Result<(), String> {
+    let mut keys = config.crypto.trusted_keys.clone();
+    if let Some(ref pk) = config.crypto.public_key {
+        keys.push(pk.clone());
+    }
+    if keys.is_empty() {
+        if let Some(ref password) = config.crypto.password {
+            let seed = Crypto::password_seed(password, config.crypto.salt.as_deref(), config.crypto.kdf.as_deref())
+                .map_err(|e| format!("{}", e))?;
+            let pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed)
+                .map_err(|_| "Failed to derive signing key from password")?;
+            keys.push(vpncloud::util::to_base62(pair.public_key().as_ref()));
+        }
+    }
+    if keys.is_empty() {
+        return Err("No public key available to verify config signature".into());
+    }
+    sign::verify_config(raw, &keys).map_err(|e| format!("{}", e))
+}
+
 fn main() {
     let args: Args = Args::parse();
     if args.version {
@@ -109,6 +143,48 @@ fn main() {
                 println!(
                     "Attention: Keep the private key secret and use only the public key on other nodes to establish trust."
                 );
+            }
+            Command::SignConfig { config_file, private_key, password } => {
+                let path = Path::new(&config_file);
+                let raw = match fs::read_to_string(path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!("Failed to read {}: {}", config_file, e);
+                        return;
+                    }
+                };
+                let body = sign::canonical_body(&raw);
+                let parsed = load_config_file(path).ok().map(|(_, f)| f);
+                let privk = private_key.or_else(|| parsed.as_ref().and_then(|f| f.crypto.private_key.clone()));
+                let pw = password.or_else(|| parsed.as_ref().and_then(|f| f.crypto.password.clone()));
+                let sig = if let Some(ref key) = privk {
+                    sign::sign_body(&body, key)
+                } else if let Some(ref password) = pw {
+                    let salt = parsed.as_ref().and_then(|f| f.crypto.salt.as_deref());
+                    let kdf = parsed.as_ref().and_then(|f| f.crypto.kdf.as_deref());
+                    sign::sign_with_password(&body, password, salt, kdf)
+                } else {
+                    log::error!("sign-config needs --private-key or --password (or those fields in the file)");
+                    return;
+                };
+                let sig = match sig {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!("Failed to sign config: {}", e);
+                        return;
+                    }
+                };
+                let toml = config_format_from_path(path) == ConfigFormat::Toml;
+                let out = sign::append_signature_line(&raw, &sig, toml);
+                if let Err(e) = fs::write(path, out) {
+                    log::error!("Failed to write {}: {}", config_file, e);
+                    return;
+                }
+                #[cfg(unix)]
+                if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+                    log::error!("Failed to set permissions on file: {:?}", e);
+                }
+                log::info!("Signed {}", config_file);
             }
             Command::MigrateConfig { config_file } => {
                 log::info!("Trying to convert from old config format");
@@ -200,10 +276,12 @@ fn main() {
         return;
     }
     let mut config = Config::default();
+    let mut raw_config: Option<String> = None;
     if let Some(ref file) = args.config {
         match load_config_file(Path::new(file)) {
             Ok((path, config_file)) => {
                 log::info!("Reading config file '{}'", path.display());
+                raw_config = fs::read_to_string(&path).ok();
                 config.merge_file(config_file)
             }
             Err(err) => {
@@ -212,16 +290,18 @@ fn main() {
                 if config_format_from_path(&path) == ConfigFormat::Yaml {
                     log::info!("Trying to convert from old config format");
                     match fs::read_to_string(&path) {
-                        Ok(raw) => match serde_norway::from_str::<OldConfigFile>(&raw) {
-                            Ok(old) => {
-                                log::info!("Successfully converted from old format, please migrate your config using migrate-config");
-                                config.merge_file(old.convert())
+                        Ok(raw) => {
+                            match serde_norway::from_str::<OldConfigFile>(&raw) {
+                                Ok(old) => {
+                                    log::info!("Successfully converted from old format, please migrate your config using migrate-config");
+                                    config.merge_file(old.convert())
+                                }
+                                Err(e) => {
+                                    log::error!("Config file is neither version 2 nor version 1: {:?}", e);
+                                    return;
+                                }
                             }
-                            Err(e) => {
-                                log::error!("Config file is neither version 2 nor version 1: {:?}", e);
-                                return;
-                            }
-                        },
+                        }
                         Err(e) => {
                             log::error!("Failed to open config file: {:?}", e);
                             return;
@@ -236,6 +316,10 @@ fn main() {
     #[cfg(windows)]
     let as_service = args.service;
     config.merge_args(args);
+    if let Err(e) = verify_loaded_config(&config, raw_config.as_deref()) {
+        log::error!("{}", e);
+        return;
+    }
     log::debug!("Config: {:?}", config);
     if config.crypto.password.is_none() && config.crypto.private_key.is_none() {
         log::error!("Either password or private key must be set in config or given as parameter");

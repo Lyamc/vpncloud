@@ -152,7 +152,15 @@ pub struct Config {
     /// Max crypto-init packets per source IP per 10 seconds.
     pub init_rate_limit: u32,
     /// Overlay ACL entries (`allow:10.0.0.0/8`, `deny:0.0.0.0/0`). Empty = allow all.
-    pub acl: Vec<String>
+    pub acl: Vec<String>,
+    /// Listen/connect with length-prefixed TCP when UDP is blocked.
+    pub tcp_fallback: bool,
+    /// DATA encrypt/decrypt worker threads (0 = wait thread).
+    pub crypto_threads: usize,
+    /// Refuse config files that are not Ed25519-signed.
+    pub require_signed_config: bool,
+    /// Linux: install a seccomp blacklist after bind/TUN/privdrop.
+    pub seccomp: bool
 }
 
 impl Default for Config {
@@ -200,7 +208,11 @@ impl Default for Config {
             },
             lan_only: false,
             init_rate_limit: 20,
-            acl: vec![]
+            acl: vec![],
+            tcp_fallback: !cfg!(test),
+            crypto_threads: 0,
+            require_signed_config: false,
+            seccomp: !cfg!(test)
         }
     }
 }
@@ -341,6 +353,18 @@ impl Config {
         if let Some(val) = file.crypto.kdf {
             self.crypto.kdf = Some(val);
         }
+        if let Some(val) = file.tcp_fallback {
+            self.tcp_fallback = val;
+        }
+        if let Some(val) = file.crypto_threads {
+            self.crypto_threads = val;
+        }
+        if let Some(val) = file.require_signed_config {
+            self.require_signed_config = val;
+        }
+        if let Some(val) = file.seccomp {
+            self.seccomp = val;
+        }
     }
 
     pub fn merge_args(&mut self, mut args: Args) {
@@ -479,6 +503,24 @@ impl Config {
             self.init_rate_limit = val;
         }
         self.acl.append(&mut args.acl);
+        if args.tcp_fallback {
+            self.tcp_fallback = true;
+        }
+        if args.no_tcp_fallback {
+            self.tcp_fallback = false;
+        }
+        if let Some(val) = args.crypto_threads {
+            self.crypto_threads = val;
+        }
+        if args.require_signed_config {
+            self.require_signed_config = true;
+        }
+        if args.seccomp {
+            self.seccomp = true;
+        }
+        if args.no_seccomp {
+            self.seccomp = false;
+        }
     }
 
     pub fn into_config_file(self) -> ConfigFile {
@@ -522,7 +564,12 @@ impl Config {
             stun_servers: Some(self.stun_servers),
             lan_only: Some(self.lan_only),
             init_rate_limit: Some(self.init_rate_limit),
-            acl: if self.acl.is_empty() { None } else { Some(self.acl) }
+            acl: if self.acl.is_empty() { None } else { Some(self.acl) },
+            tcp_fallback: Some(self.tcp_fallback),
+            crypto_threads: Some(self.crypto_threads),
+            require_signed_config: Some(self.require_signed_config),
+            seccomp: Some(self.seccomp),
+            signature: None
         }
     }
 
@@ -780,6 +827,24 @@ pub struct Args {
     /// Overlay ACL `allow:CIDR` or `deny:CIDR` (last match wins)
     #[arg(long = "acl")]
     pub acl: Vec<String>,
+    /// Listen and connect with length-prefixed TCP as a UDP fallback
+    #[arg(long)]
+    pub tcp_fallback: bool,
+    /// Disable TCP fallback
+    #[arg(long, conflicts_with = "tcp_fallback")]
+    pub no_tcp_fallback: bool,
+    /// Worker threads for DATA encrypt/decrypt (0 = wait thread)
+    #[arg(long = "crypto-threads")]
+    pub crypto_threads: Option<usize>,
+    /// Refuse unsigned config files
+    #[arg(long = "require-signed-config")]
+    pub require_signed_config: bool,
+    /// Linux: install seccomp blacklist after bind/TUN
+    #[arg(long)]
+    pub seccomp: bool,
+    /// Do not install seccomp
+    #[arg(long, conflicts_with = "seccomp")]
+    pub no_seccomp: bool,
 
     #[command(subcommand)]
     pub cmd: Option<Command>
@@ -791,6 +856,20 @@ pub enum Command {
     #[command(name = "genkey", alias = "gen-key")]
     GenKey {
         /// The shared password to encrypt all traffic
+        #[arg(short, long, env = "PASSWORD")]
+        password: Option<String>
+    },
+
+    /// Sign a config file with Ed25519 (private key or password)
+    #[command(name = "sign-config", alias = "signconfig")]
+    SignConfig {
+        /// Config file to sign (rewritten in place)
+        #[arg(long = "config", short)]
+        config_file: String,
+        /// Private key (base62). Default: key from the config or `--password`.
+        #[arg(long)]
+        private_key: Option<String>,
+        /// Password used to derive the signing key
         #[arg(short, long, env = "PASSWORD")]
         password: Option<String>
     },
@@ -985,7 +1064,17 @@ pub struct ConfigFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_rate_limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub acl: Option<Vec<String>>
+    pub acl: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_fallback: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crypto_threads: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_signed_config: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seccomp: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>
 }
 
 /// Config file encoding. YAML covers `.yaml`, `.yml`, `.net`, and unknown extensions.

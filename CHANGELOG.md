@@ -12,6 +12,11 @@ This project follows [semantic versioning](http://semver.org).
 - [added] NAT-PMP mapping, claim metrics (`10.0.0.0/8@50`), ciphertext peer-relay
 - [added] 2 MiB UDP socket buffers and multi-packet socket drain
 - [added] Overlay ACLs (`--acl allow:10.0.0.0/8`) and `trusted-key` expiry (`key:YYYY-MM-DD`)
+- [added] Optional TCP fallback (`--tcp-fallback`) with length-prefixed datagrams on the mesh port
+- [added] Linux `recvmmsg`/`sendmmsg` batch I/O and UDP GSO (`UDP_SEGMENT`)
+- [added] Optional DATA crypto worker pool (`--crypto-threads N`)
+- [added] Ed25519 config signatures (`vpncloud sign-config`, `--require-signed-config`)
+- [added] Linux seccomp blacklist after bind/TUN/privdrop (`--seccomp` / `--no-seccomp`)
 
 ### v2.4.0 (2026-08-22)
 

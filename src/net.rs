@@ -9,6 +9,9 @@ use std::{
     sync::atomic::{AtomicBool, Ordering}
 };
 
+#[cfg(target_os = "linux")]
+use std::net::Ipv4Addr;
+
 #[cfg(unix)] use std::sync::Mutex;
 
 #[cfg(unix)]
@@ -67,6 +70,15 @@ pub trait Socket: AsRawFd + Sized {
     fn send(&mut self, data: &[u8], addr: SocketAddr) -> Result<usize, io::Error>;
     fn address(&self) -> Result<SocketAddr, io::Error>;
     fn create_port_forwarding(&self) -> Option<PortForwarding>;
+    fn connect_stream(&self, _addr: SocketAddr) -> io::Result<()> {
+        Ok(())
+    }
+    fn receive_batch(&mut self, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -> io::Result<usize> {
+        default_receive_batch(self, bufs, addrs)
+    }
+    fn send_batch(&mut self, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usize> {
+        default_send_batch(self, packets)
+    }
 }
 
 #[cfg(windows)]
@@ -76,6 +88,40 @@ pub trait Socket: AsRawSocket + Sized {
     fn send(&mut self, data: &[u8], addr: SocketAddr) -> Result<usize, io::Error>;
     fn address(&self) -> Result<SocketAddr, io::Error>;
     fn create_port_forwarding(&self) -> Option<PortForwarding>;
+    fn connect_stream(&self, _addr: SocketAddr) -> io::Result<()> {
+        Ok(())
+    }
+    fn receive_batch(&mut self, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -> io::Result<usize> {
+        default_receive_batch(self, bufs, addrs)
+    }
+    fn send_batch(&mut self, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usize> {
+        default_send_batch(self, packets)
+    }
+}
+
+fn default_receive_batch<S: Socket>(
+    sock: &mut S, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]
+) -> io::Result<usize> {
+    let max = bufs.len().min(addrs.len());
+    if max == 0 {
+        return Ok(0);
+    }
+    match sock.receive(&mut bufs[0]) {
+        Ok(a) => {
+            addrs[0] = a;
+            Ok(1)
+        }
+        Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
+        Err(e) => Err(e)
+    }
+}
+
+fn default_send_batch<S: Socket>(sock: &mut S, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usize> {
+    let mut n = 0;
+    for (addr, data) in packets {
+        n += sock.send(data, **addr)?;
+    }
+    Ok(n)
 }
 
 pub fn parse_listen(addr: &str, default_port: u16) -> SocketAddr {
@@ -151,6 +197,182 @@ impl Socket for UdpSocket {
 
     fn create_port_forwarding(&self) -> Option<PortForwarding> {
         PortForwarding::new(self.address().unwrap().port())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn receive_batch(&mut self, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -> io::Result<usize> {
+        linux_recvmmsg(self.as_raw_fd(), bufs, addrs)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn send_batch(&mut self, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usize> {
+        linux_sendmmsg(self.as_raw_fd(), packets)
+    }
+}
+
+#[cfg(target_os = "linux")]
+const UDP_SEGMENT: libc::c_int = 103;
+
+#[cfg(target_os = "linux")]
+fn linux_recvmmsg(fd: RawFd, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -> io::Result<usize> {
+    let n = bufs.len().min(addrs.len()).min(64);
+    if n == 0 {
+        return Ok(0);
+    }
+    let mut names = vec![unsafe { std::mem::zeroed::<libc::sockaddr_storage>() }; n];
+    let mut iov = Vec::with_capacity(n);
+    let mut hdrs = Vec::with_capacity(n);
+    for i in 0..n {
+        bufs[i].clear();
+        let buf = bufs[i].buffer();
+        iov.push(libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: buf.len() });
+    }
+    for i in 0..n {
+        hdrs.push(libc::mmsghdr {
+            msg_hdr: libc::msghdr {
+                msg_name: &mut names[i] as *mut _ as *mut _,
+                msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as u32,
+                msg_iov: &mut iov[i],
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0
+            },
+            msg_len: 0
+        });
+    }
+    let got = unsafe { libc::recvmmsg(fd, hdrs.as_mut_ptr(), n as u32, libc::MSG_DONTWAIT, std::ptr::null_mut()) };
+    if got < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let got = got as usize;
+    for i in 0..got {
+        bufs[i].set_length(hdrs[i].msg_len as usize);
+        addrs[i] = sockaddr_to_std(&names[i], hdrs[i].msg_hdr.msg_namelen)?;
+    }
+    Ok(got)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_sendmmsg(fd: RawFd, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usize> {
+    if packets.is_empty() {
+        return Ok(0);
+    }
+    // Same destination + same payload size: UDP GSO (one sendmsg, kernel segments).
+    if packets.len() > 1 {
+        let dest = packets[0].0;
+        let seg = packets[0].1.len();
+        if seg > 0 && seg <= 65507 && packets.iter().all(|(a, d)| *a == dest && d.len() == seg) {
+            if let Ok(n) = linux_gso_send(fd, dest, packets, seg) {
+                return Ok(n);
+            }
+        }
+    }
+    let n = packets.len().min(64);
+    let mut names = Vec::with_capacity(n);
+    let mut iov = Vec::with_capacity(n);
+    let mut hdrs = Vec::with_capacity(n);
+    for (addr, data) in packets.iter().take(n) {
+        names.push(std_to_sockaddr(**addr));
+        iov.push(libc::iovec { iov_base: data.as_ptr() as *mut _, iov_len: data.len() });
+    }
+    for i in 0..n {
+        hdrs.push(libc::mmsghdr {
+            msg_hdr: libc::msghdr {
+                msg_name: &mut names[i].0 as *mut _ as *mut _,
+                msg_namelen: names[i].1,
+                msg_iov: &mut iov[i],
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0
+            },
+            msg_len: 0
+        });
+    }
+    let got = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), n as u32, 0) };
+    if got < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(got as usize)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_gso_send(fd: RawFd, dest: &SocketAddr, packets: &[(&SocketAddr, &[u8])], seg: usize) -> io::Result<usize> {
+    let mut concat = Vec::with_capacity(seg * packets.len());
+    for (_, d) in packets {
+        concat.extend_from_slice(d);
+    }
+    let mut name = std_to_sockaddr(*dest);
+    let mut iov = libc::iovec { iov_base: concat.as_ptr() as *mut _, iov_len: concat.len() };
+    let mut cbuf = [0u8; 32];
+    let mut hdr = libc::msghdr {
+        msg_name: &mut name.0 as *mut _ as *mut _,
+        msg_namelen: name.1,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: cbuf.as_mut_ptr() as *mut _,
+        msg_controllen: unsafe { libc::CMSG_SPACE(2) } as _,
+        msg_flags: 0
+    };
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&hdr);
+        if cmsg.is_null() {
+            return Err(io::Error::from(ErrorKind::Other));
+        }
+        (*cmsg).cmsg_level = libc::IPPROTO_UDP;
+        (*cmsg).cmsg_type = UDP_SEGMENT;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(2) as _;
+        std::ptr::write(libc::CMSG_DATA(cmsg) as *mut u16, seg as u16);
+        let rc = libc::sendmsg(fd, &hdr, 0);
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(packets.len())
+}
+
+#[cfg(target_os = "linux")]
+fn sockaddr_to_std(ss: &libc::sockaddr_storage, len: u32) -> io::Result<SocketAddr> {
+    let _ = len;
+    unsafe {
+        match ss.ss_family as i32 {
+            libc::AF_INET => {
+                let sin = &*(ss as *const _ as *const libc::sockaddr_in);
+                let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                Ok(SocketAddr::from((ip, u16::from_be(sin.sin_port))))
+            }
+            libc::AF_INET6 => {
+                let sin6 = &*(ss as *const _ as *const libc::sockaddr_in6);
+                let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+                Ok(SocketAddr::from((ip, u16::from_be(sin6.sin6_port))))
+            }
+            _ => Err(io::Error::from(ErrorKind::InvalidInput))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn std_to_sockaddr(addr: SocketAddr) -> (libc::sockaddr_storage, u32) {
+    let addr = send_addr(addr);
+    unsafe {
+        let mut ss: libc::sockaddr_storage = std::mem::zeroed();
+        match addr {
+            SocketAddr::V4(v4) => {
+                let sin = &mut *(&mut ss as *mut _ as *mut libc::sockaddr_in);
+                sin.sin_family = libc::AF_INET as _;
+                sin.sin_port = v4.port().to_be();
+                sin.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+                (ss, std::mem::size_of::<libc::sockaddr_in>() as u32)
+            }
+            SocketAddr::V6(v6) => {
+                let sin6 = &mut *(&mut ss as *mut _ as *mut libc::sockaddr_in6);
+                sin6.sin6_family = libc::AF_INET6 as _;
+                sin6.sin6_port = v6.port().to_be();
+                sin6.sin6_addr.s6_addr = v6.ip().octets();
+                (ss, std::mem::size_of::<libc::sockaddr_in6>() as u32)
+            }
+        }
     }
 }
 
@@ -281,6 +503,36 @@ mod tests {
             }
         }
         panic!("did not receive IPv4 datagram on dual-stack socket");
+    }
+
+    #[test]
+    fn receive_batch_two_datagrams() {
+        let mut server = UdpSocket::listen("127.0.0.1:0").expect("listen");
+        let port = server.local_addr().expect("local_addr").port();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client bind");
+        client.send_to(b"one", ("127.0.0.1", port)).expect("send1");
+        client.send_to(b"two", ("127.0.0.1", port)).expect("send2");
+        let mut bufs = vec![MsgBuffer::new(0), MsgBuffer::new(0), MsgBuffer::new(0)];
+        let mut addrs = vec!["0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap()];
+        let mut msgs = Vec::new();
+        for _ in 0..50 {
+            match server.receive_batch(&mut bufs, &mut addrs) {
+                Ok(n) => {
+                    for i in 0..n {
+                        msgs.push(bufs[i].message().to_vec());
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => panic!("receive_batch: {e}")
+            }
+            if msgs.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(msgs.len() >= 2, "got {msgs:?}");
+        assert!(msgs.iter().any(|m| m == b"one"), "{msgs:?}");
+        assert!(msgs.iter().any(|m| m == b"two"), "{msgs:?}");
     }
 
     #[test]
