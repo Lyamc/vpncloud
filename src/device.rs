@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     fmt,
     io::{self},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr},
     str::FromStr
 };
 

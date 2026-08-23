@@ -2,11 +2,23 @@
 
 This project follows [semantic versioning](http://semver.org).
 
-### UNRELEASED
+### UNRELEASED (2.4.0 fork)
 
-- [changed] Changed Rust version to 1.75.0
-- [changed] Updated dependencies
-- [fixed] Fix error when IPv6 is not available
+- [added] macOS TUN (`utun`) and TAP (`feth` + BPF) via tun-rs
+- [added] Windows TUN (Wintun) and TAP (tap-windows6)
+- [added] Native websocket listen (`ws-listen://` / `ws://0.0.0.0:port`)
+- [added] Configurable device MTU (`--mtu`)
+- [added] Multiple addresses per peer with priority order
+- [added] IPv6 overlay addresses on `--ip` (e.g. `fd00:1::1/64`)
+- [added] Firewall, LXC/Proxmox, and IPv6 documentation
+- [changed] Updated dependencies (clap 4, serde_norway, igd-next, libc::daemon)
+- [changed] Unique TAP MAC on every node
+- [fixed] Dual-stack UDP listen on macOS (IPV6_V6ONLY)
+- [fixed] IPv6-only hosts no longer panic in `get_ip`
+- [fixed] Peer-list interval overflow, loopback crypto-init flood
+- [fixed] TUN vs TAP mismatch error message
+- [fixed] Republish addresses when the public IP changes
+- [fixed] Parse interface IPs without host-endian ioctl packing
 
 ### v2.3.0 (2021-12-23)
 

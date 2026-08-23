@@ -218,7 +218,9 @@ pub fn get_internal_ip() -> Ipv4Addr {
 /// Detach from the controlling terminal (Unix `--daemon`).
 ///
 /// Uses `libc::daemon` instead of the unmaintained `daemonize` crate (#394).
+/// `daemon(3)` is deprecated on macOS but still the portable POSIX helper.
 #[cfg(unix)]
+#[allow(deprecated)]
 pub fn unix_daemonize() -> io::Result<()> {
     // nochdir=0: chdir to /; noclose=0: redirect stdin/stdout/stderr to /dev/null.
     let rc = unsafe { libc::daemon(0, 0) };

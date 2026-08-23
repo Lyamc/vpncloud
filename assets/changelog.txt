@@ -1,3 +1,13 @@
+vpncloud (2.4.0) stable; urgency=medium
+
+ * [added] macOS and Windows TUN/TAP support
+ * [added] Native websocket listen
+ * [added] Configurable MTU, IPv6 --ip, multi-address peers
+ * [changed] Replaced unmaintained serde_yaml, igd, and daemonize crates
+ * [fixed] Dual-stack UDP, IPv6-only hosts, TAP MAC collisions
+
+ -- Lyam Witherow <lyam@witherow.ca>  Sat, 22 Aug 2026 16:30:00 -0600
+
 vpncloud (2.3.0) stable; urgency=medium
 
  * [added] Added build for armv5te (thanks to xek)
