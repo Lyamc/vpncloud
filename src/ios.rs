@@ -64,9 +64,9 @@ pub extern "C" fn vpncloud_start(yaml: *const c_char, tun_fd: c_int) -> c_int {
         return set_error("null config YAML");
     }
     let yaml = unsafe { CStr::from_ptr(yaml) }.to_string_lossy();
-    let file: crate::config::ConfigFile = match serde_norway::from_str(&yaml) {
+    let file: crate::config::ConfigFile = match crate::config::parse_config_auto(&yaml) {
         Ok(f) => f,
-        Err(e) => return set_error(&format!("config YAML: {}", e))
+        Err(e) => return set_error(&format!("config YAML/TOML: {}", e))
     };
     let mut config = Config::default();
     config.merge_file(file);

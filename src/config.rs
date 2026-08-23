@@ -11,7 +11,16 @@ pub use crate::crypto::Config as CryptoConfig;
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
-use std::{cmp::max, collections::HashMap, ffi::OsStr, process, thread};
+use std::{
+    cmp::max,
+    collections::HashMap,
+    ffi::OsStr,
+    fs,
+    io,
+    path::{Path, PathBuf},
+    process,
+    thread
+};
 
 pub const DEFAULT_PEER_TIMEOUT: u16 = 300;
 pub const DEFAULT_PORT: u16 = 3210;
@@ -25,6 +34,12 @@ pub const DEFAULT_PORT: u16 = 3210;
 ///   - 172.16.0.1:3210
 ///   - - 192.168.0.3:3210
 ///     - 172.16.0.3:3210
+/// ```
+///
+/// TOML:
+///
+/// ```toml
+/// peers = ["172.16.0.1:3210", ["192.168.0.3:3210", "172.16.0.3:3210"]]
 /// ```
 ///
 /// On the command line, alternatives are comma-separated:
@@ -456,8 +471,11 @@ iOS:
 #[derive(Parser, Debug, Default)]
 #[command(name = "vpncloud", disable_version_flag = true, after_help = PLATFORM_AFTER_HELP)]
 pub struct Args {
-    /// Read configuration options from the specified file.
-    #[arg(long)]
+    /// Read configuration options from a YAML or TOML file
+    #[arg(
+        long,
+        long_help = "Read configuration options from a YAML (.yaml, .yml, .net) or TOML (.toml) file.\nIf both YAML and TOML exist for the same name, YAML is used."
+    )]
     pub config: Option<String>,
 
     /// Set the type of network [possible values: tun, tap]
@@ -744,61 +762,192 @@ pub enum WindowsServiceAction {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
 pub struct ConfigFileDevice {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub type_: Option<Type>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fix_rp_filter: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mtu: Option<usize>
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
 pub struct ConfigFileBeacon {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub load: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub interval: Option<Duration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
 pub struct ConfigFileStatsd {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
 pub struct ConfigFile {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<ConfigFileDevice>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub advertise_addresses: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ifup: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ifdown: Option<String>,
 
     pub crypto: CryptoConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peers: Option<Vec<PeerAddr>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_timeout: Option<Duration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub keepalive: Option<Duration>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub beacon: Option<ConfigFileBeacon>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<Mode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub switch_timeout: Option<Duration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub claims: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_claim: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub port_forwarding: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pid_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stats_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub statsd: Option<ConfigFileStatsd>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hook: Option<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub hooks: HashMap<String, String>,
     /// Windows system tray icon
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tray: Option<bool>
+}
+
+/// Config file encoding. YAML covers `.yaml`, `.yml`, `.net`, and unknown extensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigFormat {
+    Yaml,
+    Toml
+}
+
+const YAML_EXTS: &[&str] = &["yaml", "yml", "net"];
+
+fn ext_lower(path: &Path) -> Option<String> {
+    path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase())
+}
+
+/// Format from the path extension. `.toml` is TOML; everything else is treated as YAML
+/// (including `.yaml`, `.yml`, `.net`, and `example.net.disabled`).
+pub fn config_format_from_path(path: &Path) -> ConfigFormat {
+    match ext_lower(path).as_deref() {
+        Some("toml") => ConfigFormat::Toml,
+        _ => ConfigFormat::Yaml
+    }
+}
+
+fn is_config_ext(ext: &str) -> bool {
+    matches!(ext, "yaml" | "yml" | "net" | "toml")
+}
+
+fn config_stem(path: &Path) -> PathBuf {
+    match ext_lower(path) {
+        Some(ext) if is_config_ext(&ext) => path.with_extension(""),
+        _ => path.to_path_buf()
+    }
+}
+
+/// Resolve `--config` / a default path to an existing file.
+///
+/// If `path` already exists, it is used as-is (explicit `.toml` stays TOML).
+/// Otherwise YAML siblings (`.yaml`, `.yml`, `.net`) are tried before `.toml`.
+/// When both YAML and TOML exist for the same name, YAML wins.
+pub fn resolve_config_path(path: &Path) -> PathBuf {
+    if path.is_file() {
+        return path.to_path_buf();
+    }
+    let stem = config_stem(path);
+    for ext in YAML_EXTS {
+        let candidate = stem.with_extension(ext);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    let toml_path = stem.with_extension("toml");
+    if toml_path.is_file() {
+        return toml_path;
+    }
+    path.to_path_buf()
+}
+
+pub fn parse_config_contents(raw: &str, format: ConfigFormat) -> Result<ConfigFile, String> {
+    match format {
+        ConfigFormat::Toml => toml::from_str(raw).map_err(|e| e.to_string()),
+        ConfigFormat::Yaml => serde_norway::from_str(raw).map_err(|e| e.to_string())
+    }
+}
+
+/// Parse a config blob of unknown type. YAML is tried first, then TOML.
+pub fn parse_config_auto(raw: &str) -> Result<ConfigFile, String> {
+    match serde_norway::from_str(raw) {
+        Ok(file) => Ok(file),
+        Err(yaml_err) => toml::from_str(raw)
+            .map_err(|toml_err| format!("not valid YAML ({}); not valid TOML ({})", yaml_err, toml_err))
+    }
+}
+
+/// Read and parse a config file. Resolves YAML-over-TOML siblings when `path` is missing.
+pub fn load_config_file(path: &Path) -> Result<(PathBuf, ConfigFile), crate::error::Error> {
+    let resolved = resolve_config_path(path);
+    let raw = fs::read_to_string(&resolved).map_err(|e| crate::error::Error::FileIo("Failed to open config file", e))?;
+    let format = config_format_from_path(&resolved);
+    match parse_config_contents(&raw, format) {
+        Ok(file) => Ok((resolved, file)),
+        Err(err) => {
+            Err(crate::error::Error::FileIo("Failed to parse config file", io::Error::new(io::ErrorKind::InvalidData, err)))
+        }
+    }
+}
+
+pub fn write_config_file(path: &Path, file: &ConfigFile) -> io::Result<()> {
+    match config_format_from_path(path) {
+        ConfigFormat::Toml => {
+            let body = toml::to_string_pretty(file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            fs::write(path, body)
+        }
+        ConfigFormat::Yaml => {
+            let fh = fs::File::create(path)?;
+            serde_norway::to_writer(fh, file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        }
+    }
 }
 
 #[test]
@@ -885,6 +1034,11 @@ statsd:
 #[test]
 fn parse_example_config() {
     serde_norway::from_str::<ConfigFile>(include_str!("../assets/example.net.disabled")).unwrap();
+}
+
+#[test]
+fn parse_example_config_toml() {
+    parse_config_contents(include_str!("../assets/example.toml.disabled"), ConfigFormat::Toml).unwrap();
 }
 
 #[test]
@@ -1080,4 +1234,98 @@ fn tray_yaml() {
     let mut config = Config::default();
     config.merge_file(file);
     assert!(config.tray);
+}
+
+#[test]
+fn parse_config_toml() {
+    let toml = r#"
+ip = "10.0.1.1/16"
+listen = "3210"
+peers = ["remote.machine.foo:3210", ["192.168.0.3:3210", "172.16.0.3:3210"]]
+peer-timeout = 600
+tray = true
+
+[device]
+type = "tun"
+name = "vpncloud%d"
+
+[crypto]
+password = "secret"
+"#;
+    let file = parse_config_contents(toml, ConfigFormat::Toml).unwrap();
+    assert_eq!(file.ip.as_deref(), Some("10.0.1.1/16"));
+    assert_eq!(file.listen.as_deref(), Some("3210"));
+    assert_eq!(file.peer_timeout, Some(600));
+    assert_eq!(file.tray, Some(true));
+    assert_eq!(file.device.as_ref().unwrap().type_, Some(Type::Tun));
+    assert_eq!(file.crypto.password.as_deref(), Some("secret"));
+    assert_eq!(
+        file.peers,
+        Some(vec![
+            PeerAddr::Single("remote.machine.foo:3210".to_string()),
+            PeerAddr::Group(vec!["192.168.0.3:3210".to_string(), "172.16.0.3:3210".to_string()])
+        ])
+    );
+}
+
+#[test]
+fn parse_config_auto_prefers_yaml() {
+    let yaml = "listen: yaml-port\n";
+    let file = parse_config_auto(yaml).unwrap();
+    assert_eq!(file.listen.as_deref(), Some("yaml-port"));
+}
+
+#[test]
+fn parse_config_auto_toml_fallback() {
+    let toml = "listen = \"toml-port\"\n";
+    let file = parse_config_auto(toml).unwrap();
+    assert_eq!(file.listen.as_deref(), Some("toml-port"));
+}
+
+#[test]
+fn yaml_wins_over_toml_when_both_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = dir.path().join("net.yaml");
+    let toml_path = dir.path().join("net.toml");
+    fs::write(&yaml, "listen: from-yaml\n").unwrap();
+    fs::write(&toml_path, "listen = \"from-toml\"\n").unwrap();
+
+    let by_stem = resolve_config_path(&dir.path().join("net"));
+    assert_eq!(by_stem, yaml);
+    let (path, file) = load_config_file(&dir.path().join("net")).unwrap();
+    assert_eq!(path, yaml);
+    assert_eq!(file.listen.as_deref(), Some("from-yaml"));
+
+    let by_yaml = resolve_config_path(&yaml);
+    assert_eq!(by_yaml, yaml);
+    let by_toml_explicit = resolve_config_path(&toml_path);
+    assert_eq!(by_toml_explicit, toml_path);
+}
+
+#[test]
+fn toml_used_when_yaml_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml_path = dir.path().join("net.toml");
+    fs::write(&toml_path, "listen = \"only-toml\"\n").unwrap();
+
+    let resolved = resolve_config_path(&dir.path().join("net.yaml"));
+    assert_eq!(resolved, toml_path);
+    let (path, file) = load_config_file(&dir.path().join("net")).unwrap();
+    assert_eq!(path, toml_path);
+    assert_eq!(file.listen.as_deref(), Some("only-toml"));
+}
+
+#[test]
+fn write_and_reload_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vpncloud.toml");
+    let mut file = ConfigFile::default();
+    file.ip = Some("10.0.0.1/24".into());
+    file.crypto.password = Some("pw".into());
+    write_config_file(&path, &file).unwrap();
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("10.0.0.1/24"), "{}", raw);
+    let loaded = parse_config_contents(&raw, ConfigFormat::Toml).unwrap();
+    assert_eq!(loaded.ip, file.ip);
+    assert_eq!(loaded.crypto.password, file.crypto.password);
 }

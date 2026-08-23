@@ -130,7 +130,7 @@ pub fn run(config: Config) -> Result<(), Error> {
 
 pub fn default_config_path() -> PathBuf {
     let program_data = env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
-    PathBuf::from(program_data).join("VpnCloud").join("vpncloud.yaml")
+    crate::config::resolve_config_path(&PathBuf::from(program_data).join("VpnCloud").join("vpncloud.yaml"))
 }
 
 pub fn default_log_path() -> PathBuf {

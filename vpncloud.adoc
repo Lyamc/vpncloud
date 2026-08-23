@@ -13,10 +13,13 @@ vpncloud - Peer-to-peer VPN
 == OPTIONS
 
 *--config <file>*::
-  Read configuration options from the specified file. Please see the section
-  *CONFIG FILES* for documentation on the file format.
+  Read configuration options from the specified file (YAML or TOML). Please
+  see the section *CONFIG FILES* for documentation on the file format.
   If the same option is defined in the config file and as a parameter, the
   parameter overrides the config file.
+  If both a YAML file (*.yaml*, *.yml*, *.net*) and a TOML file (*.toml*)
+  exist for the same name, the YAML file is used. An explicit path to an
+  existing *.toml* file is honored.
 
 *-t <type>*, *--type <type>*::
   Set the type of network. There are two options: *tap* devices process
@@ -406,9 +409,38 @@ side effects.
 
 == CONFIG FILES
 
-The config file is a YAML file that contains configuration values. All entries
-are optional and override the defaults. Please see the section *OPTIONS* for
-detailed descriptions of the options.
+The config file is YAML or TOML. All entries are optional and override the
+defaults. Please see the section *OPTIONS* for detailed descriptions of the
+options.
+
+Recognized extensions: *.yaml*, *.yml*, and *.net* (YAML); *.toml* (TOML).
+If `--config` names a file that does not exist, VpnCloud looks for the same
+stem with those extensions, YAML first. When both YAML and TOML files exist
+for the same stem, YAML is used.
+
+YAML example:
+
+----
+crypto:
+  password: mysecret
+ip: 10.0.0.1/24
+peers:
+  - REMOTE_HOST:PORT
+----
+
+TOML example:
+
+----
+ip = "10.0.0.1/24"
+peers = ["REMOTE_HOST:PORT"]
+
+[crypto]
+password = "mysecret"
+----
+
+Keys use kebab-case in both formats (*peer-timeout*, *private-key*). Nested
+peer address lists in TOML are arrays of arrays:
+`peers = ["host:3210", ["a:3210", "b:3210"]]`.
 
 *device*:: A key-value map with device settings
   *type*::: Set the type of network. Same as *--type*

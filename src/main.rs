@@ -15,7 +15,9 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use vpncloud::{
-    config::{Args, Command, Config},
+    config::{
+        config_format_from_path, load_config_file, write_config_file, Args, Command, Config, ConfigFormat
+    },
     crypto::Crypto,
     engine::run_vpn,
     oldconfig::OldConfigFile
@@ -132,20 +134,13 @@ fn main() {
                     return;
                 }
                 log::info!("Writing new config back into {}", config_file);
-                let f = match File::create(&config_file) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log::error!("Failed to open config file: {:?}", e);
-                        return;
-                    }
-                };
+                if let Err(e) = write_config_file(Path::new(&config_file), &new_config) {
+                    log::error!("Failed to write converted config: {:?}", e);
+                    return;
+                }
                 #[cfg(unix)]
                 if let Err(e) = fs::set_permissions(&config_file, fs::Permissions::from_mode(0o600)) {
                     log::error!("Failed to set permissions on file: {:?}", e);
-                    return;
-                }
-                if let Err(e) = serde_norway::to_writer(f, &new_config) {
-                    log::error!("Failed to write converted config: {:?}", e);
                 }
             }
             Command::Completion { shell } => {
@@ -206,39 +201,37 @@ fn main() {
     }
     let mut config = Config::default();
     if let Some(ref file) = args.config {
-        log::info!("Reading config file '{}'", file);
-        let f = match File::open(file) {
-            Ok(f) => f,
-            Err(e) => {
-                log::error!("Failed to open config file: {:?}", e);
-                return;
+        match load_config_file(Path::new(file)) {
+            Ok((path, config_file)) => {
+                log::info!("Reading config file '{}'", path.display());
+                config.merge_file(config_file)
             }
-        };
-        let config_file = match serde_norway::from_reader(f) {
-            Ok(config) => config,
             Err(err) => {
                 log::error!("Failed to read config file: {}", err);
-                log::info!("Trying to convert from old config format");
-                let f = match File::open(file) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log::error!("Failed to open config file: {:?}", e);
-                        return;
+                let path = vpncloud::config::resolve_config_path(Path::new(file));
+                if config_format_from_path(&path) == ConfigFormat::Yaml {
+                    log::info!("Trying to convert from old config format");
+                    match fs::read_to_string(&path) {
+                        Ok(raw) => match serde_norway::from_str::<OldConfigFile>(&raw) {
+                            Ok(old) => {
+                                log::info!("Successfully converted from old format, please migrate your config using migrate-config");
+                                config.merge_file(old.convert())
+                            }
+                            Err(e) => {
+                                log::error!("Config file is neither version 2 nor version 1: {:?}", e);
+                                return;
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("Failed to open config file: {:?}", e);
+                            return;
+                        }
                     }
-                };
-                match serde_norway::from_reader::<_, OldConfigFile>(f) {
-                    Ok(old) => {
-                        log::info!("Successfully converted from old format, please migrate your config using migrate-config");
-                        old.convert()
-                    }
-                    Err(e) => {
-                        log::error!("Config file is neither version 2 nor version 1: {:?}", e);
-                        return;
-                    }
+                } else {
+                    return;
                 }
             }
-        };
-        config.merge_file(config_file)
+        }
     }
     #[cfg(windows)]
     let as_service = args.service;

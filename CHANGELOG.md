@@ -2,7 +2,7 @@
 
 This project follows [semantic versioning](http://semver.org).
 
-### UNRELEASED (2.4.0 fork)
+### v2.4.0 (2026-08-22)
 
 - [added] macOS TUN (`utun`) and TAP (`feth` + BPF) via tun-rs
 - [added] Windows TUN (Wintun) and TAP (tap-windows6)
@@ -16,6 +16,7 @@ This project follows [semantic versioning](http://semver.org).
 - [added] Multiple addresses per peer with priority order
 - [added] IPv6 overlay addresses on `--ip` (e.g. `fd00:1::1/64`)
 - [added] Firewall, LXC/Proxmox, and IPv6 documentation
+- [added] TOML config files (`.toml`); YAML still wins if both exist for the same name
 - [changed] Updated dependencies (clap 4, serde_norway, igd-next, libc::daemon)
 - [changed] Unique TAP MAC on every node
 - [fixed] Dual-stack UDP listen on macOS (IPV6_V6ONLY)
