@@ -4,7 +4,7 @@ This project follows [semantic versioning](http://semver.org).
 
 ### UNRELEASED
 
-- [added] Windows NSIS installer and portable zip (CLI + GUI + official Wintun 0.14.1). TAP (tap-windows6) is still a separate OpenVPN driver.
+- [added] Windows NSIS installer and portable zip (CLI + GUI + official Wintun 0.14.1). Optional TAP component downloads OpenVPN's tap-windows6 installer at install time (not shipped).
 
 ### v2.4.3 (2026-08-23)
 

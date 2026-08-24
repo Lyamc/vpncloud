@@ -86,7 +86,8 @@ Android, and iOS (TUN). It includes:
 
 Known limits: on macOS, TAP L2/ARP works but ICMP through `feth` is often
 lossy — prefer TUN there. Windows TUN needs `wintun.dll` (bundled in the
-setup.exe / portable zip). TAP still needs tap-windows6 from OpenVPN.
+setup.exe / portable zip). TAP can be downloaded by the NSIS setup from
+OpenVPN (not shipped).
 
 
 ### Platforms
@@ -111,8 +112,9 @@ UDP listen works (`IPV6_V6ONLY` is cleared). `vpncloud install` writes
 portable zip: both ship `vpncloud.exe`, `vpncloud-gui.exe`, and the official
 [Wintun](https://www.wintun.net/) 0.14.1 DLL for TUN. TAP uses
 [tap-windows6](https://github.com/OpenVPN/tap-windows6) (NdisWan / `tap0901`)
-and is **not** bundled (signed kernel driver). Run as Administrator to create
-the adapter. See *Installing* below. Optional system tray (Enable / Disable /
+and is **not** bundled (signed OpenVPN kernel driver). The NSIS setup can
+download that installer from OpenVPN at install time (optional checkbox).
+Run as Administrator to create the adapter. See *Installing* below. Optional system tray (Enable / Disable /
 Exit) is offered at `vpncloud install` (build with `--features installer`) or
 `vpncloud.exe --tray`. Unattended: `vpncloud install --tray` / `--no-tray` /
 `--autostart`. `vpncloud install` copies `wintun.dll` when it sits next to the
@@ -291,8 +293,10 @@ The GitHub release has an NSIS installer and a portable zip per architecture
 (`vpncloud-2.4.3-windows-x86_64-setup.exe` / `.zip`, and the ARM64 pair). Both
 include `vpncloud.exe`, `vpncloud-gui.exe`, and the official Wintun 0.14.1 DLL
 plus its license. The setup.exe writes `C:\Program Files\VpnCloud`, Start Menu
-shortcuts, an uninstaller, and optionally PATH and a LocalSystem service.
-Rebuild those artifacts with `./contrib/windows/package.sh` (needs `makensis`).
+shortcuts, an uninstaller, and optionally PATH, a LocalSystem service, and a
+download of OpenVPN's tap-windows6 installer (TAP/L2; SHA-256 verified; not
+shipped in the setup). Rebuild with `./contrib/windows/package.sh` (needs
+`makensis`).
 
 Standalone `vpncloud-2.4.3-windows-*.exe` CLI/GUI builds are still published;
 put `wintun.dll` next to the CLI for TUN if you are not using the installer.
@@ -323,9 +327,13 @@ copy path\to\wintun\bin\amd64\wintun.dll target\release\
 
 Without `wintun.dll`, TUN fails at startup with `LoadLibraryExW failed`.
 
-4. Optional TAP: install a tap-windows6 release from
+4. Optional TAP: tick **TAP driver** in the NSIS setup (downloads OpenVPN
+   `tap-windows-9.24.7-I601-Win10.exe`, verifies SHA-256, runs their wizard)
+   or install tap-windows6 from
    [OpenVPN downloads](https://build.openvpn.net/downloads/releases/)
-   (hardware id `tap0901` / NdisWan).
+   (hardware id `tap0901` / NdisWan). ARM64 has no standalone TAP `.exe`; the
+   setup opens the [9.27.0 GitHub release](https://github.com/OpenVPN/tap-windows6/releases/tag/9.27.0)
+   instead. Uninstalling VpnCloud does not remove TAP.
 
 5. Install (copies the exe, `wintun.dll` if present, an example config, and a
    Start Menu shortcut). User-level files go to `%LOCALAPPDATA%\VpnCloud`

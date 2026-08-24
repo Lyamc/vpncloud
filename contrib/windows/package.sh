@@ -7,7 +7,8 @@
 #   ./contrib/windows/package.sh aarch64
 #
 # Bundles the official Wintun 0.14.1 DLL (TUN). TAP (tap-windows6) is not
-# included: it is a signed kernel driver from OpenVPN.
+# shipped: the NSIS setup can download OpenVPN's signed installer at
+# install time (optional, unchecked).
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$ROOT"
@@ -57,8 +58,10 @@ TUN is the default device type. Creating the adapter needs Administrator.
 
 Or use the GUI. Keep wintun.dll next to vpncloud.exe.
 
-TAP (layer-2) is optional and is NOT included. Install tap-windows6 from
-OpenVPN (hardware id tap0901 / NdisWan), then:
+TAP (layer-2) is optional and is NOT shipped. The setup.exe can download
+OpenVPN's tap-windows6 installer (9.24.7-I601, SHA-256 verified) when you
+tick "TAP driver". Or install tap-windows6 yourself (hardware id tap0901),
+then:
 
   vpncloud.exe --type tap --ip 10.0.0.2/24 -c HOST:3210 -p PASS
 
