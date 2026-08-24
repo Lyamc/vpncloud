@@ -43,6 +43,7 @@ pub mod payload;
 pub mod poll;
 pub mod port_forwarding;
 pub mod rate_limit;
+pub mod runtime_status;
 pub mod seccomp;
 pub mod sign;
 pub mod stun;

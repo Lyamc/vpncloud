@@ -23,7 +23,8 @@ use crate::{
     },
     device::Type,
     engine::run_vpn,
-    util::CtrlC
+    runtime_status,
+    util::{Bytes, CtrlC}
 };
 
 #[derive(Debug, Clone)]
@@ -50,6 +51,9 @@ pub struct Gui {
     tap: bool,
     config_path: String,
     status: String,
+    sent_bytes: u64,
+    recv_bytes: u64,
+    last_handshake_unix: i64,
     worker: Option<JoinHandle<()>>
 }
 
@@ -63,6 +67,9 @@ impl Default for Gui {
             tap: false,
             config_path: default_config_path().display().to_string(),
             status: "Disconnected".into(),
+            sent_bytes: 0,
+            recv_bytes: 0,
+            last_handshake_unix: 0,
             worker: None
         };
         if Path::new(&gui.config_path).is_file() {
@@ -93,6 +100,26 @@ fn theme(_: &Gui) -> Theme {
     Theme::Dark
 }
 
+fn format_handshake(unix: i64) -> String {
+    if unix <= 0 {
+        return "never".into();
+    }
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(unix);
+    let ago = (now - unix).max(0);
+    if ago < 5 {
+        "just now".into()
+    } else if ago < 60 {
+        format!("{}s ago", ago)
+    } else if ago < 3600 {
+        format!("{}m ago", ago / 60)
+    } else if ago < 86400 {
+        format!("{}h ago", ago / 3600)
+    } else {
+        format!("{}d ago", ago / 86400)
+    }
+}
+
 fn later_tick() -> Task<Message> {
     Task::perform(
         async {
@@ -106,7 +133,7 @@ pub fn run() -> iced::Result {
     iced::application(Gui::default, update, view)
         .title(title)
         .theme(theme)
-        .window_size(iced::Size::new(460.0, 620.0))
+        .window_size(iced::Size::new(460.0, 700.0))
         .antialiasing(false)
         .run()
 }
@@ -161,6 +188,10 @@ fn update(gui: &mut Gui, message: Message) -> Task<Message> {
                     if !CtrlC::is_paused() {
                         gui.status = "Connected".into();
                     }
+                    let snap = runtime_status::snapshot();
+                    gui.sent_bytes = snap.sent_bytes;
+                    gui.recv_bytes = snap.recv_bytes;
+                    gui.last_handshake_unix = snap.last_handshake_unix;
                     return later_tick();
                 }
             }
@@ -196,6 +227,9 @@ fn view(gui: &Gui) -> Element<'_, Message> {
         .spacing(8),
         checkbox(connected && CtrlC::is_paused()).label("Pause forwarding").on_toggle(|_| Message::TogglePause),
         text(&gui.status).size(14),
+        text(format!("Sent: {}", Bytes(gui.sent_bytes))).size(14),
+        text(format!("Received: {}", Bytes(gui.recv_bytes))).size(14),
+        text(format!("Last handshake: {}", format_handshake(gui.last_handshake_unix))).size(14),
     ]
     .spacing(6)
     .padding(16)
@@ -224,6 +258,10 @@ fn connect(gui: &mut Gui) {
         }
     };
     CtrlC::clear_stop();
+    runtime_status::reset();
+    gui.sent_bytes = 0;
+    gui.recv_bytes = 0;
+    gui.last_handshake_unix = 0;
     crate::util::set_fail_panics(true);
     gui.status = "Connecting…".into();
     gui.worker = Some(
@@ -348,9 +386,7 @@ fn default_config_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = env::var_os("HOME") {
-            return resolve_config_path(
-                &PathBuf::from(home).join("Library/Application Support/VpnCloud/vpncloud.yaml")
-            );
+            return resolve_config_path(&PathBuf::from(home).join("Library/Application Support/VpnCloud/vpncloud.yaml"));
         }
     }
     #[cfg(not(any(windows, target_os = "macos")))]

@@ -968,6 +968,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
 
     fn add_new_peer(&mut self, addr: SocketAddr, info: NodeInfo) -> Result<(), Error> {
         info!("Added peer {}", addr_nice(addr));
+        crate::runtime_status::note_handshake();
         self.config.call_hook(
             "peer_connected",
             vec![

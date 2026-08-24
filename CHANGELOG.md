@@ -4,6 +4,11 @@ This project follows [semantic versioning](http://semver.org).
 
 ### UNRELEASED
 
+### v2.4.3 (2026-08-23)
+
+- [added] GUI shows Sent / Received mesh bytes and last handshake time
+- Mesh protocol remains compatible with 2.4.0 / 2.4.1 / 2.4.2 peers
+
 ### v2.4.2 (2026-08-23)
 
 - [fixed] Linux seccomp arch check was inverted (SIGSYS on `write()`); 2.4.1 Linux binaries needed `--no-seccomp`

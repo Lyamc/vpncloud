@@ -95,12 +95,14 @@ impl TrafficStats {
     pub fn count_out_traffic(&mut self, peer: SocketAddr, bytes: usize) {
         // HOT PATH
         self.peers.entry(peer).or_default().count_out(bytes);
+        crate::runtime_status::add_sent(bytes);
     }
 
     #[inline]
     pub fn count_in_traffic(&mut self, peer: SocketAddr, bytes: usize) {
         // HOT PATH
         self.peers.entry(peer).or_default().count_in(bytes);
+        crate::runtime_status::add_recv(bytes);
     }
 
     pub fn set_track_payload(&mut self, on: bool) {

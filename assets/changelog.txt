@@ -1,3 +1,10 @@
+vpncloud (2.4.3) stable; urgency=medium
+
+ * [added] GUI Sent / Received mesh bytes and last handshake time
+ * Mesh protocol remains compatible with 2.4.0 / 2.4.1 / 2.4.2 peers
+
+ -- Lyam Witherow <lyam@witherow.ca>  Sun, 23 Aug 2026 22:19:00 -0600
+
 vpncloud (2.4.2) stable; urgency=medium
 
  * [fixed] Linux seccomp arch check (2.4.1 needed --no-seccomp)

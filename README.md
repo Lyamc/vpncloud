@@ -14,8 +14,8 @@ of [dswd/vpncloud](https://github.com/dswd/vpncloud). The fork adds **macOS**,
 protocol, config, and dependency fixes. Upstream documentation lives at
 [vpncloud.ddswd.de](https://vpncloud.ddswd.de).
 
-Prebuilt **2.4.2** binaries are on
-[GitHub Releases](https://github.com/Lyamc/vpncloud/releases/tag/v2.4.2)
+Prebuilt **2.4.3** binaries are on
+[GitHub Releases](https://github.com/Lyamc/vpncloud/releases/tag/v2.4.3)
 (`SHA256SUMS` in the same release). Mesh protocol is compatible with 2.4.0
 peers.
 
@@ -68,7 +68,7 @@ TAP. For a process that outlives the terminal, use `vpncloud install`
 
 ### Project status
 
-VpnCloud 2.4.2 on this fork is usable on Linux, macOS, FreeBSD, Windows,
+VpnCloud 2.4.3 on this fork is usable on Linux, macOS, FreeBSD, Windows,
 Android, and iOS (TUN). It includes:
 
 * Automatic peer-to-peer meshing, no central servers
@@ -158,24 +158,24 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 
 ### Installing
 
-Download a 2.4.2 binary from
-[GitHub Releases](https://github.com/Lyamc/vpncloud/releases/tag/v2.4.2)
+Download a 2.4.3 binary from
+[GitHub Releases](https://github.com/Lyamc/vpncloud/releases/tag/v2.4.3)
 (checksums in `SHA256SUMS`):
 
 | File | Platform |
 |---|---|
-| `vpncloud-2.4.2-linux-x86_64` | Linux CLI, x86_64, static musl |
-| `vpncloud-2.4.2-linux-aarch64` | Linux CLI, ARM64, static musl |
-| `vpncloud-2.4.2-freebsd-x86_64` | FreeBSD CLI, x86_64 (FreeBSD 15 `libc.so.7`) |
-| `vpncloud-2.4.2-macos-universal` | macOS CLI, Intel + Apple silicon |
-| `vpncloud-gui-2.4.2-macos-universal` | macOS GUI |
-| `vpncloud-2.4.2-windows-x86_64.exe` | Windows CLI, x86_64 |
-| `vpncloud-2.4.2-windows-aarch64.exe` | Windows CLI, ARM64 |
-| `vpncloud-gui-2.4.2-windows-x86_64.exe` | Windows GUI, x86_64 |
-| `vpncloud-gui-2.4.2-windows-aarch64.exe` | Windows GUI, ARM64 |
-| `vpncloud-2.4.2-android-debug.apk` | Android, signed debug, arm64-v8a + armeabi-v7a |
-| `vpncloud-2.4.2-android-release-unsigned.apk` | Android, unsigned release |
-| `libvpncloud-2.4.2.xcframework.tar.gz` | iOS static lib (device + simulator arm64) |
+| `vpncloud-2.4.3-linux-x86_64` | Linux CLI, x86_64, static musl |
+| `vpncloud-2.4.3-linux-aarch64` | Linux CLI, ARM64, static musl |
+| `vpncloud-2.4.3-freebsd-x86_64` | FreeBSD CLI, x86_64 (FreeBSD 15 `libc.so.7`) |
+| `vpncloud-2.4.3-macos-universal` | macOS CLI, Intel + Apple silicon |
+| `vpncloud-gui-2.4.3-macos-universal` | macOS GUI |
+| `vpncloud-2.4.3-windows-x86_64.exe` | Windows CLI, x86_64 |
+| `vpncloud-2.4.3-windows-aarch64.exe` | Windows CLI, ARM64 |
+| `vpncloud-gui-2.4.3-windows-x86_64.exe` | Windows GUI, x86_64 |
+| `vpncloud-gui-2.4.3-windows-aarch64.exe` | Windows GUI, ARM64 |
+| `vpncloud-2.4.3-android-debug.apk` | Android, signed debug, arm64-v8a + armeabi-v7a |
+| `vpncloud-2.4.3-android-release-unsigned.apk` | Android, unsigned release |
+| `libvpncloud-2.4.3.xcframework.tar.gz` | iOS static lib (device + simulator arm64) |
 
 There is no Windows fat/universal PE and no FreeBSD ARM64 build. The Android
 release APK must be signed before distribution. The iOS artifact is an
@@ -199,8 +199,8 @@ Static musl binaries from the release run on most distributions (no glibc
 version pin). Example:
 
 ```sh
-chmod +x vpncloud-2.4.2-linux-x86_64
-sudo ./vpncloud-2.4.2-linux-x86_64 --help
+chmod +x vpncloud-2.4.3-linux-x86_64
+sudo ./vpncloud-2.4.3-linux-x86_64 --help
 ```
 
 Or build from source:
@@ -280,8 +280,8 @@ Windows has no in-box TUN/TAP. **TUN** needs [Wintun](https://www.wintun.net/)
 [tap-windows6](https://github.com/OpenVPN/tap-windows6) driver. Creating the
 virtual interface requires **Administrator**.
 
-Prebuilt `vpncloud-2.4.2-windows-x86_64.exe` and
-`vpncloud-2.4.2-windows-aarch64.exe` (plus GUI builds) are on the GitHub
+Prebuilt `vpncloud-2.4.3-windows-x86_64.exe` and
+`vpncloud-2.4.3-windows-aarch64.exe` (plus GUI builds) are on the GitHub
 release. Put `wintun.dll` next to the exe for TUN.
 
 To build from source:
