@@ -85,8 +85,8 @@ Android, and iOS (TUN). It includes:
 * Single binary, no kernel module
 
 Known limits: on macOS, TAP L2/ARP works but ICMP through `feth` is often
-lossy — prefer TUN there. Windows still needs `wintun.dll` (TUN) or
-tap-windows6 (TAP) installed.
+lossy — prefer TUN there. Windows TUN needs `wintun.dll` (bundled in the
+setup.exe / portable zip). TAP still needs tap-windows6 from OpenVPN.
 
 
 ### Platforms
@@ -107,15 +107,16 @@ that helper exits; persist with `vpncloud install` (LaunchDaemon
 UDP listen works (`IPV6_V6ONLY` is cleared). `vpncloud install` writes
 `/usr/local/bin/vpncloud`, `/usr/local/etc/vpncloud/`, and an rc.d script.
 
-**Windows.** TUN uses [Wintun](https://www.wintun.net/) (`wintun.dll` next to
-`vpncloud.exe`). TAP uses [tap-windows6](https://github.com/OpenVPN/tap-windows6)
-(NdisWan / `tap0901`). Run as Administrator. See *Installing* below for MSVC
-build steps and where `vpncloud install` puts files. Optional system tray
-(Enable / Disable / Exit) is offered at `vpncloud install` (build with
-`--features installer`) or `vpncloud.exe --tray`. Install prompts for the tray
-and optional Start-with-Windows; unattended: `vpncloud install --tray` /
-`--no-tray` / `--autostart`. If `wintun.dll` is next to the built exe, `install`
-copies it into the install folder.
+**Windows.** Prefer the NSIS setup (`vpncloud-*-windows-*-setup.exe`) or the
+portable zip: both ship `vpncloud.exe`, `vpncloud-gui.exe`, and the official
+[Wintun](https://www.wintun.net/) 0.14.1 DLL for TUN. TAP uses
+[tap-windows6](https://github.com/OpenVPN/tap-windows6) (NdisWan / `tap0901`)
+and is **not** bundled (signed kernel driver). Run as Administrator to create
+the adapter. See *Installing* below. Optional system tray (Enable / Disable /
+Exit) is offered at `vpncloud install` (build with `--features installer`) or
+`vpncloud.exe --tray`. Unattended: `vpncloud install --tray` / `--no-tray` /
+`--autostart`. `vpncloud install` copies `wintun.dll` when it sits next to the
+exe.
 
 As a **system service** (Administrator, LocalSystem, auto-start at boot):
 
@@ -169,17 +170,23 @@ Download a 2.4.3 binary from
 | `vpncloud-2.4.3-freebsd-x86_64` | FreeBSD CLI, x86_64 (FreeBSD 15 `libc.so.7`) |
 | `vpncloud-2.4.3-macos-universal` | macOS CLI, Intel + Apple silicon |
 | `vpncloud-gui-2.4.3-macos-universal` | macOS GUI |
-| `vpncloud-2.4.3-windows-x86_64.exe` | Windows CLI, x86_64 |
-| `vpncloud-2.4.3-windows-aarch64.exe` | Windows CLI, ARM64 |
-| `vpncloud-gui-2.4.3-windows-x86_64.exe` | Windows GUI, x86_64 |
-| `vpncloud-gui-2.4.3-windows-aarch64.exe` | Windows GUI, ARM64 |
+| `vpncloud-2.4.3-windows-x86_64-setup.exe` | Windows installer (x86_64): CLI, GUI, Wintun |
+| `vpncloud-2.4.3-windows-aarch64-setup.exe` | Windows installer (ARM64): CLI, GUI, Wintun |
+| `vpncloud-2.4.3-windows-x86_64.zip` | Windows portable zip (x86_64) |
+| `vpncloud-2.4.3-windows-aarch64.zip` | Windows portable zip (ARM64) |
+| `vpncloud-2.4.3-windows-x86_64.exe` | Windows CLI only, x86_64 (needs `wintun.dll` for TUN) |
+| `vpncloud-2.4.3-windows-aarch64.exe` | Windows CLI only, ARM64 (needs `wintun.dll` for TUN) |
+| `vpncloud-gui-2.4.3-windows-x86_64.exe` | Windows GUI only, x86_64 |
+| `vpncloud-gui-2.4.3-windows-aarch64.exe` | Windows GUI only, ARM64 |
 | `vpncloud-2.4.3-android-debug.apk` | Android, signed debug, arm64-v8a + armeabi-v7a |
 | `vpncloud-2.4.3-android-release-unsigned.apk` | Android, unsigned release |
 | `libvpncloud-2.4.3.xcframework.tar.gz` | iOS static lib (device + simulator arm64) |
 
-There is no Windows fat/universal PE and no FreeBSD ARM64 build. The Android
-release APK must be signed before distribution. The iOS artifact is an
-xcframework for a Packet Tunnel extension, not a signed IPA.
+There is no Windows fat/universal PE and no FreeBSD ARM64 build. The NSIS
+setup stub is 32-bit (runs on x64 and ARM64 Windows); the payload matches the
+filename architecture. The Android release APK must be signed before
+distribution. The iOS artifact is an xcframework for a Packet Tunnel
+extension, not a signed IPA.
 
 To build from source: Rust/Cargo (edition 2021, toolchain 1.75+). On Linux,
 install `asciidoctor` if you want the man page. The `install` subcommand is
@@ -280,9 +287,15 @@ Windows has no in-box TUN/TAP. **TUN** needs [Wintun](https://www.wintun.net/)
 [tap-windows6](https://github.com/OpenVPN/tap-windows6) driver. Creating the
 virtual interface requires **Administrator**.
 
-Prebuilt `vpncloud-2.4.3-windows-x86_64.exe` and
-`vpncloud-2.4.3-windows-aarch64.exe` (plus GUI builds) are on the GitHub
-release. Put `wintun.dll` next to the exe for TUN.
+The GitHub release has an NSIS installer and a portable zip per architecture
+(`vpncloud-2.4.3-windows-x86_64-setup.exe` / `.zip`, and the ARM64 pair). Both
+include `vpncloud.exe`, `vpncloud-gui.exe`, and the official Wintun 0.14.1 DLL
+plus its license. The setup.exe writes `C:\Program Files\VpnCloud`, Start Menu
+shortcuts, an uninstaller, and optionally PATH and a LocalSystem service.
+Rebuild those artifacts with `./contrib/windows/package.sh` (needs `makensis`).
+
+Standalone `vpncloud-2.4.3-windows-*.exe` CLI/GUI builds are still published;
+put `wintun.dll` next to the CLI for TUN if you are not using the installer.
 
 To build from source:
 

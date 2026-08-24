@@ -4,6 +4,8 @@ This project follows [semantic versioning](http://semver.org).
 
 ### UNRELEASED
 
+- [added] Windows NSIS installer and portable zip (CLI + GUI + official Wintun 0.14.1). TAP (tap-windows6) is still a separate OpenVPN driver.
+
 ### v2.4.3 (2026-08-23)
 
 - [added] GUI shows Sent / Received mesh bytes and last handshake time
