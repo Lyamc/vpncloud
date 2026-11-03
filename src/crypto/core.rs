@@ -252,7 +252,7 @@ pub fn test_speed(algo: &'static aead::Algorithm, max_time: &Duration) -> f64 {
         iterations += 1000;
     }
     let duration = (Instant::now() - start).as_secs_f64();
-    let data = iterations * 1000 * 2;
+    let data = (iterations as u64).saturating_mul(1000).saturating_mul(2);
     data as f64 / duration / 1_000_000.0
 }
 

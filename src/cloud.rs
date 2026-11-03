@@ -4,7 +4,7 @@
 
 use std::{
     cmp::{max, min},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt,
     fs::{self, File},
     hash::BuildHasherDefault,
@@ -29,12 +29,13 @@ use crate::{
     config::{Config, DEFAULT_PEER_TIMEOUT, DEFAULT_PORT},
     crypto::{is_init_message, Crypto, MessageResult, PeerCrypto},
     crypto_pool::{CryptoBoxHandle, CryptoDone, CryptoJob, CryptoPool},
-    device::{Device, Type},
+    device::{Device, OffloadRead, Type},
     error::Error,
+    gso::{GsoMeta, GSO_META_LEN},
     lan,
     messages::{
-        AddrList, NodeInfo, PeerInfo, MESSAGE_TYPE_CLOSE, MESSAGE_TYPE_DATA, MESSAGE_TYPE_KEEPALIVE,
-        MESSAGE_TYPE_NODE_INFO, MESSAGE_TYPE_RELAY
+        AddrList, NodeInfo, PeerInfo, MESSAGE_TYPE_CLOSE, MESSAGE_TYPE_DATA, MESSAGE_TYPE_DATA_GSO,
+        MESSAGE_TYPE_KEEPALIVE, MESSAGE_TYPE_NODE_INFO, MESSAGE_TYPE_RELAY
     },
     natpmp,
     net::{mapped_addr, parse_listen, Socket},
@@ -63,7 +64,7 @@ const RESOLVE_INTERVAL: Time = 300;
 pub const STATS_INTERVAL: Time = 60;
 const OWN_ADDRESS_RESET_INTERVAL: Time = 30;
 const SPACE_BEFORE: usize = 100;
-const BATCH_SIZE: usize = 64;
+const BATCH_SIZE: usize = 128;
 
 enum PeerCryptoSlot {
     Direct(PeerCrypto<NodeInfo>),
@@ -175,6 +176,7 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     rx_addrs: Vec<SocketAddr>,
     tun_bufs: Vec<MsgBuffer>,
     tun_out: Vec<MsgBuffer>,
+    gso_out: VecDeque<(GsoMeta, MsgBuffer)>,
     next_peers: Time,
     peer_timeout_publish: u16,
     update_freq: u16,
@@ -267,12 +269,13 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             crypto,
             crypto_pool: CryptoPool::new(config.crypto_threads),
             outbox: Vec::with_capacity(BATCH_SIZE),
-            buf_spare: Vec::with_capacity(BATCH_SIZE),
+            buf_spare: (0..BATCH_SIZE).map(|_| MsgBuffer::new(SPACE_BEFORE)).collect(),
             pending_encrypt: HashMap::default(),
             rx_bufs: (0..BATCH_SIZE).map(|_| MsgBuffer::new(SPACE_BEFORE)).collect(),
             rx_addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)); BATCH_SIZE],
             tun_bufs: (0..BATCH_SIZE).map(|_| MsgBuffer::new(SPACE_BEFORE)).collect(),
             tun_out: Vec::with_capacity(BATCH_SIZE),
+            gso_out: VecDeque::new(),
             acl: try_fail!(crate::acl::Acl::parse(&config.acl), "Invalid ACL: {}"),
             config: config.clone(),
             _dummy_p: PhantomData,
@@ -331,7 +334,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         if !self.peers.contains_key(&addr) {
             return Err(Error::Message("Sending to node that is not a peer"));
         }
-        if type_ == MESSAGE_TYPE_DATA {
+        if type_ == MESSAGE_TYPE_DATA || type_ == MESSAGE_TYPE_DATA_GSO {
             if self.peers.get(&addr).and_then(|p| p.crypto.shared_handle()).is_some() {
                 let mut owned = self.take_spare();
                 mem::swap(msg, &mut owned);
@@ -353,15 +356,35 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         if pending.is_empty() {
             return Ok(());
         }
-        if !self.crypto_pool.enabled() {
+        // One peer cannot split a nonce sequence across workers. A thread hop per
+        // batch costs more than AES-GCM on this core, so encrypt in place.
+        if !self.use_crypto_pool() {
             for (addr, packets) in pending {
-                for (type_, mut data) in packets {
-                    if let Some(peer) = self.peers.get_mut(&addr) {
-                        peer.crypto.with_mut(|c| c.send_message(type_, &mut data))??;
-                    } else {
+                let encrypted = if let Some(peer) = self.peers.get_mut(&addr) {
+                    // One lock for the whole batch. The bench has a single peer, so
+                    // the slot is a mutex even though encryption stays on this thread.
+                    peer.crypto.with_mut(|c| {
+                        let mut out = Vec::with_capacity(packets.len());
+                        for (type_, mut data) in packets {
+                            let result = c.send_message(type_, &mut data);
+                            out.push((result, data));
+                        }
+                        out
+                    })?
+                } else {
+                    for (_, data) in packets {
+                        self.buf_spare.push(data);
+                    }
+                    continue;
+                };
+                for (result, mut data) in encrypted {
+                    if result.is_err() {
+                        self.buf_spare.push(data);
                         continue;
                     }
+                    // send_to swaps `data` with an empty spare. Keep that spare.
                     self.send_to(addr, &mut data)?;
+                    self.buf_spare.push(data);
                 }
             }
             return Ok(());
@@ -379,6 +402,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 Some(CryptoDone::Encrypted { addr, packets }) => {
                     for mut data in packets {
                         self.send_to(addr, &mut data)?;
+                        self.buf_spare.push(data);
                     }
                 }
                 Some(CryptoDone::Failed(e)) => error!("{}", e),
@@ -387,6 +411,10 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             }
         }
         Ok(())
+    }
+
+    fn use_crypto_pool(&self) -> bool {
+        self.crypto_pool.enabled() && self.peers.len() > 1
     }
 
     fn flush_outbox(&mut self) -> Result<(), Error> {
@@ -410,11 +438,25 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             return Ok(());
         }
         let mut pkts = mem::take(&mut self.tun_out);
-        let res = self.device.write_batch(&mut pkts);
-        for buf in pkts {
-            self.buf_spare.push(buf);
+        match self.device.write_batch(&mut pkts) {
+            Ok(_) => {
+                for buf in pkts {
+                    self.buf_spare.push(buf);
+                }
+                Ok(())
+            }
+            // Keep the packets. Dropping them forces TCP to retransmit and the window collapses.
+            Err(Error::DeviceIo(_, ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.tun_out = pkts;
+                Ok(())
+            }
+            Err(e) => {
+                for buf in pkts {
+                    self.buf_spare.push(buf);
+                }
+                Err(e)
+            }
         }
-        res.map(|_| ())
     }
 
     fn apply_decrypted(
@@ -932,19 +974,13 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
     }
 
-    pub fn handle_interface_data(&mut self, data: &mut MsgBuffer) -> Result<(), Error> {
-        // HOT PATH
-        let (src, dst) = P::parse(data.message())?;
-        debug!("Read data from interface: src: {}, dst: {}, {} bytes", src, dst, data.len());
-        self.traffic.count_out_payload(dst, src, data.len());
+    fn route_message(&mut self, dst: Address, type_: u8, data: &mut MsgBuffer) -> Result<(), Error> {
         match self.table.lookup(dst) {
             Some((addr, dest_id)) => {
-                // HOT PATH
-                debug!("Found destination for {} => {}", dst, addr);
                 if self.peers.contains_key(&addr) {
-                    self.send_msg(addr, MESSAGE_TYPE_DATA, data)?;
+                    self.send_msg(addr, type_, data)?;
                 } else if let Some(via) = self.pick_relay(addr) {
-                    self.send_relay(via, dest_id, MESSAGE_TYPE_DATA, data)?;
+                    self.send_relay(via, dest_id, type_, data)?;
                     self.connect_sock(addr)?;
                 } else {
                     warn!("Destination for {} not found in peers: {}", dst, addr_nice(addr));
@@ -953,17 +989,99 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 }
             }
             None => {
-                // COLD PATH
                 if self.broadcast {
-                    debug!("No destination for {} found, broadcasting", dst);
-                    self.broadcast_msg(MESSAGE_TYPE_DATA, data)?;
+                    self.broadcast_msg(type_, data)?;
                 } else {
-                    debug!("No destination for {} found, dropping", dst);
                     self.traffic.count_dropped_payload(data.len());
                 }
             }
         }
         Ok(())
+    }
+
+    /// Forward one kernel GSO aggregate as a single encrypted message.
+    fn handle_gso_from_tun(&mut self, data: &mut MsgBuffer, meta: GsoMeta) -> Result<(), Error> {
+        if !meta.sane(data.len()) {
+            debug!("Dropping TUN GSO aggregate with unusable virtio header");
+            self.traffic.count_dropped_payload(data.len());
+            return Ok(());
+        }
+        let (src, dst) = P::parse(data.message())?;
+        self.traffic.count_out_payload(dst, src, data.len());
+        if data.get_start() < GSO_META_LEN {
+            return Err(Error::Message("No headroom for GSO metadata"));
+        }
+        data.prepend_zero(GSO_META_LEN);
+        meta.write(data.message_mut());
+        self.route_message(dst, MESSAGE_TYPE_DATA_GSO, data)
+    }
+
+    fn handle_gso_payload_from(&mut self, peer: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
+        let Some(meta) = GsoMeta::read(data.message()) else {
+            self.traffic.count_invalid_protocol(data.len());
+            return Err(Error::Message("Truncated GSO message"));
+        };
+        if data.len() < GSO_META_LEN || !meta.sane(data.len() - GSO_META_LEN) {
+            self.traffic.count_invalid_protocol(data.len());
+            return Err(Error::Message("Invalid GSO message"));
+        }
+        let (src, dst) = {
+            let ip = &data.message()[GSO_META_LEN..];
+            let (src, dst) = P::parse(ip)?;
+            if !self.acl.is_empty() {
+                let tap = self.config.device_type == Type::Tap;
+                let l4 = crate::payload::overlay_l4(ip, tap);
+                let match_src = l4.ip_src.unwrap_or(src);
+                if !self.acl.allows(match_src, l4.proto, l4.dport) {
+                    debug!("ACL dropped GSO src {} proto {:?} dport {:?}", match_src, l4.proto, l4.dport);
+                    return Ok(());
+                }
+            }
+            (src, dst)
+        };
+        data.skip(GSO_META_LEN);
+        let len = data.len();
+        self.traffic.count_in_payload(src, dst, len);
+        if self.learning {
+            let nid = self.peers.get(&peer).map(|p| p.node_id).unwrap_or([0; 16]);
+            self.table.cache(src, peer, nid);
+        }
+        match self.device.write_offload(data, &meta) {
+            Ok(()) => Ok(()),
+            Err(Error::DeviceIo(_, ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                let mut owned = self.take_spare();
+                mem::swap(data, &mut owned);
+                self.gso_out.push_back((meta, owned));
+                data.clear();
+                Ok(())
+            }
+            Err(e) => Err(e)
+        }
+    }
+
+    fn flush_gso_out(&mut self) -> Result<(), Error> {
+        while let Some((meta, mut buf)) = self.gso_out.pop_front() {
+            match self.device.write_offload(&mut buf, &meta) {
+                Ok(()) => self.buf_spare.push(buf),
+                Err(Error::DeviceIo(_, ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.gso_out.push_front((meta, buf));
+                    break;
+                }
+                Err(e) => {
+                    self.buf_spare.push(buf);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn handle_interface_data(&mut self, data: &mut MsgBuffer) -> Result<(), Error> {
+        // HOT PATH
+        let (src, dst) = P::parse(data.message())?;
+        debug!("Read data from interface: src: {}, dst: {}, {} bytes", src, dst, data.len());
+        self.traffic.count_out_payload(dst, src, data.len());
+        self.route_message(dst, MESSAGE_TYPE_DATA, data)
     }
 
     fn add_new_peer(&mut self, addr: SocketAddr, info: NodeInfo) -> Result<(), Error> {
@@ -1105,6 +1223,10 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                     MESSAGE_TYPE_DATA => {
                         // HOT PATH
                         self.handle_payload_from(src, data)?
+                    }
+                    MESSAGE_TYPE_DATA_GSO => {
+                        // HOT PATH
+                        self.handle_gso_payload_from(src, data)?
                     }
                     MESSAGE_TYPE_RELAY => self.handle_relay(src, data)?,
                     MESSAGE_TYPE_NODE_INFO => {
@@ -1258,22 +1380,34 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
     }
 
-    fn handle_socket_event(&mut self, _buffer: &mut MsgBuffer) {
+    fn handle_socket_event(&mut self, _buffer: &mut MsgBuffer) -> bool {
         // HOT PATH
         let mut bufs = mem::take(&mut self.rx_bufs);
         let mut addrs = mem::take(&mut self.rx_addrs);
+        let mut got = false;
+        let mut again = false;
+        let mut rounds = 0usize;
         loop {
+            if rounds >= 4 {
+                again = true;
+                break;
+            }
+            rounds += 1;
             let n = match self.socket.receive_batch(&mut bufs, &mut addrs) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => try_fail!(Err(e), "Failed to read from network socket: {}")
             };
+            got = true;
             let mut decrypt: HashMap<SocketAddr, (CryptoBoxHandle, Vec<MsgBuffer>), Hash> = HashMap::default();
             for i in 0..n {
+                if bufs[i].is_empty() {
+                    continue;
+                }
                 let src = mapped_addr(addrs[i]);
                 self.traffic.count_in_traffic(src, bufs[i].len());
-                let offload = self.crypto_pool.enabled()
+                let offload = self.use_crypto_pool()
                     && !is_init_message(bufs[i].message())
                     && self.peers.get(&src).and_then(|p| p.crypto.shared_handle()).is_some();
                 if offload {
@@ -1325,29 +1459,199 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         if let Err(e) = self.flush_tun_out() {
             error!("{}", e);
         }
+        if let Err(e) = self.flush_gso_out() {
+            error!("{}", e);
+        }
         let _ = self.flush_outbox();
+        let _ = got;
+        if !self.tun_out.is_empty() || !self.gso_out.is_empty() {
+            return false;
+        }
+        again
     }
 
-    fn handle_device_event(&mut self, _buffer: &mut MsgBuffer) {
-        // HOT PATH
-        let mut bufs = mem::take(&mut self.tun_bufs);
-        let n = match self.device.read_batch(&mut bufs) {
-            Ok(n) => n,
-            Err(Error::DeviceIo(_, ref e)) if e.kind() == io::ErrorKind::WouldBlock => 0,
-            Err(Error::Device(_)) => 0,
-            Err(e) => try_fail!(Err(e), "Failed to read from device: {}")
-        };
-        for buf in bufs.iter_mut().take(n) {
-            if let Err(e) = self.handle_interface_data(buf) {
-                error!("{}", e);
+    /// Largest inner IP packet that still fits in one outer IPv4 UDP datagram
+    /// after the message type, GSO prefix, crypto header, and AEAD tag.
+    const UDP_GSO_MAX: usize = 60_000;
+
+    /// Finish checksums and, for a run of equal UDP datagrams, ship one GSO aggregate.
+    fn forward_plain_batch(&mut self, batch: &mut Vec<(MsgBuffer, Option<(u16, u16)>)>) {
+        let mut rest = mem::take(batch);
+        while !rest.is_empty() {
+            let n = {
+                let views: Vec<&[u8]> = rest.iter().map(|(buf, _)| buf.message()).collect();
+                crate::payload::udp_gso_span(&views, Self::UDP_GSO_MAX)
+            };
+            if n >= 2 {
+                let run: Vec<_> = rest.drain(..n).collect();
+                self.emit_udp_gso(run);
+            } else {
+                let (buf, partial) = rest.remove(0);
+                self.forward_one_plain(buf, partial);
             }
         }
-        self.tun_bufs = bufs;
+    }
+
+    fn forward_one_plain(&mut self, mut buf: MsgBuffer, partial: Option<(u16, u16)>) {
+        if let Some((start, off)) = partial {
+            crate::payload::finish_virtio_l4_csum(buf.message_mut(), start, off);
+        }
+        crate::payload::fix_ipv4_checksums(buf.message_mut());
+        if let Err(e) = self.handle_interface_data(&mut buf) {
+            error!("{}", e);
+        }
+        self.buf_spare.push(buf);
+    }
+
+    fn emit_udp_gso(&mut self, mut run: Vec<(MsgBuffer, Option<(u16, u16)>)>) {
+        let Some((hdr, gso_size)) = crate::payload::udp_segment(run[0].0.message()) else {
+            for (buf, partial) in run {
+                self.forward_one_plain(buf, partial);
+            }
+            return;
+        };
+        let (mut acc, _) = run.remove(0);
+        for (nxt, _) in run {
+            let add = nxt.len().saturating_sub(hdr);
+            let old = acc.len();
+            if add == 0 || old + add > acc.remaining_capacity() {
+                error!("UDP GSO aggregate exceeded the message buffer");
+                self.buf_spare.push(nxt);
+                continue;
+            }
+            acc.set_length(old + add);
+            acc.message_mut()[old..].copy_from_slice(&nxt.message()[hdr..hdr + add]);
+            self.buf_spare.push(nxt);
+        }
+        match crate::payload::seal_udp_gso(acc.message_mut(), hdr, gso_size) {
+            Some(meta) => {
+                if let Err(e) = self.handle_gso_from_tun(&mut acc, meta) {
+                    error!("{}", e);
+                }
+            }
+            None => error!("Failed to seal UDP GSO aggregate")
+        }
+        self.buf_spare.push(acc);
+    }
+
+    fn handle_device_event(&mut self, _buffer: &mut MsgBuffer) -> bool {
+        // HOT PATH
+        // mio registers the TUN fd edge-triggered. One read leaves the rest queued
+        // with no further wakeup, so TCP stalls after a single batch. Drain until
+        // the device would block, then encrypt and send once.
+        if !self.tun_out.is_empty() {
+            let _ = self.flush_tun_out();
+            if !self.tun_out.is_empty() {
+                // TUN tx is full. Spinning here starves the overlay reader.
+                return false;
+            }
+        }
+        if !self.gso_out.is_empty() {
+            let _ = self.flush_gso_out();
+            if !self.gso_out.is_empty() {
+                return false;
+            }
+        }
+        let mut got = false;
+        let mut again = false;
+        let mut plain_n = 0usize;
+        let mut gso_n = 0usize;
+        // `read_offload` returns Unsupported only when this device has no GSO reader.
+        // A Blocked result means the TUN was drained; falling through into `read_batch`
+        // would read and split the next aggregate.
+        let mut use_batch = false;
+        let mut plain_batch: Vec<(MsgBuffer, Option<(u16, u16)>)> = Vec::with_capacity(64);
+        loop {
+            let mut one = self.take_spare();
+            match self.device.read_offload(&mut one) {
+                Ok(OffloadRead::Unsupported) => {
+                    self.buf_spare.push(one);
+                    use_batch = true;
+                    break;
+                }
+                Ok(OffloadRead::Blocked) => {
+                    self.buf_spare.push(one);
+                    break;
+                }
+                Ok(OffloadRead::Plain(partial)) => {
+                    got = true;
+                    plain_n += 1;
+                    plain_batch.push((one, partial));
+                    // A UDP flood never returns WouldBlock if we keep up with the
+                    // writer. Cap the drain so this batch is flushed and the UDP
+                    // socket is serviced before the spare pool allocates without bound.
+                    if plain_n >= 64 {
+                        again = true;
+                        break;
+                    }
+                }
+                Ok(OffloadRead::Gso(meta)) => {
+                    got = true;
+                    gso_n += 1;
+                    // Keep datagrams that arrived before this aggregate in order.
+                    self.forward_plain_batch(&mut plain_batch);
+                    if let Err(e) = self.handle_gso_from_tun(&mut one, meta) {
+                        error!("{}", e);
+                    }
+                    self.buf_spare.push(one);
+                    // One aggregate is already a full segment train. Ship it before
+                    // reading the next so TCP does not wait on a second 64KB encrypt.
+                    let _ = self.flush_pending_crypto();
+                    let _ = self.flush_outbox();
+                    if gso_n >= 8 {
+                        again = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    self.buf_spare.push(one);
+                    self.forward_plain_batch(&mut plain_batch);
+                    try_fail!(Err(e), "Failed to read from device: {}");
+                }
+            }
+        }
+        self.forward_plain_batch(&mut plain_batch);
+        if use_batch {
+        loop {
+            let mut bufs = mem::take(&mut self.tun_bufs);
+            let n = match self.device.read_batch(&mut bufs) {
+                Ok(0) => {
+                    self.tun_bufs = bufs;
+                    break;
+                }
+                Ok(n) => n,
+                Err(Error::DeviceIo(_, ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.tun_bufs = bufs;
+                    break;
+                }
+                Err(Error::Device(_)) => {
+                    self.tun_bufs = bufs;
+                    break;
+                }
+                Err(e) => try_fail!(Err(e), "Failed to read from device: {}")
+            };
+            got = true;
+            for buf in bufs.iter_mut().take(n) {
+                if let Err(e) = self.handle_interface_data(buf) {
+                    error!("{}", e);
+                }
+            }
+            self.tun_bufs = bufs;
+        }
+        }
         let _ = self.flush_pending_crypto();
         if let Err(e) = self.flush_tun_out() {
             error!("{}", e);
         }
+        if let Err(e) = self.flush_gso_out() {
+            error!("{}", e);
+        }
         let _ = self.flush_outbox();
+        let _ = got;
+        if !self.tun_out.is_empty() || !self.gso_out.is_empty() {
+            return false;
+        }
+        again
     }
 
     /// The main method of the node
@@ -1359,24 +1663,47 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     /// Also, this method will call `housekeep` every second.
     pub fn run(&mut self) {
         let mut ctrlc = CtrlC::new();
-        let waiter = try_fail!(WaitImpl::new(&self.socket, &self.device, 1000), "Failed to setup poll: {}");
+        let mut waiter = try_fail!(WaitImpl::new(&self.socket, &self.device, 1000), "Failed to setup poll: {}");
         let mut buffer = MsgBuffer::new(SPACE_BEFORE);
         let mut poll_error = false;
         self.config.call_hook("vpn_started", vec![("IFNAME", self.device.ifname())], true);
+        // mio is edge-triggered. On every wakeup, drain both the TUN and the UDP
+        // socket until they would block so a single edge cannot leave packets stuck.
         for evt in waiter {
-            // HOT PATH
             match evt {
                 WaitResult::Error(err) => {
-                    // COLD PATH
                     if poll_error {
                         fail!("Poll wait failed again: {}", err);
                     }
                     debug!("Poll wait failed: {}, retrying...", err);
                     poll_error = true;
                 }
-                WaitResult::Timeout => {}
-                WaitResult::Socket if !CtrlC::is_paused() => self.handle_socket_event(&mut buffer),
-                WaitResult::Device if !CtrlC::is_paused() => self.handle_device_event(&mut buffer),
+                WaitResult::Timeout => {
+                    let _ = self.flush_tun_out();
+                    let _ = self.flush_gso_out();
+                    let _ = self.flush_outbox();
+                }
+                WaitResult::Socket | WaitResult::Device if !CtrlC::is_paused() => {
+                    // mio is edge-triggered, so leave this only after both fds
+                    // would block. Each handler flushes after a bounded batch and
+                    // returns true when the peer is still producing, which keeps
+                    // the UDP socket and the TUN interleaved.
+                    loop {
+                        let more_dev = self.handle_device_event(&mut buffer);
+                        let more_sock = self.handle_socket_event(&mut buffer);
+                        if !more_dev && !more_sock {
+                            break;
+                        }
+                        if self.next_housekeep < TS::now() {
+                            if !CtrlC::is_paused() {
+                                if let Err(e) = self.housekeep() {
+                                    error!("{}", e)
+                                }
+                            }
+                            self.next_housekeep = TS::now() + 1
+                        }
+                    }
+                }
                 WaitResult::Socket | WaitResult::Device => {}
             }
             if self.next_housekeep < TS::now() {

@@ -188,6 +188,36 @@ impl<P: Protocol> Simulator<P> {
         self.messages.len()
     }
 
+    pub fn put_plains(&mut self, addr: SocketAddr, packets: Vec<(Option<(u16, u16)>, Vec<u8>)>) {
+        let node = self.nodes.get_mut(&addr).unwrap();
+        for (partial, data) in packets {
+            node.device().put_plain_inbound(partial, data);
+        }
+        DebugLogger::set_node(node.get_num());
+        node.trigger_device_event();
+        DebugLogger::set_node(0);
+        let sock = node.socket();
+        while let Some((dst, data)) = sock.pop_outbound() {
+            self.messages.push_back((addr, dst, data));
+        }
+    }
+
+    pub fn put_gso(&mut self, addr: SocketAddr, meta: crate::gso::GsoMeta, data: Vec<u8>) {
+        let node = self.nodes.get_mut(&addr).unwrap();
+        node.device().put_gso_inbound(meta, data);
+        DebugLogger::set_node(node.get_num());
+        node.trigger_device_event();
+        DebugLogger::set_node(0);
+        let sock = node.socket();
+        while let Some((dst, data)) = sock.pop_outbound() {
+            self.messages.push_back((addr, dst, data));
+        }
+    }
+
+    pub fn pop_gso_meta(&mut self, node: SocketAddr) -> Option<crate::gso::GsoMeta> {
+        self.nodes.get_mut(&node).unwrap().device().pop_gso_meta()
+    }
+
     pub fn put_payload(&mut self, addr: SocketAddr, data: Vec<u8>) {
         let node = self.nodes.get_mut(&addr).unwrap();
         node.device().put_inbound(data);

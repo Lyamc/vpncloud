@@ -2,7 +2,11 @@
 // Copyright (C) 2015-2021  Dennis Schwerdel
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
-use crate::{error::Error, types::Address};
+use crate::{
+    error::Error,
+    gso::{GsoMeta, GSO_UDP_L4, VIRTIO_F_NEEDS_CSUM},
+    types::Address
+};
 #[cfg(test)] use std::str::FromStr;
 
 pub trait Protocol: Sized {
@@ -271,6 +275,32 @@ pub fn fix_ethernet_ipv4_checksums(frame: &mut [u8]) {
     fix_ipv4_checksums(&mut frame[payload_off..]);
 }
 
+/// Finish a virtio `NEEDS_CSUM` transport checksum.
+///
+/// The field at `csum_start + csum_offset` holds the unfolded pseudo-header sum.
+/// The bytes from `csum_start` to the end of the packet are the L4 header and payload.
+pub fn finish_virtio_l4_csum(pkt: &mut [u8], csum_start: u16, csum_offset: u16) {
+    let start = csum_start as usize;
+    let at = start + csum_offset as usize;
+    if start > pkt.len() || at + 1 >= pkt.len() {
+        return;
+    }
+    let initial = u16::from_be_bytes([pkt[at], pkt[at + 1]]) as u32;
+    pkt[at] = 0;
+    pkt[at + 1] = 0;
+    let mut sum = initial;
+    let data = &pkt[start..];
+    let mut chunks = data.chunks_exact(2);
+    for c in chunks.by_ref() {
+        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+    }
+    if let [b] = chunks.remainder() {
+        sum += (*b as u32) << 8;
+    }
+    let sum = fold_checksum(sum);
+    pkt[at..at + 2].copy_from_slice(&sum.to_be_bytes());
+}
+
 pub fn fix_ipv4_checksums(pkt: &mut [u8]) {
     if pkt.len() < 20 || pkt[0] >> 4 != 4 {
         return;
@@ -355,6 +385,176 @@ fn fold_checksum(mut sum: u32) -> u16 {
     !sum as u16
 }
 
+fn fold_sum(mut sum: u32) -> u16 {
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum as u16
+}
+
+/// One ordinary UDP datagram that can be glued onto a UDP_L4 aggregate.
+///
+/// Returns `(header_len, payload_len)`. Header length is the IP header plus
+/// the 8-byte UDP header. IPv4 options and IPv6 extension headers are rejected
+/// because the kernel will not segment those.
+pub fn udp_segment(pkt: &[u8]) -> Option<(usize, usize)> {
+    if pkt.len() < 28 {
+        return None;
+    }
+    let (iph, proto_at) = match pkt[0] >> 4 {
+        4 => {
+            let iph = ((pkt[0] & 0x0f) as usize) * 4;
+            if iph != 20 || pkt.len() < iph + 8 {
+                return None;
+            }
+            let frag = (((pkt[6] as u16) & 0x1f) << 8) | pkt[7] as u16;
+            if frag != 0 || pkt[6] & 0x20 != 0 {
+                return None;
+            }
+            let total = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
+            if total != pkt.len() {
+                return None;
+            }
+            (iph, 9usize)
+        }
+        6 => {
+            if pkt.len() < 48 {
+                return None;
+            }
+            let payload = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
+            if payload != pkt.len() - 40 {
+                return None;
+            }
+            (40usize, 6usize)
+        }
+        _ => return None
+    };
+    if pkt[proto_at] != 17 {
+        return None;
+    }
+    let hdr = iph + 8;
+    if pkt.len() <= hdr {
+        return None;
+    }
+    Some((hdr, pkt.len() - hdr))
+}
+
+fn udp_same_flow(a: &[u8], b: &[u8]) -> bool {
+    match a[0] >> 4 {
+        4 => {
+            a[1] == b[1]
+                && a[6] >> 5 == b[6] >> 5
+                && a[8] == b[8]
+                && a[12..20] == b[12..20]
+                && a[20..24] == b[20..24]
+        }
+        6 => a[0] == b[0] && a[1] >> 4 == b[1] >> 4 && a[7] == b[7] && a[8..44] == b[8..44],
+        _ => false
+    }
+}
+
+/// How many leading packets form one UDP GSO aggregate, or 0 when fewer than two match.
+///
+/// `max_len` is the largest IP packet that still fits in one outer UDP datagram.
+/// A shorter final datagram is included. Anything after that shorter tail is not,
+/// matching the kernel rule that a short segment ends the train.
+pub fn udp_gso_span(pkts: &[&[u8]], max_len: usize) -> usize {
+    if pkts.len() < 2 || max_len < 28 {
+        return 0;
+    }
+    let Some((hdr, payload)) = udp_segment(pkts[0]) else {
+        return 0;
+    };
+    if payload == 0 || payload > u16::MAX as usize {
+        return 0;
+    }
+    let mut total = pkts[0].len();
+    let mut n = 1usize;
+    let mut short = false;
+    for pkt in &pkts[1..] {
+        let Some((hdr2, payload2)) = udp_segment(pkt) else {
+            break;
+        };
+        if hdr2 != hdr || !udp_same_flow(pkts[0], pkt) || short || payload2 > payload {
+            break;
+        }
+        let add = pkt.len() - hdr;
+        if add != payload2 || total + add > max_len {
+            break;
+        }
+        if payload2 < payload {
+            short = true;
+        }
+        total += add;
+        n += 1;
+    }
+    if n >= 2 {
+        n
+    } else {
+        0
+    }
+}
+
+/// Rewrite `pkt` as one UDP_L4 aggregate and return the virtio header for it.
+///
+/// `hdr` is the IP+UDP header length and `gso_size` is one segment's UDP payload.
+/// The checksum field receives the unfolded-then-folded pseudo-header sum with
+/// no final inversion. That is the `CHECKSUM_PARTIAL` value the kernel combines
+/// with each segment, the same placement WireGuard's TUN GRO uses.
+pub fn seal_udp_gso(pkt: &mut [u8], hdr: usize, gso_size: usize) -> Option<GsoMeta> {
+    if hdr < 28 || gso_size == 0 || gso_size > u16::MAX as usize || pkt.len() < hdr + gso_size || pkt.len() > 65535 {
+        return None;
+    }
+    let iph = hdr - 8;
+    let udp_len = pkt.len() - iph;
+    if udp_len > u16::MAX as usize {
+        return None;
+    }
+    let v6 = match pkt[0] >> 4 {
+        4 => false,
+        6 => true,
+        _ => return None
+    };
+    pkt[iph + 4..iph + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    let pseudo = if v6 {
+        if iph != 40 {
+            return None;
+        }
+        pkt[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        pseudo_sum(&pkt[8..24], &pkt[24..40], udp_len as u16)
+    } else {
+        if iph != 20 || pkt.len() > u16::MAX as usize {
+            return None;
+        }
+        let total = pkt.len() as u16;
+        pkt[2..4].copy_from_slice(&total.to_be_bytes());
+        pkt[10] = 0;
+        pkt[11] = 0;
+        let ip_sum = internet_checksum(&pkt[..iph]);
+        pkt[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+        pseudo_sum(&pkt[12..16], &pkt[16..20], udp_len as u16)
+    };
+    pkt[iph + 6..iph + 8].copy_from_slice(&pseudo.to_be_bytes());
+    Some(GsoMeta {
+        flags: VIRTIO_F_NEEDS_CSUM,
+        gso_type: GSO_UDP_L4,
+        hdr_len: hdr as u16,
+        gso_size: gso_size as u16,
+        csum_start: iph as u16,
+        csum_offset: 6
+    })
+}
+
+fn pseudo_sum(src: &[u8], dst: &[u8], udp_len: u16) -> u16 {
+    let mut sum = 0u32;
+    for chunk in src.chunks_exact(2).chain(dst.chunks_exact(2)) {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    sum += 17;
+    sum += udp_len as u32;
+    fold_sum(sum)
+}
+
 #[test]
 fn ipv4_header_checksum_is_recomputed() {
     // Minimal IPv4 header (20 bytes) + ICMP echo (8 bytes)
@@ -381,4 +581,44 @@ fn ethernet_frame_checksum_skips_non_ipv4() {
     arp[12] = 0x08;
     arp[13] = 0x06;
     fix_ethernet_ipv4_checksums(&mut arp);
+}
+
+#[cfg(test)]
+fn sample_udp(payload: usize, port: u16, fill: u8) -> Vec<u8> {
+    let total = 28 + payload;
+    let mut pkt = vec![fill; total];
+    pkt[..28].fill(0);
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    pkt[8] = 64;
+    pkt[9] = 17;
+    pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+    pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+    pkt[20..22].copy_from_slice(&port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&9u16.to_be_bytes());
+    pkt[24..26].copy_from_slice(&((8 + payload) as u16).to_be_bytes());
+    pkt
+}
+
+#[test]
+fn udp_gso_span_groups_one_flow_and_stops_after_a_short_tail() {
+    let a = sample_udp(100, 4000, 0xab);
+    let b = sample_udp(100, 4000, 0xcd);
+    let short = sample_udp(40, 4000, 0xef);
+    let after = sample_udp(100, 4000, 0x11);
+    let other = sample_udp(100, 4001, 0x22);
+    let pkts = [&a[..], &b[..], &short[..], &after[..]];
+    assert_eq!(udp_gso_span(&pkts, 60_000), 3);
+    assert_eq!(udp_gso_span(&[&a[..], &other[..]], 60_000), 0);
+    assert_eq!(udp_gso_span(&[&a[..], &b[..]], 28 + 100 + 50), 0);
+    let mut joined = a.clone();
+    joined.extend_from_slice(&b[28..]);
+    let meta = seal_udp_gso(&mut joined, 28, 100).unwrap();
+    assert_eq!(meta.gso_type, GSO_UDP_L4);
+    assert_eq!(meta.gso_size, 100);
+    assert_eq!(meta.hdr_len, 28);
+    assert_eq!(meta.flags, VIRTIO_F_NEEDS_CSUM);
+    assert_eq!(u16::from_be_bytes([joined[2], joined[3]]) as usize, joined.len());
+    assert_eq!(&joined[28..128], &a[28..]);
+    assert_eq!(&joined[128..], &b[28..]);
 }

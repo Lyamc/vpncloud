@@ -27,7 +27,23 @@ use tun_rs::{DeviceBuilder, Layer};
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use tun_rs::{ExpandBuffer, GROTable, VIRTIO_NET_HDR_LEN};
 
-use crate::error::Error;
+use crate::{error::Error, gso::GsoMeta};
+
+/// What [`Device::read_offload`] produced.
+pub enum OffloadRead {
+    /// This device has no GSO reader. Use [`Device::read_batch`].
+    Unsupported,
+    /// No packet is waiting.
+    Blocked,
+    /// One IP packet is in the buffer.
+    ///
+    /// `Some((csum_start, csum_offset))` means the virtio header had `NEEDS_CSUM`
+    /// and the L4 checksum field is still the partial sum. `None` means the
+    /// packet is already safe to forward.
+    Plain(Option<(u16, u16)>),
+    /// One GSO/USO aggregate is in the buffer (IP bytes only; metadata alongside).
+    Gso(GsoMeta)
+}
 
 /// The type of a tun/tap device
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -157,6 +173,16 @@ pub trait Device: io::Read + io::Write {
         }
         Ok(bufs.len())
     }
+
+    /// Read one TUN packet, keeping a GSO aggregate intact when it fits in `buf`.
+    fn read_offload(&mut self, _buf: &mut crate::util::MsgBuffer) -> Result<OffloadRead, Error> {
+        Ok(OffloadRead::Unsupported)
+    }
+
+    /// Write one GSO aggregate. `data` is the unmodified IP super-packet.
+    fn write_offload(&mut self, data: &mut crate::util::MsgBuffer, _meta: &GsoMeta) -> Result<(), Error> {
+        self.write_msg(data)
+    }
 }
 
 pub struct TunTapDevice {
@@ -174,7 +200,12 @@ pub struct TunTapDevice {
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     tun_sizes: Vec<usize>,
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    gro_table: GROTable
+    gro_table: GROTable,
+    /// Segments produced by splitting one aggregate that did not fit in a UDP datagram.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    split_len: usize,
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    split_pos: usize
 }
 
 /// Shown in `--help` and in the error when TAP is requested without root.
@@ -361,7 +392,11 @@ impl TunTapDevice {
             #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             tun_sizes: Vec::new(),
             #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-            gro_table: GROTable::default()
+            gro_table: GROTable::default(),
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            split_len: 0,
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+            split_pos: 0
         })
     }
 
@@ -392,7 +427,11 @@ impl TunTapDevice {
                 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 tun_sizes: Vec::new(),
                 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-                gro_table: GROTable::default()
+                gro_table: GROTable::default(),
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                split_len: 0,
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                split_pos: 0
             });
         }
         #[cfg(target_os = "ios")]
@@ -471,11 +510,15 @@ impl TunTapDevice {
                 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 tun_scratch: if type_ == Type::Tun { vec![0u8; VIRTIO_NET_HDR_LEN + 65535] } else { Vec::new() },
                 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-                tun_batch: if type_ == Type::Tun { vec![vec![0u8; 2048]; 64] } else { Vec::new() },
+                tun_batch: if type_ == Type::Tun { vec![vec![0u8; 2048]; 128] } else { Vec::new() },
                 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-                tun_sizes: if type_ == Type::Tun { vec![0usize; 64] } else { Vec::new() },
+                tun_sizes: if type_ == Type::Tun { vec![0usize; 128] } else { Vec::new() },
                 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-                gro_table: GROTable::default()
+                gro_table: GROTable::default(),
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                split_len: 0,
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                split_pos: 0
             })
         }
     }
@@ -498,6 +541,33 @@ impl TunTapDevice {
         };
 
         info!("Setting MTU {} on device {}", value, self.ifname);
+        // One IPv4 UDP datagram can carry about 65400 bytes after the AEAD tag.
+        // Ask the kernel to cut GSO aggregates there so each one is a single message
+        // instead of a 64KB buffer we would have to split back into MTU segments.
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        if self.tun_offload {
+            // tun-rs enables TCP offload and then best-effort UDP. Re-apply both and
+            // keep the result: iperf -u only reaches line rate when the kernel coalesces
+            // datagrams (TUN_F_USO4/6) into one aggregate per AEAD message.
+            let offloads = libc::TUN_F_CSUM | libc::TUN_F_TSO4 | libc::TUN_F_TSO6 | libc::TUN_F_TSO_ECN | libc::TUN_F_USO4 | libc::TUN_F_USO6;
+            let rc = unsafe { libc::ioctl(self.as_raw_fd(), libc::TUNSETOFFLOAD, offloads) };
+            if rc == 0 {
+                info!("TUN offload includes UDP segmentation");
+            } else {
+                let err = io::Error::last_os_error();
+                info!("UDP segmentation offload unavailable ({}), TCP GSO only", err);
+            }
+            for (key, size) in [("gso_max_size", "60000"), ("gso_ipv4_max_size", "60000")] {
+                let status = std::process::Command::new("ip")
+                    .args(["link", "set", "dev", &self.ifname, key, size])
+                    .status();
+                match status {
+                    Ok(s) if s.success() => info!("Set {} {} on {}", key, size, self.ifname),
+                    Ok(s) => info!("Could not set {} on {} ({})", key, self.ifname, s),
+                    Err(e) => info!("Could not set {} on {}: {}", key, self.ifname, e)
+                }
+            }
+        }
         #[cfg(target_os = "android")]
         {
             android_tun::run_ip(&["link", "set", "dev", &self.ifname, "mtu", &value.to_string()])
@@ -783,30 +853,179 @@ impl Device for TunTapDevice {
         }
         let nbufs = bufs.len();
         let mut wraps: Vec<MsgVirtio<'_>> = bufs.iter_mut().map(MsgVirtio).collect();
-        match self.device.send_multiple(&mut self.gro_table, &mut wraps, VIRTIO_NET_HDR_LEN) {
-            Ok(_) => Ok(nbufs),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                drop(wraps);
-                for b in bufs.iter_mut() {
-                    b.skip(VIRTIO_NET_HDR_LEN);
-                }
-                Err(Error::DeviceIo("IO error when sending to device", e))
-            }
-            Err(_) => {
-                drop(wraps);
-                for b in bufs.iter_mut() {
-                    b.skip(VIRTIO_NET_HDR_LEN);
-                    let slice = b.message();
-                    match self.device.send(slice) {
-                        Ok(written) if written == slice.len() => {}
-                        Ok(_) => return Err(Error::Socket("Sent out truncated packet")),
-                        Err(io_err) => return Err(Error::DeviceIo("IO error when sending to device", io_err))
+        let mut last_block = io::Error::new(io::ErrorKind::WouldBlock, "tun tx queue full");
+        for attempt in 0..3 {
+            match self.device.send_multiple(&mut self.gro_table, &mut wraps, VIRTIO_NET_HDR_LEN) {
+                Ok(_) => return Ok(nbufs),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    last_block = e;
+                    if attempt == 2 || !tun_tx_ready(self.as_raw_fd()) {
+                        break;
                     }
                 }
-                Ok(bufs.len())
+                Err(_) => {
+                    drop(wraps);
+                    for b in bufs.iter_mut() {
+                        b.skip(VIRTIO_NET_HDR_LEN);
+                    }
+                    for b in bufs.iter_mut() {
+                        let slice = b.message();
+                        match self.device.send(slice) {
+                            Ok(written) if written == slice.len() => {}
+                            Ok(_) => return Err(Error::Socket("Sent out truncated packet")),
+                            Err(io_err) => return Err(Error::DeviceIo("IO error when sending to device", io_err))
+                        }
+                    }
+                    return Ok(bufs.len());
+                }
             }
         }
+        drop(wraps);
+        for b in bufs.iter_mut() {
+            b.skip(VIRTIO_NET_HDR_LEN);
+        }
+        Err(Error::DeviceIo("IO error when sending to device", last_block))
     }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn read_offload(&mut self, buf: &mut crate::util::MsgBuffer) -> Result<OffloadRead, Error> {
+        if !self.tun_offload {
+            return Ok(OffloadRead::Unsupported);
+        }
+        if self.split_pos < self.split_len {
+            let i = self.split_pos;
+            self.split_pos += 1;
+            let n = self.tun_sizes[i];
+            buf.clear();
+            buf.clone_from(&self.tun_batch[i][..n]);
+            crate::payload::fix_ipv4_checksums(buf.message_mut());
+            return Ok(OffloadRead::Plain(None));
+        }
+        self.split_len = 0;
+        self.split_pos = 0;
+        // Read straight into the message buffer. The previous scratch copy was a
+        // full extra pass over every packet on the forward path.
+        buf.clear();
+        let len = loop {
+            match self.device.recv(buf.buffer()) {
+                Ok(len) => break len,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(OffloadRead::Blocked),
+                Err(e) => return Err(Error::DeviceIo("IO error when reading from device", e))
+            }
+        };
+        if len <= VIRTIO_NET_HDR_LEN || len > buf.remaining_capacity() {
+            return Ok(OffloadRead::Blocked);
+        }
+        buf.set_length(len);
+        let Some(mut meta) = GsoMeta::read(buf.message()) else {
+            return Ok(OffloadRead::Blocked);
+        };
+        let payload_len = len - VIRTIO_NET_HDR_LEN;
+        // AEAD tag is 16 bytes. The 10-byte virtio prefix and the message type are
+        // prepended from `space_before`, and the UDP datagram must stay within 65507.
+        let max_ip = buf.remaining_capacity().saturating_sub(16).min(65507 - 35);
+        if meta.segmented() && payload_len <= max_ip {
+            buf.skip(VIRTIO_NET_HDR_LEN);
+            return Ok(OffloadRead::Gso(meta));
+        }
+        if meta.segmented() {
+            self.tun_scratch[..len].copy_from_slice(&buf.message()[..len]);
+            tune_gso_hdr(&mut meta, &self.tun_scratch[VIRTIO_NET_HDR_LEN..len]);
+            let is_v6 = self.tun_scratch[VIRTIO_NET_HDR_LEN] >> 4 == 6;
+            let hdr = tun_rs::VirtioNetHdr {
+                flags: meta.flags,
+                gso_type: meta.gso_type,
+                hdr_len: meta.hdr_len,
+                gso_size: meta.gso_size,
+                csum_start: meta.csum_start,
+                csum_offset: meta.csum_offset
+            };
+            let nbufs = self.tun_batch.len().min(self.tun_sizes.len());
+            let split = {
+                let (_head, tail) = self.tun_scratch.split_at_mut(VIRTIO_NET_HDR_LEN);
+                tun_rs::gso_split(&mut tail[..payload_len], hdr, &mut self.tun_batch[..nbufs], &mut self.tun_sizes[..nbufs], 0, is_v6)
+            };
+            match split {
+                Ok(n) if n > 0 => {
+                    self.split_len = n;
+                    self.split_pos = 1;
+                    let seg = self.tun_sizes[0];
+                    buf.clear();
+                    buf.clone_from(&self.tun_batch[0][..seg]);
+                    crate::payload::fix_ipv4_checksums(buf.message_mut());
+                    return Ok(OffloadRead::Plain(None));
+                }
+                Ok(_) => return Ok(OffloadRead::Blocked),
+                Err(e) => {
+                    debug!("GSO split failed, dropping aggregate: {}", e);
+                    return Ok(OffloadRead::Blocked);
+                }
+            }
+        }
+        let partial = if meta.flags & crate::gso::VIRTIO_F_NEEDS_CSUM != 0 {
+            Some((meta.csum_start, meta.csum_offset))
+        } else {
+            None
+        };
+        buf.skip(VIRTIO_NET_HDR_LEN);
+        Ok(OffloadRead::Plain(partial))
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn write_offload(&mut self, data: &mut crate::util::MsgBuffer, meta: &GsoMeta) -> Result<(), Error> {
+        if !self.tun_offload {
+            return self.write_msg(data);
+        }
+        let total = VIRTIO_NET_HDR_LEN + data.len();
+        if total > self.tun_scratch.len() {
+            return Err(Error::Device("GSO packet exceeds TUN buffer"));
+        }
+        self.tun_scratch[..VIRTIO_NET_HDR_LEN].fill(0);
+        meta.write(&mut self.tun_scratch);
+        self.tun_scratch[VIRTIO_NET_HDR_LEN..total].copy_from_slice(data.message());
+        let mut last = io::Error::new(io::ErrorKind::WouldBlock, "tun tx queue full");
+        for attempt in 0..3 {
+            match self.device.send(&self.tun_scratch[..total]) {
+                Ok(n) if n == total => return Ok(()),
+                Ok(_) => return Err(Error::Socket("Sent out truncated packet")),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    last = e;
+                    if attempt == 2 || !tun_tx_ready(self.as_raw_fd()) {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(Error::DeviceIo("IO error when sending to device", e))
+            }
+        }
+        Err(Error::DeviceIo("IO error when sending to device", last))
+    }
+}
+
+/// Fill `hdr_len` from the transport header. The kernel sometimes reports the
+/// first segment's full length here, which makes `gso_split` emit one giant packet.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn tune_gso_hdr(meta: &mut GsoMeta, pkt: &[u8]) {
+    let kind = meta.gso_type & !0x80;
+    if kind == crate::gso::GSO_UDP_L4 {
+        meta.hdr_len = meta.csum_start.saturating_add(8);
+        return;
+    }
+    let cs = meta.csum_start as usize;
+    if pkt.len() <= cs + 12 {
+        return;
+    }
+    let tcp_hlen = ((pkt[cs + 12] as u16) >> 4) * 4;
+    if (20..=60).contains(&tcp_hlen) {
+        meta.hdr_len = meta.csum_start.saturating_add(tcp_hlen);
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn tun_tx_ready(fd: RawFd) -> bool {
+    let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
@@ -892,6 +1111,14 @@ impl crate::poll::Pollable for MockDevice {}
 pub struct MockDevice {
     inbound: VecDeque<Vec<u8>>,
     outbound: VecDeque<Vec<u8>>,
+    gso_in: VecDeque<(GsoMeta, Vec<u8>)>,
+    gso_out: VecDeque<GsoMeta>,
+    /// Plain packets produced by [`MockDevice::read_offload`], with an optional
+    /// virtio partial checksum `(csum_start, csum_offset)`.
+    plain_in: VecDeque<(Option<(u16, u16)>, Vec<u8>)>,
+    /// Set when this call already returned a packet, so the next empty read is
+    /// [`OffloadRead::Blocked`] rather than falling through into `read_batch`.
+    offload_yielded: bool,
     fd: std::fs::File
 }
 
@@ -908,15 +1135,35 @@ fn null_file() -> std::fs::File {
 
 impl MockDevice {
     pub fn new() -> Self {
-        Self { inbound: VecDeque::with_capacity(10), outbound: VecDeque::with_capacity(10), fd: null_file() }
+        Self {
+            inbound: VecDeque::with_capacity(10),
+            outbound: VecDeque::with_capacity(10),
+            gso_in: VecDeque::new(),
+            gso_out: VecDeque::new(),
+            plain_in: VecDeque::new(),
+            offload_yielded: false,
+            fd: null_file()
+        }
+    }
+
+    pub fn put_plain_inbound(&mut self, partial_csum: Option<(u16, u16)>, data: Vec<u8>) {
+        self.plain_in.push_back((partial_csum, data))
     }
 
     pub fn put_inbound(&mut self, data: Vec<u8>) {
         self.inbound.push_back(data)
     }
 
+    pub fn put_gso_inbound(&mut self, meta: GsoMeta, data: Vec<u8>) {
+        self.gso_in.push_back((meta, data))
+    }
+
     pub fn pop_outbound(&mut self) -> Option<Vec<u8>> {
         self.outbound.pop_front()
+    }
+
+    pub fn pop_gso_meta(&mut self) -> Option<GsoMeta> {
+        self.gso_out.pop_front()
     }
 
     pub fn has_inbound(&self) -> bool {
@@ -953,6 +1200,32 @@ impl Device for MockDevice {
             Err(Error::Device("No data available"))
         }
     }
+
+    fn read_offload(&mut self, buf: &mut crate::util::MsgBuffer) -> Result<OffloadRead, Error> {
+        if let Some((meta, data)) = self.gso_in.pop_front() {
+            self.offload_yielded = true;
+            buf.clear();
+            buf.clone_from(&data);
+            return Ok(OffloadRead::Gso(meta));
+        }
+        if let Some((partial, data)) = self.plain_in.pop_front() {
+            self.offload_yielded = true;
+            buf.clear();
+            buf.clone_from(&data);
+            return Ok(OffloadRead::Plain(partial));
+        }
+        if self.offload_yielded {
+            self.offload_yielded = false;
+            return Ok(OffloadRead::Blocked);
+        }
+        Ok(OffloadRead::Unsupported)
+    }
+
+    fn write_offload(&mut self, data: &mut crate::util::MsgBuffer, meta: &GsoMeta) -> Result<(), Error> {
+        self.gso_out.push_back(*meta);
+        self.outbound.push_back(data.message().to_vec());
+        Ok(())
+    }
 }
 
 impl io::Read for MockDevice {
@@ -980,7 +1253,7 @@ impl io::Write for MockDevice {
 
 impl Default for MockDevice {
     fn default() -> Self {
-        Self { inbound: VecDeque::with_capacity(10), outbound: VecDeque::with_capacity(10), fd: null_file() }
+        Self::new()
     }
 }
 

@@ -19,6 +19,9 @@ pub const MESSAGE_TYPE_DATA: u8 = 0;
 pub const MESSAGE_TYPE_NODE_INFO: u8 = 1;
 pub const MESSAGE_TYPE_KEEPALIVE: u8 = 2;
 pub const MESSAGE_TYPE_RELAY: u8 = 3;
+/// One kernel GSO/USO aggregate. Payload is [`crate::gso::GSO_META_LEN`] bytes of
+/// virtio header fields followed by the unmodified super-packet.
+pub const MESSAGE_TYPE_DATA_GSO: u8 = 4;
 pub const MESSAGE_TYPE_CLOSE: u8 = 0xff;
 
 pub type AddrList = SmallVec<[SocketAddr; 4]>;

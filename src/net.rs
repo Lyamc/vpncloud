@@ -191,6 +191,10 @@ impl Socket for UdpSocket {
         protect_socket(sock.as_raw_fd())?;
         #[cfg(target_os = "linux")]
         enable_udp_gro(sock.as_raw_fd());
+        // GSO aggregates leave as one UDP datagram larger than the underlay MTU.
+        // Allow IP fragmentation so the peer socket sees a single datagram again.
+        #[cfg(target_os = "linux")]
+        allow_ip_fragmentation(sock.as_raw_fd());
         Ok(sock)
     }
 
@@ -233,6 +237,16 @@ impl Socket for UdpSocket {
 const UDP_SEGMENT: libc::c_int = 103;
 #[cfg(target_os = "linux")]
 const UDP_GRO: libc::c_int = 104;
+
+#[cfg(target_os = "linux")]
+fn allow_ip_fragmentation(fd: RawFd) {
+    // IP_PMTUDISC_DONT = 0, IP_MTU_DISCOVER = 10, IPV6_MTU_DISCOVER = 23.
+    let dont: libc::c_int = 0;
+    unsafe {
+        libc::setsockopt(fd, libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, &dont as *const _ as *const libc::c_void, 4);
+        libc::setsockopt(fd, libc::IPPROTO_IPV6, 23, &dont as *const _ as *const libc::c_void, 4);
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn enable_udp_gro(fd: RawFd) {
@@ -315,13 +329,86 @@ thread_local! {
     static SEND_MMSG: RefCell<SendMmsgScratch> =
         RefCell::new(SendMmsgScratch { names: Vec::new(), iov: Vec::new(), hdrs: Vec::new() });
     static GSO_CONCAT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    // UDP GRO can turn one recvmmsg slot into dozens of segments. Segments that do not
+    // fit in this batch are kept and returned on the next receive, in order.
+    static GRO_PENDING: RefCell<VecDeque<(SocketAddr, Vec<u8>)>> = RefCell::new(VecDeque::new());
+}
+
+/// Split datagrams that carry a UDP_GRO segment size. Older segments in `pending` come first.
+/// Returns how many segments were written into `bufs`. The rest stay in `pending`.
+#[cfg(target_os = "linux")]
+fn take_segments(
+    bufs: &mut [MsgBuffer],
+    addrs: &mut [SocketAddr],
+    got: usize,
+    gro_sizes: &[usize],
+    pending: &mut VecDeque<(SocketAddr, Vec<u8>)>
+) -> usize {
+    let cap = bufs.len().min(addrs.len());
+    if cap == 0 {
+        return 0;
+    }
+    let mut split = !pending.is_empty();
+    if !split {
+        for i in 0..got {
+            let gro = gro_sizes.get(i).copied().unwrap_or(0);
+            if gro > 0 && gro < bufs[i].len() {
+                split = true;
+                break;
+            }
+        }
+    }
+    if !split {
+        return got.min(cap);
+    }
+    let mut segs: Vec<(SocketAddr, Vec<u8>)> = Vec::with_capacity(pending.len() + got);
+    segs.extend(pending.drain(..));
+    for i in 0..got {
+        let addr = addrs[i];
+        let total = bufs[i].len();
+        let gro = gro_sizes.get(i).copied().unwrap_or(0);
+        if total == 0 {
+            continue;
+        }
+        if gro == 0 || gro >= total {
+            segs.push((addr, bufs[i].message().to_vec()));
+            continue;
+        }
+        for chunk in bufs[i].message().chunks(gro) {
+            if !chunk.is_empty() {
+                segs.push((addr, chunk.to_vec()));
+            }
+        }
+    }
+    let n = segs.len().min(cap);
+    for (i, (addr, data)) in segs.iter().take(n).enumerate() {
+        addrs[i] = *addr;
+        bufs[i].clear();
+        bufs[i].clone_from(data);
+    }
+    for extra in segs.into_iter().skip(n) {
+        pending.push_back(extra);
+    }
+    n
 }
 
 #[cfg(target_os = "linux")]
 fn linux_recvmmsg(fd: RawFd, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -> io::Result<usize> {
-    let n = bufs.len().min(addrs.len()).min(64);
+    let n = bufs.len().min(addrs.len()).min(128);
     if n == 0 {
         return Ok(0);
+    }
+    // Finish splitting the previous GRO datagram before reading more, so a large
+    // coalesce cannot drop segments that do not fit in this batch.
+    let flushed = GRO_PENDING.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        if pending.is_empty() {
+            return 0;
+        }
+        take_segments(bufs, addrs, 0, &[], &mut pending)
+    });
+    if flushed > 0 {
+        return Ok(flushed);
     }
     RECV_MMSG.with(|cell| {
         let mut s = cell.borrow_mut();
@@ -350,7 +437,7 @@ fn linux_recvmmsg(fd: RawFd, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -
             return Err(io::Error::last_os_error());
         }
         let got = got as usize;
-        let mut gro_sizes = [0usize; 64];
+        let mut gro_sizes = [0usize; 128];
         for i in 0..got {
             let len = s.hdrs[i].msg_len as usize;
             bufs[i].set_length(len);
@@ -358,27 +445,10 @@ fn linux_recvmmsg(fd: RawFd, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -
             gro_sizes[i] = gro_segment_size(&s.hdrs[i].msg_hdr);
         }
         drop(s);
-        let cap = bufs.len().min(addrs.len());
-        let mut w = got;
-        for i in 0..got {
-            let gro = gro_sizes[i];
-            let total = bufs[i].len();
-            if gro == 0 || gro >= total {
-                continue;
-            }
-            let mut off = gro;
-            while off < total && w < cap {
-                let seglen = (total - off).min(gro);
-                let tmp = bufs[i].message()[off..off + seglen].to_vec();
-                bufs[w].clear();
-                bufs[w].clone_from(&tmp);
-                addrs[w] = addrs[i];
-                w += 1;
-                off += seglen;
-            }
-            bufs[i].set_length(gro);
-        }
-        Ok(w)
+        GRO_PENDING.with(|cell| {
+            let mut pending = cell.borrow_mut();
+            Ok(take_segments(bufs, addrs, got, &gro_sizes, &mut pending))
+        })
     })
 }
 
@@ -387,6 +457,21 @@ fn linux_sendmmsg(fd: RawFd, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usi
     if packets.is_empty() {
         return Ok(0);
     }
+    // UDP_MAX_SEGMENTS is 64. Send the whole queue in chunks so nothing is dropped.
+    let mut off = 0;
+    while off < packets.len() {
+        let n = linux_sendmmsg_chunk(fd, &packets[off..])?;
+        if n == 0 {
+            break;
+        }
+        off += n;
+    }
+    Ok(off)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_sendmmsg_chunk(fd: RawFd, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usize> {
+    let packets = if packets.len() > 64 { &packets[..64] } else { packets };
     // Same destination + same payload size: UDP GSO (one sendmsg, kernel segments).
     if packets.len() > 1 {
         let dest = packets[0].0;
@@ -397,7 +482,7 @@ fn linux_sendmmsg(fd: RawFd, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usi
             }
         }
     }
-    let n = packets.len().min(64);
+    let n = packets.len();
     SEND_MMSG.with(|cell| {
         let mut s = cell.borrow_mut();
         s.names.clear();
@@ -643,6 +728,26 @@ mod tests {
             }
         }
         panic!("did not receive IPv4 datagram on dual-stack socket");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gro_segments_spill_to_the_next_batch() {
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let mut bufs = vec![MsgBuffer::new(0), MsgBuffer::new(0)];
+        let mut addrs = vec![addr, addr];
+        bufs[0].clone_from(b"aabbccdd");
+        let mut pending = VecDeque::new();
+        let n = take_segments(&mut bufs, &mut addrs, 1, &[2], &mut pending);
+        assert_eq!(n, 2);
+        assert_eq!(bufs[0].message(), b"aa");
+        assert_eq!(bufs[1].message(), b"bb");
+        assert_eq!(pending.len(), 2);
+        let n2 = take_segments(&mut bufs, &mut addrs, 0, &[], &mut pending);
+        assert_eq!(n2, 2);
+        assert_eq!(bufs[0].message(), b"cc");
+        assert_eq!(bufs[1].message(), b"dd");
+        assert!(pending.is_empty());
     }
 
     #[test]

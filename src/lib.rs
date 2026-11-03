@@ -31,6 +31,7 @@ pub mod crypto_pool;
 pub mod device;
 pub mod engine;
 pub mod error;
+pub mod gso;
 #[cfg(feature = "installer")]
 pub mod installer;
 pub mod lan;

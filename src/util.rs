@@ -26,14 +26,17 @@ pub type Time = i64;
 
 pub struct MsgBuffer {
     space_before: usize,
-    buffer: [u8; 65535],
+    // Heap buffer so moving a packet between the TUN queue, crypto workers, and the
+    // UDP outbox is a pointer swap. An inline 64KB array made every `mem::swap` copy
+    // the whole allocation and capped forwarding well below line rate.
+    buffer: Box<[u8]>,
     start: usize,
     end: usize
 }
 
 impl MsgBuffer {
     pub fn new(space_before: usize) -> Self {
-        Self { buffer: [0; 65535], space_before, start: space_before, end: space_before }
+        Self { buffer: vec![0u8; 65535].into_boxed_slice(), space_before, start: space_before, end: space_before }
     }
 
     pub fn get_start(&self) -> usize {
