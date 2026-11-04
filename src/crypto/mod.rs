@@ -13,7 +13,7 @@ pub use common::*;
 #[cfg(feature = "noise")]
 pub use noise::is_noise_frame;
 
-/// ECDH that works with both `ring` 0.17 and `aws-lc-rs` (ring 0.16-style error argument).
+/// X25519 agreement. The private key is consumed so it is used once.
 pub(crate) fn agree_ephemeral<B, R>(
     my_private_key: crate::crypto_ring::agreement::EphemeralPrivateKey,
     peer_public_key: &crate::crypto_ring::agreement::UnparsedPublicKey<B>, kdf: impl FnOnce(&[u8]) -> R
@@ -21,19 +21,7 @@ pub(crate) fn agree_ephemeral<B, R>(
 where
     B: AsRef<[u8]>
 {
-    #[cfg(not(feature = "aws-lc"))]
-    {
-        crate::crypto_ring::agreement::agree_ephemeral(my_private_key, peer_public_key, kdf)
-    }
-    #[cfg(feature = "aws-lc")]
-    {
-        crate::crypto_ring::agreement::agree_ephemeral(
-            my_private_key,
-            peer_public_key,
-            crate::crypto_ring::error::Unspecified,
-            |k| Ok(kdf(k))
-        )
-    }
+    crate::crypto_ring::agreement::agree_ephemeral(my_private_key, peer_public_key, kdf)
 }
 
 #[cfg(not(feature = "noise"))]

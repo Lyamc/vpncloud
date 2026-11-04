@@ -192,9 +192,9 @@ extension, not a signed IPA.
 
 To build from source: Rust/Cargo (edition 2021, toolchain 1.75+). On Linux,
 install `asciidoctor` if you want the man page. The `install` subcommand is
-compiled only with `--features installer`. AES-GCM can use AWS-LC instead of
-`ring` (`cargo build --release --features aws-lc`; needs cmake). Noise still
-uses `ring` via `snow`.
+compiled only with `--features installer`. Crypto is pure Rust
+(AES-GCM, ChaCha20-Poly1305, Ed25519, X25519). The default build does not
+compile C.
 
 ```sh
 git clone https://github.com/Lyamc/vpncloud.git
@@ -304,9 +304,8 @@ put `wintun.dll` next to the CLI for TUN if you are not using the installer.
 To build from source:
 
 1. Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-   with the **Desktop development with C++** workload. The GNU Rust toolchain
-   (`x86_64-pc-windows-gnu`) also needs a MinGW `cc` on `PATH` because `ring`
-   compiles C; **MSVC is the path that works out of the box**.
+   with the **Desktop development with C++** workload. **MSVC is the path that
+   works out of the box.**
 
 2. Build with the MSVC toolchain and the installer feature:
 

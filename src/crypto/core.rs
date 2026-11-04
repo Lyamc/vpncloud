@@ -539,11 +539,7 @@ mod tests {
     #[test]
     fn test_core_size() {
         let size = mem::size_of::<CryptoCore>();
-        #[cfg(not(feature = "aws-lc"))]
-        assert_eq!(size, 2448);
-        // aws-lc-rs stores a smaller handle than ring's in-process key material.
-        #[cfg(feature = "aws-lc")]
-        assert!((200..512).contains(&size), "unexpected CryptoCore size {size}");
+        assert_eq!(size, 4368);
     }
 
     #[test]

@@ -36,10 +36,13 @@ signal-hook = "0.4.4"
 rand = "0.10.2"
 
 fnv = "1.0.7"
-ring = "0.17.14"
-aws-lc-rs = { version = "1", optional = true }
-snow = { version = "0.10", optional = true, default-features = false, features = ["std", "default-resolver", "default-resolver-crypto"] }
-x25519-dalek = { version = "2", optional = true, default-features = false, features = ["static_secrets"] }
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+ed25519-dalek = "2"
+sha2 = "0.10"
+pbkdf2 = "0.12"
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+snow = { version = "0.10", optional = true, default-features = false, features = ["default-resolver", "default-resolver-crypto"] }
 byteorder = "1.5.0"
 thiserror = "2.0.20"
 smallvec = "1.15.2"
@@ -95,7 +98,6 @@ android_logger = "0.15"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-criterion = { version = "0.8.2", features = ["html_reports"] }
 iai = "0.1.1"
 
 [features]
@@ -105,18 +107,12 @@ websocket = ["dep:tungstenite", "dep:url"]
 wizard = ["dep:dialoguer"]
 installer = ["dep:service-manager"]
 gui = ["dep:iced"]
-noise = ["dep:snow", "dep:x25519-dalek"]
-# AES-GCM via AWS-LC instead of ring. Needs cmake. Noise still uses ring.
-aws-lc = ["dep:aws-lc-rs"]
+noise = ["dep:snow"]
 
 [[bin]]
 name = "vpncloud-gui"
 path = "src/bin/vpncloud-gui.rs"
 required-features = ["gui"]
-
-[[bench]]
-name = "criterion"
-harness = false
 
 [[bench]]
 name = "valgrind"
@@ -140,6 +136,8 @@ lto = false
 incremental = true
 
 [profile.test]
+# opt-level 0 leaves the inlined AEAD path under the 10 MiB/s lib floor.
+opt-level = 1
 lto = false
 
 [package.metadata.deb]

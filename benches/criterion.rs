@@ -5,7 +5,7 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
 use smallvec::smallvec;
-use ring::aead;
+use vpncloud::crypto_ring::aead;
 
 use std::str::FromStr;
 use std::net::{SocketAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
