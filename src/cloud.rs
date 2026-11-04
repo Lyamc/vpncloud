@@ -37,7 +37,7 @@ use crate::{
     gso::{GsoMeta, GSO_META_LEN},
     lan,
     messages::{
-        AddrList, NodeInfo, PeerInfo, MESSAGE_TYPE_CLOSE, MESSAGE_TYPE_DATA, MESSAGE_TYPE_DATA_GSO,
+        AddrList, NodeInfo, PeerInfo, TransitClaim, MESSAGE_TYPE_CLOSE, MESSAGE_TYPE_DATA, MESSAGE_TYPE_DATA_GSO,
         MESSAGE_TYPE_KEEPALIVE, MESSAGE_TYPE_NODE_INFO, MESSAGE_TYPE_RELAY
     },
     natpmp,
@@ -859,6 +859,16 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         for (id, pk) in self.known_e2e.iter().take(16) {
             peer_e2e.push((*id, *pk));
         }
+        let mut transit = Vec::new();
+        for (addr, node_id, claim) in self.table.export_claims() {
+            if transit.len() >= 32 {
+                break;
+            }
+            if node_id == self.node_id {
+                continue;
+            }
+            transit.push(TransitClaim { node_id, addr, claim });
+        }
         NodeInfo {
             node_id: self.node_id,
             peers,
@@ -868,7 +878,8 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             underlay_mtu: u16::try_from(self.local_l2).ok().filter(|_| self.local_l2 >= 68),
             group: self.config.announce_group.clone(),
             e2e_public: Some(self.e2e_public),
-            peer_e2e
+            peer_e2e,
+            transit
         }
     }
 
@@ -969,6 +980,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         for addr in del {
             self.pending_inits.remove(&addr);
             if self.peers.remove(&addr).is_some() {
+                // Same as the timeout path. Leaving the claim in place makes the
+                // next lookup miss the direct peer and relay that prefix elsewhere.
+                self.table.remove_claims(addr);
                 self.connect_sock(addr)?;
             }
         }
@@ -1290,11 +1304,15 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
 
     fn send_relay(&mut self, via: SocketAddr, dest: NodeId, inner: u8, msg: &mut MsgBuffer) -> Result<(), Error> {
         let plain = msg.message().to_vec();
-        let pk = self.known_e2e.get(&dest).copied();
-        let body = if let Some(pk) = pk {
-            policy::seal_relay_body(&self.e2e_secret, &self.e2e_public, &pk, &plain)
-        } else {
-            plain
+        let Some(pk) = self.known_e2e.get(&dest).copied() else {
+            debug!("Dropping relay: no end-to-end key for destination");
+            self.traffic.count_dropped_payload(plain.len());
+            return Ok(());
+        };
+        let Some(body) = policy::seal_relay_body(&self.e2e_secret, &self.e2e_public, &pk, &plain) else {
+            debug!("Dropping relay: end-to-end seal failed");
+            self.traffic.count_dropped_payload(plain.len());
+            return Ok(());
         };
         let frame = policy::encode_relay(&dest, inner, &body);
         msg.clear();
@@ -1312,7 +1330,11 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 Ok(())
             }
             policy::RelayDecision::Deliver { inner_type, inner } => {
-                let plain = policy::open_relay_body(&self.e2e_secret, &inner).unwrap_or(inner);
+                let Some(plain) = policy::open_relay_body(&self.e2e_secret, &inner) else {
+                    debug!("Dropping relay: end-to-end open failed");
+                    self.traffic.count_dropped_payload(inner.len());
+                    return Ok(());
+                };
                 let mut buf = self.take_spare();
                 buf.clone_from(&plain);
                 let result = self.handle_message(src, MessageResult::Message(inner_type), &mut buf);
@@ -1530,6 +1552,44 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
     }
 
+    /// Install prefixes whose underlay address is not a connected peer.
+    /// Lookup then misses `self.peers` and `route_message` seals a relay.
+    fn install_transit(&mut self, transit: &[TransitClaim]) {
+        let mut grouped: Vec<(SocketAddr, NodeId, RangeList)> = Vec::new();
+        for hop in transit {
+            if hop.node_id == self.node_id {
+                continue;
+            }
+            let addr = mapped_addr(hop.addr);
+            if self.own_addresses.contains(&addr) || self.peers.contains_key(&addr) {
+                continue;
+            }
+            if self.peers.values().any(|peer| peer.node_id == hop.node_id) {
+                continue;
+            }
+            if let Some(slot) = grouped.iter_mut().find(|slot| slot.0 == addr && slot.1 == hop.node_id) {
+                slot.2.push(hop.claim);
+            } else {
+                let mut claims = RangeList::new();
+                claims.push(hop.claim);
+                grouped.push((addr, hop.node_id, claims));
+            }
+        }
+        for (addr, node_id, claims) in grouped {
+            let decision = policy::filter_announcement(
+                &self.grants,
+                &policy::Announcement { claims: claims.iter().copied().collect(), group: None }
+            );
+            if decision.claims.is_empty() {
+                continue;
+            }
+            let mut kept = RangeList::new();
+            kept.extend(decision.claims.iter().copied());
+            debug!("Transit route {} via {}", addr_nice(addr), kept.len());
+            self.table.set_claims(addr, node_id, kept);
+        }
+    }
+
     fn connect_to_peers(&mut self, peers: &[PeerInfo]) -> Result<(), Error> {
         'outer: for peer in peers {
             for addr in &peer.addrs {
@@ -1608,6 +1668,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             claims.extend(decision.claims.iter().copied());
             debug!("Adding claims of peer {}: {:?}", addr_nice(addr), claims);
             self.table.set_claims(addr, info.node_id, claims);
+            self.install_transit(&info.transit);
             debug!("Received {} peers from {}: {:?}", info.peers.len(), addr_nice(addr), info.peers);
             self.connect_to_peers(&info.peers)?;
         }
@@ -2417,6 +2478,28 @@ impl<P: Protocol> GenericCloud<MockDevice, P, MockSocket, MockTimeSource> {
 
     pub fn get_num(&self) -> usize {
         self.socket.address().unwrap().port() as usize
+    }
+
+    #[cfg(test)]
+    pub fn test_node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    #[cfg(test)]
+    pub fn test_peer_rtt(&self, addr: &SocketAddr) -> Option<u64> {
+        self.peers.get(addr).map(|peer| peer.rtt_us)
+    }
+
+    #[cfg(test)]
+    pub fn test_forget_e2e(&mut self, id: &NodeId) {
+        self.known_e2e.remove(id);
+    }
+
+    #[cfg(test)]
+    pub fn test_fail_peer_crypto(&mut self, addr: &SocketAddr) {
+        if let Some(peer) = self.peers.get_mut(addr) {
+            let _ = peer.crypto.with_mut(|crypto| crypto.fail_housekeep());
+        }
     }
 }
 

@@ -372,7 +372,7 @@ mod tests {
         let (secret_a, pub_a) = crate::policy::generate_e2e_keypair();
         let (secret_b, pub_b) = crate::policy::generate_e2e_keypair();
         let payload = b"tcp-relay-secret";
-        let sealed = crate::policy::seal_relay_body(&secret_a, &pub_a, &pub_b, payload);
+        let sealed = crate::policy::seal_relay_body(&secret_a, &pub_a, &pub_b, payload).expect("seal");
         let frame = crate::policy::encode_relay(&[9u8; 16], crate::messages::MESSAGE_TYPE_DATA, &sealed);
         let server = MeshSocket::open("127.0.0.1:0", true).expect("listen");
         let addr = server.udp.local_addr().expect("addr");

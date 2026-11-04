@@ -81,16 +81,10 @@ impl<TS: TimeSource> ClaimTable<TS> {
     }
 
     pub fn remove_claims(&mut self, peer: SocketAddr) {
-        for entry in &mut self.claims {
-            if entry.peer == peer {
-                entry.timeout = 0
-            }
-        }
-        for entry in self.cache.values_mut() {
-            if entry.peer == peer {
-                entry.timeout = 0
-            }
-        }
+        // Drop immediately. Zeroing the timeout and then housekeeping keeps the
+        // row when `now == 0`, and the next lookup would still relay it.
+        self.claims.retain(|entry| entry.peer != peer);
+        self.cache.retain(|_, entry| entry.peer != peer);
         self.housekeep()
     }
 
@@ -137,6 +131,11 @@ impl<TS: TimeSource> ClaimTable<TS> {
 
     pub fn claim_len(&self) -> usize {
         self.claims.len()
+    }
+
+    /// Claims learned from peers, including prefixes those peers only reach indirectly.
+    pub fn export_claims(&self) -> Vec<(SocketAddr, NodeId, Range)> {
+        self.claims.iter().map(|entry| (entry.peer, entry.node_id, entry.claim)).collect()
     }
 
     /// Write out the table

@@ -64,7 +64,10 @@ type TestNode<P> = GenericCloud<MockDevice, P, MockSocket, MockTimeSource>;
 pub struct Simulator<P: Protocol> {
     next_port: u16,
     nodes: HashMap<SocketAddr, TestNode<P>>,
-    messages: VecDeque<(SocketAddr, SocketAddr, Vec<u8>)>
+    messages: VecDeque<(SocketAddr, SocketAddr, Vec<u8>)>,
+    /// Underlay pairs whose datagrams are discarded. Adjacent links still flow,
+    /// so a node with no direct path has to be reached by relay.
+    blocked: Vec<(SocketAddr, SocketAddr)>
 }
 
 pub type TapSimulator = Simulator<Frame>;
@@ -75,7 +78,7 @@ impl<P: Protocol> Simulator<P> {
     pub fn new() -> Self {
         init_debug_logger();
         MockTimeSource::set_time(0);
-        Self { next_port: 1, nodes: HashMap::default(), messages: VecDeque::with_capacity(10) }
+        Self { next_port: 1, nodes: HashMap::default(), messages: VecDeque::with_capacity(10), blocked: Vec::new() }
     }
 
     pub fn add_node(&mut self, nat: bool, config: &Config) -> SocketAddr {
@@ -101,8 +104,19 @@ impl<P: Protocol> Simulator<P> {
         node
     }
 
+    pub fn block_pair(&mut self, a: SocketAddr, b: SocketAddr) {
+        self.blocked.push((a, b));
+    }
+
+    fn is_blocked(&self, src: SocketAddr, dst: SocketAddr) -> bool {
+        self.blocked.iter().any(|&(a, b)| (a == src && b == dst) || (a == dst && b == src))
+    }
+
     pub fn simulate_next_message(&mut self) {
         if let Some((src, dst, data)) = self.messages.pop_front() {
+            if self.is_blocked(src, dst) {
+                return;
+            }
             if let Some(node) = self.nodes.get_mut(&dst) {
                 if node.socket().put_inbound(src, data) {
                     DebugLogger::set_node(node.get_num());
@@ -195,6 +209,14 @@ impl<P: Protocol> Simulator<P> {
     #[allow(dead_code)]
     pub fn message_count(&self) -> usize {
         self.messages.len()
+    }
+
+    pub fn clear_messages(&mut self) {
+        self.messages.clear();
+    }
+
+    pub fn front_message(&self) -> Option<(SocketAddr, SocketAddr, Vec<u8>)> {
+        self.messages.front().cloned()
     }
 
     pub fn put_plains(&mut self, addr: SocketAddr, packets: Vec<(Option<(u16, u16)>, Vec<u8>)>) {

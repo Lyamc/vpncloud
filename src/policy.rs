@@ -99,8 +99,9 @@ pub fn generate_e2e_keypair() -> ([u8; 32], [u8; 32]) {
     }
 }
 
-/// Seal `plain` to `dest_public`. The result starts with [`SEAL_MARK`] and does not contain `plain`.
-pub fn seal_relay_body(secret: &[u8; 32], my_public: &[u8; 32], dest_public: &[u8; 32], plain: &[u8]) -> Vec<u8> {
+/// Seal `plain` to `dest_public`. `None` when the seal cannot be built.
+/// Callers drop the packet. The plaintext is never returned.
+pub fn seal_relay_body(secret: &[u8; 32], my_public: &[u8; 32], dest_public: &[u8; 32], plain: &[u8]) -> Option<Vec<u8>> {
     #[cfg(feature = "noise")]
     {
         let me = x25519_dalek::StaticSecret::from(*secret);
@@ -108,17 +109,17 @@ pub fn seal_relay_body(secret: &[u8; 32], my_public: &[u8; 32], dest_public: &[u
         let shared = me.diffie_hellman(&them);
         let mut key = [0u8; 16];
         key.copy_from_slice(&shared.as_bytes()[..16]);
-        let ct = crate::crypto::seal_raw(&key, true, plain).unwrap_or_else(|_| plain.to_vec());
+        let ct = crate::crypto::seal_raw(&key, true, plain).ok()?;
         let mut out = Vec::with_capacity(1 + 32 + ct.len());
         out.push(SEAL_MARK);
         out.extend_from_slice(my_public);
         out.extend_from_slice(&ct);
-        return out;
+        return Some(out);
     }
     #[cfg(not(feature = "noise"))]
     {
-        let _ = (secret, my_public, dest_public);
-        plain.to_vec()
+        let _ = (secret, my_public, dest_public, plain);
+        None
     }
 }
 
@@ -416,7 +417,7 @@ mod tests {
         let (secret_b, pub_b) = generate_e2e_keypair();
         let (secret_r, _) = generate_e2e_keypair();
         let payload = b"end-to-end-secret";
-        let sealed = seal_relay_body(&secret_a, &pub_a, &pub_b, payload);
+        let sealed = seal_relay_body(&secret_a, &pub_a, &pub_b, payload).expect("seal");
         assert_ne!(&sealed[..], payload);
         assert!(open_relay_body(&secret_r, &sealed).is_none());
         assert_eq!(open_relay_body(&secret_b, &sealed).as_deref(), Some(payload.as_slice()));

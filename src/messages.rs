@@ -47,7 +47,18 @@ pub struct NodeInfo {
     /// X25519 public key for relay end-to-end seals.
     pub e2e_public: Option<[u8; 32]>,
     /// Public keys of nodes this node has learned, so peers can seal toward them.
-    pub peer_e2e: Vec<(NodeId, [u8; 32])>
+    pub peer_e2e: Vec<(NodeId, [u8; 32])>,
+    /// Prefixes this node can reach only by relaying. `addr` is the far node's underlay address.
+    pub transit: Vec<TransitClaim>
+}
+
+/// A prefix owned by a node that is not the sender. The receiver installs it
+/// under `addr`, which is not a connected peer, so lookup takes the relay path.
+#[derive(Debug, PartialEq, Clone)]
+pub struct TransitClaim {
+    pub node_id: NodeId,
+    pub addr: SocketAddr,
+    pub claim: Range
 }
 
 impl NodeInfo {
@@ -62,6 +73,7 @@ impl NodeInfo {
     const PART_GROUP: u8 = 8;
     const PART_E2E: u8 = 9;
     const PART_PEER_E2E: u8 = 10;
+    const PART_TRANSIT: u8 = 11;
 
     fn read_addr_list<R: Read>(r: &mut Take<R>) -> Result<AddrList, io::Error> {
         let flags = r.read_u8()?;
@@ -124,6 +136,7 @@ impl NodeInfo {
         let mut group = None;
         let mut e2e_public = None;
         let mut peer_e2e = Vec::new();
+        let mut transit = Vec::new();
         loop {
             let part = r.read_u8().map_err(|_| Error::Message("Truncated message"))?;
             if part == Self::PART_END {
@@ -184,6 +197,9 @@ impl NodeInfo {
                         peer_e2e.push((id, pk));
                     }
                 }
+                Self::PART_TRANSIT => {
+                    transit = Self::decode_transit(&mut rp)?;
+                }
                 _ => {
                     let mut data = vec![0; part_len];
                     rp.read_exact(&mut data).map_err(|_| Error::Message("Truncated message"))?;
@@ -195,7 +211,63 @@ impl NodeInfo {
             Some(node_id) => node_id,
             None => return Err(Error::Message("Payload without node_id"))
         };
-        Ok(Self { node_id, peers, claims, peer_timeout, addrs, underlay_mtu, group, e2e_public, peer_e2e })
+        Ok(Self {
+            node_id,
+            peers,
+            claims,
+            peer_timeout,
+            addrs,
+            underlay_mtu,
+            group,
+            e2e_public,
+            peer_e2e,
+            transit
+        })
+    }
+
+    fn decode_transit<R: Read>(r: &mut Take<R>) -> Result<Vec<TransitClaim>, Error> {
+        let mut out = Vec::new();
+        while r.limit() > 0 {
+            let mut node_id = [0u8; NODE_ID_BYTES];
+            r.read_exact(&mut node_id).map_err(|_| Error::Message("Truncated message"))?;
+            let family = r.read_u8().map_err(|_| Error::Message("Truncated message"))?;
+            let addr = match family {
+                4 => {
+                    let mut ip = [0u8; 4];
+                    r.read_exact(&mut ip).map_err(|_| Error::Message("Truncated message"))?;
+                    let port = r.read_u16::<NetworkEndian>().map_err(|_| Error::Message("Truncated message"))?;
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port))
+                }
+                6 => {
+                    let mut ip = [0u8; 16];
+                    r.read_exact(&mut ip).map_err(|_| Error::Message("Truncated message"))?;
+                    let port = r.read_u16::<NetworkEndian>().map_err(|_| Error::Message("Truncated message"))?;
+                    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(ip), port, 0, 0))
+                }
+                _ => return Err(Error::Message("Truncated message"))
+            };
+            let claim = Range::read_from(&mut *r)?;
+            out.push(TransitClaim { node_id, addr, claim });
+        }
+        Ok(out)
+    }
+
+    fn write_transit<W: Write>(out: &mut W, hop: &TransitClaim) -> Result<(), io::Error> {
+        out.write_all(&hop.node_id)?;
+        match hop.addr {
+            SocketAddr::V4(addr) => {
+                out.write_u8(4)?;
+                out.write_all(&addr.ip().octets())?;
+                out.write_u16::<NetworkEndian>(addr.port())?;
+            }
+            SocketAddr::V6(addr) => {
+                out.write_u8(6)?;
+                out.write_all(&addr.ip().octets())?;
+                out.write_u16::<NetworkEndian>(addr.port())?;
+            }
+        }
+        hop.claim.write_to(&mut *out);
+        Ok(())
     }
 
     pub fn decode<R: Read>(r: R) -> Result<Self, Error> {
@@ -327,6 +399,14 @@ impl NodeInfo {
                     Ok(())
                 })?;
             }
+            if !self.transit.is_empty() {
+                Self::encode_part(&mut cursor, Self::PART_TRANSIT, |cursor| {
+                    for hop in &self.transit {
+                        Self::write_transit(cursor, hop)?;
+                    }
+                    Ok(())
+                })?;
+            }
             cursor.write_u8(Self::PART_END)?;
             len = cursor.position() as usize;
         }
@@ -363,8 +443,33 @@ mod tests {
             underlay_mtu: mtu,
             group: None,
             e2e_public: None,
-            peer_e2e: Vec::new()
+            peer_e2e: Vec::new(),
+            transit: Vec::new()
         }
+    }
+
+    #[test]
+    fn transit_roundtrips_and_old_messages_have_none() {
+        use std::net::SocketAddr;
+        let mut info = sample(None);
+        info.transit.push(TransitClaim {
+            node_id: [9; NODE_ID_BYTES],
+            addr: "192.0.2.8:3210".parse::<SocketAddr>().unwrap(),
+            claim: Range { base: crate::types::Address::from_ipv4("10.9.0.0".parse().unwrap()), prefix_len: 24, metric: 0 }
+        });
+        info.transit.push(TransitClaim {
+            node_id: [8; NODE_ID_BYTES],
+            addr: "[2001:db8::8]:3211".parse::<SocketAddr>().unwrap(),
+            claim: Range { base: crate::types::Address::from_ipv4("10.8.0.0".parse().unwrap()), prefix_len: 16, metric: 0 }
+        });
+        let mut buf = MsgBuffer::new(0);
+        info.encode(&mut buf);
+        let decoded = NodeInfo::decode(buf.message()).expect("decode");
+        assert_eq!(decoded.transit, info.transit);
+        buf.clear();
+        sample(None).encode(&mut buf);
+        let decoded = NodeInfo::decode(buf.message()).expect("decode");
+        assert!(decoded.transit.is_empty());
     }
 
     #[test]

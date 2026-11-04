@@ -349,7 +349,9 @@ pub struct PeerCrypto<P: Payload> {
     core: Option<CryptoCore>,
     #[cfg(feature = "noise")]
     noise_transport: Option<NoiseTransport>,
-    rotate_counter: usize
+    rotate_counter: usize,
+    #[cfg(test)]
+    fail_housekeep: bool
 }
 
 impl<P: Payload> PeerCrypto<P> {
@@ -368,7 +370,9 @@ impl<P: Payload> PeerCrypto<P> {
                 unencrypted: false,
                 core: None,
                 noise_transport: None,
-                rotate_counter: 0
+                rotate_counter: 0,
+                #[cfg(test)]
+                fail_housekeep: false
             };
         }
         let _ = use_noise;
@@ -382,8 +386,15 @@ impl<P: Payload> PeerCrypto<P> {
             core: None,
             #[cfg(feature = "noise")]
             noise_transport: None,
-            rotate_counter: 0
+            rotate_counter: 0,
+            #[cfg(test)]
+            fail_housekeep: false
         }
+    }
+
+    #[cfg(test)]
+    pub fn fail_housekeep(&mut self) {
+        self.fail_housekeep = true;
     }
 
     fn get_init(&mut self) -> Result<&mut InitState<P>, Error> {
@@ -603,6 +614,10 @@ impl<P: Payload> PeerCrypto<P> {
     }
 
     pub fn every_second(&mut self, out: &mut MsgBuffer) -> Result<MessageResult<P>, Error> {
+        #[cfg(test)]
+        if self.fail_housekeep {
+            return Err(Error::Crypto("housekeep failed"));
+        }
         out.clear();
         if let Some(ref mut core) = self.core {
             core.every_second()
