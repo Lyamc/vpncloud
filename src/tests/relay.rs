@@ -407,3 +407,38 @@ fn unauthorized_group_is_dropped_on_relay_delivery() {
     assert!(drain(&mut sim, c).is_empty());
     assert!(drain(&mut sim, b).is_empty());
 }
+
+#[test]
+fn authorized_group_is_delivered_on_relay() {
+    let mut sim = TunSimulator::new();
+    sim.set_time(10);
+    let mut a_cfg = router_grants("10.1.0.0/24", &["group:eng", "prefix:10.3.0.0/24", "prefix:10.2.0.0/24"]);
+    a_cfg.announce_group = Some("eng".to_string());
+    let a = sim.add_node(false, &a_cfg);
+    let b = sim.add_node(false, &{
+        let mut config = router_grants("10.2.0.0/24", &["group:eng", "prefix:10.1.0.0/24", "prefix:10.3.0.0/24"]);
+        config.announce_group = Some("eng".to_string());
+        config
+    });
+    let c = sim.add_node(false, &{
+        let mut config = router_grants("10.3.0.0/24", &["group:eng", "prefix:10.1.0.0/24", "prefix:10.2.0.0/24"]);
+        config.announce_group = Some("eng".to_string());
+        config
+    });
+    bring_up(&mut sim, b, c);
+    sim.block_pair(a, c);
+    bring_up(&mut sim, a, b);
+    assert!(!sim.is_connected(a, c));
+    sim.trigger_node_housekeep(b);
+    sim.simulate_all_messages();
+    assert!(!sim.is_connected(a, c));
+    assert!(sim.is_connected(b, c));
+
+    let pkt = ipv4([10, 1, 0, 9], [10, 3, 0, 9], SECRET);
+    sim.clear_messages();
+    sim.put_payload(a, pkt.clone());
+    let relays = drive(&mut sim);
+    assert!(relays.iter().any(|(src, dst, _)| *src == b && *dst == c), "eng relay did not reach C: {relays:?}");
+    assert!(drain(&mut sim, b).is_empty());
+    assert_eq!(drain(&mut sim, c), vec![pkt]);
+}

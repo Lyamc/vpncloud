@@ -224,7 +224,9 @@ pub fn installable_claims(decision: &FilteredAnnouncement) -> &[Range] {
 #[derive(Clone, Debug)]
 pub struct OriginAuth {
     pub group_ok: bool,
-    pub claims: Vec<Range>
+    pub claims: Vec<Range>,
+    /// Group name the origin announced. Transit export carries this to the next hop.
+    pub group: Option<String>
 }
 
 /// `None`, a failed group, and a claim list that does not cover `src` are false.
@@ -531,12 +533,12 @@ mod tests {
         let own = Range::from_str("10.1.0.0/24").unwrap();
         let other = Range::from_str("10.2.0.0/24").unwrap();
         let src = Address::from_str("10.1.0.9").unwrap();
-        let ok = OriginAuth { group_ok: true, claims: vec![own] };
+        let ok = OriginAuth { group_ok: true, claims: vec![own], group: Some("eng".to_string()) };
         assert!(relay_origin_allowed(Some(&ok), src));
-        let borrowed = OriginAuth { group_ok: true, claims: vec![other] };
+        let borrowed = OriginAuth { group_ok: true, claims: vec![other], group: Some("eng".to_string()) };
         assert!(!relay_origin_allowed(Some(&borrowed), src));
         assert!(!relay_origin_allowed(None, src));
-        let bad_group = OriginAuth { group_ok: false, claims: vec![own] };
+        let bad_group = OriginAuth { group_ok: false, claims: vec![own], group: Some("finance".to_string()) };
         assert!(!relay_origin_allowed(Some(&bad_group), src));
     }
 

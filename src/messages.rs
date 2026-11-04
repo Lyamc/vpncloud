@@ -58,7 +58,9 @@ pub struct NodeInfo {
 pub struct TransitClaim {
     pub node_id: NodeId,
     pub addr: SocketAddr,
-    pub claim: Range
+    pub claim: Range,
+    /// Group the far node announced. The receiver filters with this, not with `None`.
+    pub group: Option<String>
 }
 
 impl NodeInfo {
@@ -248,7 +250,15 @@ impl NodeInfo {
             };
             let mut claim = Range::read_from(&mut *r)?;
             claim.metric = r.read_u8().map_err(|_| Error::Message("Truncated message"))?;
-            out.push(TransitClaim { node_id, addr, claim });
+            let glen = r.read_u8().map_err(|_| Error::Message("Truncated message"))? as usize;
+            let mut gbytes = vec![0u8; glen];
+            r.read_exact(&mut gbytes).map_err(|_| Error::Message("Truncated message"))?;
+            let group = if glen == 0 {
+                None
+            } else {
+                Some(String::from_utf8(gbytes).map_err(|_| Error::Message("Truncated message"))?)
+            };
+            out.push(TransitClaim { node_id, addr, claim, group });
         }
         Ok(out)
     }
@@ -269,6 +279,15 @@ impl NodeInfo {
         }
         hop.claim.write_to(&mut *out);
         out.write_u8(hop.claim.metric)?;
+        match hop.group.as_deref() {
+            Some(name) if !name.is_empty() => {
+                let bytes = name.as_bytes();
+                let n = bytes.len().min(255);
+                out.write_u8(n as u8)?;
+                out.write_all(&bytes[..n])?;
+            }
+            _ => out.write_u8(0)?
+        }
         Ok(())
     }
 
@@ -457,12 +476,14 @@ mod tests {
         info.transit.push(TransitClaim {
             node_id: [9; NODE_ID_BYTES],
             addr: "192.0.2.8:3210".parse::<SocketAddr>().unwrap(),
-            claim: Range { base: crate::types::Address::from_ipv4("10.9.0.0".parse().unwrap()), prefix_len: 16, metric: 40 }
+            claim: Range { base: crate::types::Address::from_ipv4("10.9.0.0".parse().unwrap()), prefix_len: 16, metric: 40 },
+            group: Some("eng".to_string())
         });
         info.transit.push(TransitClaim {
             node_id: [8; NODE_ID_BYTES],
             addr: "[2001:db8::8]:3211".parse::<SocketAddr>().unwrap(),
-            claim: Range { base: crate::types::Address::from_ipv4("10.8.0.0".parse().unwrap()), prefix_len: 16, metric: 10 }
+            claim: Range { base: crate::types::Address::from_ipv4("10.8.0.0".parse().unwrap()), prefix_len: 16, metric: 10 },
+            group: None
         });
         let mut buf = MsgBuffer::new(0);
         info.encode(&mut buf);
@@ -470,6 +491,8 @@ mod tests {
         assert_eq!(decoded.transit, info.transit);
         assert_eq!(decoded.transit[0].claim.metric, 40);
         assert_eq!(decoded.transit[1].claim.metric, 10);
+        assert_eq!(decoded.transit[0].group.as_deref(), Some("eng"));
+        assert_eq!(decoded.transit[1].group, None);
         buf.clear();
         sample(None).encode(&mut buf);
         let decoded = NodeInfo::decode(buf.message()).expect("decode");

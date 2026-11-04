@@ -873,10 +873,14 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             if node_id == self.node_id {
                 continue;
             }
-            if !self.origin_auth.get(&node_id).is_some_and(|auth| auth.group_ok) {
+            let Some(auth) = self.origin_auth.get(&node_id) else {
+                continue;
+            };
+            if !auth.group_ok {
                 continue;
             }
-            transit.push(TransitClaim { node_id, addr, claim });
+            let group = auth.group.clone();
+            transit.push(TransitClaim { node_id, addr, claim, group });
         }
         NodeInfo {
             node_id: self.node_id,
@@ -1566,7 +1570,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     /// Install prefixes whose underlay address is not a connected peer.
     /// Lookup then misses `self.peers` and `route_message` seals a relay.
     fn install_transit(&mut self, transit: &[TransitClaim]) {
-        let mut grouped: Vec<(SocketAddr, NodeId, RangeList)> = Vec::new();
+        let mut grouped: Vec<(SocketAddr, NodeId, Option<String>, RangeList)> = Vec::new();
         for hop in transit {
             if hop.node_id == self.node_id {
                 continue;
@@ -1579,21 +1583,21 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 continue;
             }
             if let Some(slot) = grouped.iter_mut().find(|slot| slot.0 == addr && slot.1 == hop.node_id) {
-                slot.2.push(hop.claim);
+                slot.3.push(hop.claim);
             } else {
                 let mut claims = RangeList::new();
                 claims.push(hop.claim);
-                grouped.push((addr, hop.node_id, claims));
+                grouped.push((addr, hop.node_id, hop.group.clone(), claims));
             }
         }
-        for (addr, node_id, claims) in grouped {
+        for (addr, node_id, group, claims) in grouped {
             let decision = policy::filter_announcement(
                 &self.grants,
-                &policy::Announcement { claims: claims.iter().copied().collect(), group: None }
+                &policy::Announcement { claims: claims.iter().copied().collect(), group: group.clone() }
             );
             self.origin_auth.insert(
                 node_id,
-                policy::OriginAuth { group_ok: decision.group_ok, claims: decision.claims.clone() }
+                policy::OriginAuth { group_ok: decision.group_ok, claims: decision.claims.clone(), group: group.clone() }
             );
             let mut kept = RangeList::new();
             kept.extend(policy::installable_claims(&decision).iter().copied());
@@ -1675,7 +1679,11 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             );
             self.origin_auth.insert(
                 info.node_id,
-                policy::OriginAuth { group_ok: decision.group_ok, claims: decision.claims.clone() }
+                policy::OriginAuth {
+                    group_ok: decision.group_ok,
+                    claims: decision.claims.clone(),
+                    group: info.group.clone()
+                }
             );
             if self.grants.enforcing {
                 if let Some(peer) = self.peers.get_mut(&addr) {
