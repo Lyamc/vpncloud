@@ -362,4 +362,48 @@ fn relay_delivery_authorizes_the_origin_not_the_hop() {
     sim.simulate_all_messages();
     assert!(drain(&mut sim, c).is_empty());
     assert!(drain(&mut sim, b).is_empty());
+
+    // 10.2.0.9 is B's granted prefix. A's seal must not be accepted for it.
+    let spoof = ipv4([10, 2, 0, 9], [10, 3, 0, 9], SECRET);
+    sim.clear_messages();
+    sim.put_payload(a, spoof);
+    let relays = drive(&mut sim);
+    assert!(relays.iter().any(|(src, dst, _)| *src == b && *dst == c), "spoof was not relayed: {relays:?}");
+    assert!(drain(&mut sim, c).is_empty());
+    assert!(drain(&mut sim, b).is_empty());
+}
+
+#[test]
+fn unauthorized_group_is_dropped_on_relay_delivery() {
+    let mut sim = TunSimulator::new();
+    sim.set_time(10);
+    let mut a_cfg = router("10.1.0.0/24", true);
+    a_cfg.announce_group = Some("finance".to_string());
+    let a = sim.add_node(false, &a_cfg);
+    let b = sim.add_node(false, &{
+        let mut config = router_grants("10.2.0.0/24", &["group:eng", "prefix:10.1.0.0/24", "prefix:10.3.0.0/24"]);
+        config.announce_group = Some("eng".to_string());
+        config
+    });
+    let c = sim.add_node(false, &{
+        let mut config = router_grants("10.3.0.0/24", &["group:eng", "prefix:10.1.0.0/24"]);
+        config.announce_group = Some("eng".to_string());
+        config
+    });
+    bring_up(&mut sim, b, c);
+    sim.block_pair(a, c);
+    bring_up(&mut sim, a, b);
+    assert!(!sim.is_connected(a, c));
+    assert!(sim.is_connected(b, c));
+    sim.trigger_node_housekeep(b);
+    sim.simulate_all_messages();
+    assert!(!sim.is_connected(a, c));
+
+    let pkt = ipv4([10, 1, 0, 9], [10, 3, 0, 9], SECRET);
+    sim.clear_messages();
+    sim.put_payload(a, pkt);
+    let relays = drive(&mut sim);
+    assert!(relays.iter().any(|(src, dst, _)| *src == b && *dst == c), "group reject never reached C: {relays:?}");
+    assert!(drain(&mut sim, c).is_empty());
+    assert!(drain(&mut sim, b).is_empty());
 }

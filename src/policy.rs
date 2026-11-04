@@ -123,8 +123,9 @@ pub fn seal_relay_body(secret: &[u8; 32], my_public: &[u8; 32], dest_public: &[u
     }
 }
 
-/// Open a body produced by [`seal_relay_body`]. Returns `None` when the mark is absent or the MAC fails.
-pub fn open_relay_body(secret: &[u8; 32], inner: &[u8]) -> Option<Vec<u8>> {
+/// Open a body produced by [`seal_relay_body`].
+/// Returns the sealer public key and the plaintext. `None` when the mark is absent or the MAC fails.
+pub fn open_relay_body(secret: &[u8; 32], inner: &[u8]) -> Option<([u8; 32], Vec<u8>)> {
     if inner.first() != Some(&SEAL_MARK) || inner.len() < 1 + 32 {
         return None;
     }
@@ -137,7 +138,8 @@ pub fn open_relay_body(secret: &[u8; 32], inner: &[u8]) -> Option<Vec<u8>> {
         let shared = me.diffie_hellman(&them);
         let mut key = [0u8; 16];
         key.copy_from_slice(&shared.as_bytes()[..16]);
-        return crate::crypto::open_raw(&key, false, &inner[33..]).ok();
+        let plain = crate::crypto::open_raw(&key, false, &inner[33..]).ok()?;
+        return Some((their, plain));
     }
     #[cfg(not(feature = "noise"))]
     {
@@ -196,16 +198,41 @@ fn prefix_covered(allow: &[Range], claim: &Range) -> bool {
 }
 
 /// Unauthorized prefixes are left out of `claims`. An unauthorized group sets `group_ok` false.
+/// A missing group is allowed only when no group grant is configured.
 pub fn filter_announcement(grants: &Grants, ann: &Announcement) -> FilteredAnnouncement {
     if !grants.enforcing {
         return FilteredAnnouncement { claims: ann.claims.clone(), group_ok: true };
     }
     let claims = ann.claims.iter().copied().filter(|c| prefix_covered(&grants.prefixes, c)).collect();
     let group_ok = match &ann.group {
-        None => true,
+        None => grants.groups.is_empty(),
         Some(group) => grants.groups.iter().any(|allowed| allowed == group)
     };
     FilteredAnnouncement { claims, group_ok }
+}
+
+/// Claims that may be installed. A failed group installs nothing.
+pub fn installable_claims(decision: &FilteredAnnouncement) -> &[Range] {
+    if decision.group_ok {
+        &decision.claims
+    } else {
+        &[]
+    }
+}
+
+/// The sealer's own group and prefixes. This does not look at any other node.
+#[derive(Clone, Debug)]
+pub struct OriginAuth {
+    pub group_ok: bool,
+    pub claims: Vec<Range>
+}
+
+/// `None`, a failed group, and a claim list that does not cover `src` are false.
+pub fn relay_origin_allowed(origin: Option<&OriginAuth>, src: Address) -> bool {
+    match origin {
+        Some(origin) if origin.group_ok => origin.claims.iter().any(|claim| claim.matches(src)),
+        _ => false
+    }
 }
 
 pub fn source_allowed(enforcing: bool, group_ok: bool, installed: &[Range], src: Address) -> bool {
@@ -420,7 +447,9 @@ mod tests {
         let sealed = seal_relay_body(&secret_a, &pub_a, &pub_b, payload).expect("seal");
         assert_ne!(&sealed[..], payload);
         assert!(open_relay_body(&secret_r, &sealed).is_none());
-        assert_eq!(open_relay_body(&secret_b, &sealed).as_deref(), Some(payload.as_slice()));
+        let (sealer, plain) = open_relay_body(&secret_b, &sealed).expect("open");
+        assert_eq!(sealer, pub_a);
+        assert_eq!(plain, payload);
 
         let dest = [9u8; 16];
         let frame = encode_relay(&dest, MESSAGE_TYPE_DATA, &sealed);
@@ -443,7 +472,9 @@ mod tests {
             panic!("dest")
         };
         assert_eq!(inner, sealed);
-        assert_eq!(open_relay_body(&secret_b, &inner).as_deref(), Some(payload.as_slice()));
+        let (sealer, plain) = open_relay_body(&secret_b, &inner).expect("open");
+        assert_eq!(sealer, pub_a);
+        assert_eq!(plain, payload);
     }
 
     fn hops_addr(id: u8) -> SocketAddr {
@@ -493,6 +524,33 @@ mod tests {
         let all = filter_announcement(&open, &Announcement { claims: vec![bad_claim], group: Some("finance".into()) });
         assert_eq!(all.claims, vec![bad_claim]);
         assert!(source_allowed(false, true, &[], outsider));
+    }
+
+    #[test]
+    fn relay_origin_allowed_uses_only_that_origins_record() {
+        let own = Range::from_str("10.1.0.0/24").unwrap();
+        let other = Range::from_str("10.2.0.0/24").unwrap();
+        let src = Address::from_str("10.1.0.9").unwrap();
+        let ok = OriginAuth { group_ok: true, claims: vec![own] };
+        assert!(relay_origin_allowed(Some(&ok), src));
+        let borrowed = OriginAuth { group_ok: true, claims: vec![other] };
+        assert!(!relay_origin_allowed(Some(&borrowed), src));
+        assert!(!relay_origin_allowed(None, src));
+        let bad_group = OriginAuth { group_ok: false, claims: vec![own] };
+        assert!(!relay_origin_allowed(Some(&bad_group), src));
+    }
+
+    #[test]
+    fn missing_group_fails_only_when_groups_are_required() {
+        let claim = Range::from_str("10.1.0.0/24").unwrap();
+        let grouped = parse_grants(&["prefix:10.0.0.0/8".into(), "group:eng".into()]).unwrap();
+        let missing = filter_announcement(&grouped, &Announcement { claims: vec![claim], group: None });
+        assert!(!missing.group_ok);
+        assert!(installable_claims(&missing).is_empty());
+        let prefixes = parse_grants(&["prefix:10.0.0.0/8".into()]).unwrap();
+        let open_group = filter_announcement(&prefixes, &Announcement { claims: vec![claim], group: None });
+        assert!(open_group.group_ok);
+        assert_eq!(installable_claims(&open_group), &[claim]);
     }
 
     #[test]

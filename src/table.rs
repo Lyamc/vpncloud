@@ -106,12 +106,6 @@ impl<TS: TimeSource> ClaimTable<TS> {
         found
     }
 
-    /// Longest prefix, then lowest metric. Ignores the forwarding cache.
-    pub fn best_claim(&self, addr: Address) -> Option<(SocketAddr, NodeId, Range)> {
-        let entry = &self.claims[self.best_index(addr)?];
-        Some((entry.peer, entry.node_id, entry.claim))
-    }
-
     pub fn lookup(&mut self, addr: Address) -> Option<(SocketAddr, NodeId)> {
         // HOT PATH
         if let Some(entry) = self.cache.get(&addr) {

@@ -288,6 +288,10 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     e2e_secret: [u8; 32],
     e2e_public: [u8; 32],
     known_e2e: HashMap<NodeId, [u8; 32], Hash>,
+    /// Reverse of `known_e2e`. A relay sealer is this key, not the previous hop.
+    e2e_by_pub: HashMap<[u8; 32], NodeId, Hash>,
+    /// Per-node group and prefixes taken from `filter_announcement` only.
+    origin_auth: HashMap<NodeId, policy::OriginAuth, Hash>,
     grants: policy::Grants,
     flows: policy::FlowTable,
     names: Vec<(String, Address)>,
@@ -413,6 +417,8 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             e2e_secret,
             e2e_public,
             known_e2e: HashMap::default(),
+            e2e_by_pub: HashMap::default(),
+            origin_auth: HashMap::default(),
             grants,
             flows: policy::FlowTable::default(),
             names: policy::parse_peer_names(&config.peer_names),
@@ -737,7 +743,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         for (result, mut data) in packets {
             match result {
                 Ok(val) => {
-                    if let Err(e) = self.handle_message(src, val, &mut data, false) {
+                    if let Err(e) = self.handle_message(src, val, &mut data, None) {
                         error!("{}", e);
                     }
                     if data.is_empty() {
@@ -865,6 +871,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 break;
             }
             if node_id == self.node_id {
+                continue;
+            }
+            if !self.origin_auth.get(&node_id).is_some_and(|auth| auth.group_ok) {
                 continue;
             }
             transit.push(TransitClaim { node_id, addr, claim });
@@ -1330,14 +1339,14 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 Ok(())
             }
             policy::RelayDecision::Deliver { inner_type, inner } => {
-                let Some(plain) = policy::open_relay_body(&self.e2e_secret, &inner) else {
+                let Some((sealer, plain)) = policy::open_relay_body(&self.e2e_secret, &inner) else {
                     debug!("Dropping relay: end-to-end open failed");
                     self.traffic.count_dropped_payload(inner.len());
                     return Ok(());
                 };
                 let mut buf = self.take_spare();
                 buf.clone_from(&plain);
-                let result = self.handle_message(src, MessageResult::Message(inner_type), &mut buf, true);
+                let result = self.handle_message(src, MessageResult::Message(inner_type), &mut buf, Some(sealer));
                 self.buf_spare.push(buf);
                 result
             }
@@ -1416,7 +1425,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         self.route_message(dst, MESSAGE_TYPE_DATA_GSO, data)
     }
 
-    fn handle_gso_payload_from(&mut self, peer: SocketAddr, data: &mut MsgBuffer, relayed: bool) -> Result<(), Error> {
+    fn handle_gso_payload_from(
+        &mut self, peer: SocketAddr, data: &mut MsgBuffer, sealer: Option<[u8; 32]>
+    ) -> Result<(), Error> {
         let Some(meta) = GsoMeta::read(data.message()) else {
             self.traffic.count_invalid_protocol(data.len());
             return Err(Error::Message("Truncated GSO message"));
@@ -1428,7 +1439,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         let (src, dst) = {
             let ip = &data.message()[GSO_META_LEN..];
             let (src, dst) = P::parse(ip)?;
-            if !self.ingress_allowed(peer, ip, src, relayed) {
+            if !self.ingress_allowed(peer, ip, src, sealer) {
                 return Ok(());
             }
             if !self.acl.is_empty() {
@@ -1580,11 +1591,16 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 &self.grants,
                 &policy::Announcement { claims: claims.iter().copied().collect(), group: None }
             );
-            if decision.claims.is_empty() {
+            self.origin_auth.insert(
+                node_id,
+                policy::OriginAuth { group_ok: decision.group_ok, claims: decision.claims.clone() }
+            );
+            let mut kept = RangeList::new();
+            kept.extend(policy::installable_claims(&decision).iter().copied());
+            if kept.is_empty() {
+                self.table.set_claims(addr, node_id, kept);
                 continue;
             }
-            let mut kept = RangeList::new();
-            kept.extend(decision.claims.iter().copied());
             debug!("Transit route {} via {}", addr_nice(addr), kept.len());
             self.table.set_claims(addr, node_id, kept);
         }
@@ -1648,14 +1664,18 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
         if let Some(info) = info {
             if let Some(pk) = info.e2e_public {
-                self.known_e2e.insert(info.node_id, pk);
+                self.remember_e2e(info.node_id, pk);
             }
             for (id, pk) in &info.peer_e2e {
-                self.known_e2e.entry(*id).or_insert(*pk);
+                self.remember_e2e_if_new(*id, *pk);
             }
             let decision = policy::filter_announcement(
                 &self.grants,
                 &policy::Announcement { claims: info.claims.iter().copied().collect(), group: info.group.clone() }
+            );
+            self.origin_auth.insert(
+                info.node_id,
+                policy::OriginAuth { group_ok: decision.group_ok, claims: decision.claims.clone() }
             );
             if self.grants.enforcing {
                 if let Some(peer) = self.peers.get_mut(&addr) {
@@ -1665,7 +1685,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 }
             }
             let mut claims = RangeList::new();
-            claims.extend(decision.claims.iter().copied());
+            claims.extend(policy::installable_claims(&decision).iter().copied());
             debug!("Adding claims of peer {}: {:?}", addr_nice(addr), claims);
             self.table.set_claims(addr, info.node_id, claims);
             self.install_transit(&info.transit);
@@ -1676,10 +1696,12 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         Ok(())
     }
 
-    fn handle_payload_from(&mut self, peer: SocketAddr, data: &mut MsgBuffer, relayed: bool) -> Result<(), Error> {
+    fn handle_payload_from(
+        &mut self, peer: SocketAddr, data: &mut MsgBuffer, sealer: Option<[u8; 32]>
+    ) -> Result<(), Error> {
         // HOT PATH
         let (src, dst) = P::parse(data.message())?;
-        if !self.ingress_allowed(peer, data.message(), src, relayed) {
+        if !self.ingress_allowed(peer, data.message(), src, sealer) {
             self.traffic.count_dropped_payload(data.len());
             return Ok(());
         }
@@ -1715,7 +1737,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         Ok(())
     }
 
-    fn ingress_allowed(&self, peer: SocketAddr, pkt: &[u8], src: Address, relayed: bool) -> bool {
+    fn ingress_allowed(&self, peer: SocketAddr, pkt: &[u8], src: Address, sealer: Option<[u8; 32]>) -> bool {
         if self.config.stateful_filter {
             if let Some(flow) = policy::ipv4_flow(pkt) {
                 if !self.flows.allow_inbound(&flow) {
@@ -1725,8 +1747,8 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             }
         }
         if self.grants.enforcing {
-            let allowed = if relayed {
-                self.relay_source_allowed(src)
+            let allowed = if let Some(sealer) = sealer {
+                self.relay_source_allowed(sealer, src)
             } else {
                 self.peers
                     .get(&peer)
@@ -1741,16 +1763,28 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         true
     }
 
-    /// A relayed packet's previous hop is not the origin. The source has to
-    /// match the origin's installed claim. That row already passed the grants.
-    fn relay_source_allowed(&self, src: Address) -> bool {
-        let Some((_, origin_id, _)) = self.table.best_claim(src) else {
+    /// The opened source has to match the sealer's own record. Another node's prefix does not count.
+    fn relay_source_allowed(&self, sealer: [u8; 32], src: Address) -> bool {
+        let Some(origin_id) = self.e2e_by_pub.get(&sealer).copied() else {
             return false;
         };
-        if let Some(peer) = self.peers.values().find(|peer| peer.node_id == origin_id) {
-            return policy::source_allowed(true, peer.group_ok, &peer.auth_claims, src);
+        policy::relay_origin_allowed(self.origin_auth.get(&origin_id), src)
+    }
+
+    fn remember_e2e(&mut self, id: NodeId, pk: [u8; 32]) {
+        if let Some(prev) = self.known_e2e.insert(id, pk) {
+            if prev != pk {
+                self.e2e_by_pub.remove(&prev);
+            }
         }
-        true
+        self.e2e_by_pub.insert(pk, id);
+    }
+
+    fn remember_e2e_if_new(&mut self, id: NodeId, pk: [u8; 32]) {
+        if self.known_e2e.contains_key(&id) {
+            return;
+        }
+        self.remember_e2e(id, pk);
     }
 
     fn arm_gro_hold(&mut self) {
@@ -1789,7 +1823,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     }
 
     fn handle_message(
-        &mut self, src: SocketAddr, msg_result: MessageResult<NodeInfo>, data: &mut MsgBuffer, relayed: bool
+        &mut self, src: SocketAddr, msg_result: MessageResult<NodeInfo>, data: &mut MsgBuffer, sealer: Option<[u8; 32]>
     ) -> Result<(), Error> {
         // HOT PATH
         match msg_result {
@@ -1798,11 +1832,11 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 match type_ {
                     MESSAGE_TYPE_DATA => {
                         // HOT PATH
-                        self.handle_payload_from(src, data, relayed)?
+                        self.handle_payload_from(src, data, sealer)?
                     }
                     MESSAGE_TYPE_DATA_GSO => {
                         // HOT PATH
-                        self.handle_gso_payload_from(src, data, relayed)?
+                        self.handle_gso_payload_from(src, data, sealer)?
                     }
                     MESSAGE_TYPE_RELAY => self.handle_relay(src, data)?,
                     MESSAGE_TYPE_NODE_INFO => {
@@ -1940,7 +1974,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         match msg_result {
             Ok(val) => {
                 // HOT PATH
-                self.handle_message(src, val, data, false)
+                self.handle_message(src, val, data, None)
             }
             Err(err) => {
                 // COLD PATH
@@ -2507,7 +2541,9 @@ impl<P: Protocol> GenericCloud<MockDevice, P, MockSocket, MockTimeSource> {
 
     #[cfg(test)]
     pub fn test_forget_e2e(&mut self, id: &NodeId) {
-        self.known_e2e.remove(id);
+        if let Some(pk) = self.known_e2e.remove(id) {
+            self.e2e_by_pub.remove(&pk);
+        }
     }
 
     #[cfg(test)]

@@ -387,7 +387,9 @@ mod tests {
             match s.receive(&mut buf) {
                 Ok(_) if buf.message() == frame.as_slice() => {
                     assert_eq!(buf.message()[16], crate::messages::MESSAGE_TYPE_DATA);
-                    assert_eq!(crate::policy::open_relay_body(&secret_b, &buf.message()[17..]).as_deref(), Some(payload.as_slice()));
+                    let (sealer, plain) = crate::policy::open_relay_body(&secret_b, &buf.message()[17..]).expect("open");
+                    assert_eq!(sealer, pub_a);
+                    assert_eq!(plain, payload);
                     let (plain, _, _) = crate::crypto::Crypto::parse_algorithms(&[]).unwrap();
                     assert!(!plain);
                     return;
