@@ -167,4 +167,26 @@ impl<TS: TimeSource> ClaimTable<TS> {
     }
 }
 
-// TODO: test
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::MockTimeSource;
+    use std::str::FromStr;
+
+    #[test]
+    fn lowest_metric_wins_on_equal_prefix() {
+        MockTimeSource::set_time(1_000);
+        let mut table = ClaimTable::<MockTimeSource>::new(60, 300);
+        let worse: SocketAddr = "1.1.1.1:1".parse().unwrap();
+        let better: SocketAddr = "2.2.2.2:2".parse().unwrap();
+        let mut high = RangeList::new();
+        high.push(Range::from_str("10.0.0.0/16@50").unwrap());
+        table.set_claims(worse, [1; 16], high);
+        let mut low = RangeList::new();
+        low.push(Range::from_str("10.0.0.0/16@10").unwrap());
+        table.set_claims(better, [2; 16], low);
+        let (peer, node) = table.lookup(Address::from_str("10.0.1.9").unwrap()).unwrap();
+        assert_eq!(peer, better);
+        assert_eq!(node, [2; 16]);
+    }
+}

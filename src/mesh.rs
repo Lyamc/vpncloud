@@ -73,6 +73,12 @@ impl MeshSocket {
     fn take_tcp(&self) -> Option<(SocketAddr, Vec<u8>)> {
         self.inbound.lock().ok()?.pop_front()
     }
+
+    fn tcp_tx(&self, addr: &SocketAddr) -> Option<mpsc::Sender<Vec<u8>>> {
+        let mapped = mapped_addr(*addr);
+        let map = self.peers.lock().ok()?;
+        map.get(&mapped).or_else(|| map.get(addr)).or_else(|| map.get(&send_addr(*addr))).cloned()
+    }
 }
 
 fn poke_wakeup(wakeup: SocketAddr) {
@@ -288,26 +294,34 @@ impl Socket for MeshSocket {
     }
 
     fn send_batch(&mut self, packets: &[(&SocketAddr, &[u8])]) -> io::Result<usize> {
-        let mut udp: Vec<(&SocketAddr, &[u8])> = Vec::with_capacity(packets.len());
-        let mut n = 0;
-        for (addr, data) in packets {
-            let mapped = mapped_addr(**addr);
-            let via_tcp = if let Ok(map) = self.peers.lock() {
-                map.get(&mapped).or_else(|| map.get(addr)).or_else(|| map.get(&send_addr(**addr))).cloned()
-            } else {
-                None
-            };
-            if let Some(tx) = via_tcp {
-                let _ = tx.send(data.to_vec());
-                n += 1;
-            } else {
-                udp.push((*addr, *data));
+        // The count is a prefix of `packets`. A short UDP send stops the scan
+        // so the caller can retry the tail instead of treating a byte total
+        // as a message count.
+        let mut i = 0;
+        while i < packets.len() {
+            if let Some(tx) = self.tcp_tx(packets[i].0) {
+                let _ = tx.send(packets[i].1.to_vec());
+                i += 1;
+                continue;
+            }
+            let start = i;
+            i += 1;
+            while i < packets.len() && self.tcp_tx(packets[i].0).is_none() {
+                i += 1;
+            }
+            let sent = Socket::send_batch(&mut self.udp, &packets[start..i])?;
+            if sent < i - start {
+                return Ok(start + sent);
             }
         }
-        if !udp.is_empty() {
-            n += Socket::send_batch(&mut self.udp, &udp)?;
-        }
-        Ok(n)
+        Ok(i)
+    }
+
+    /// The event loop polls this same UDP descriptor. The hold must use it too,
+    /// or a short train never waits and GRO never sees more than one segment.
+    #[cfg(target_os = "linux")]
+    fn gro_wait_fd(&self) -> Option<RawFd> {
+        Some(self.udp.as_raw_fd())
     }
 }
 
@@ -321,6 +335,13 @@ impl crate::poll::Pollable for MeshSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mesh_socket_polls_the_udp_fd_for_the_gro_hold() {
+        let sock = MeshSocket::open("127.0.0.1:0", false).expect("open");
+        assert_eq!(Socket::gro_wait_fd(&sock), Some(AsRawFd::as_raw_fd(&sock)));
+    }
 
     #[test]
     fn frame_roundtrip_localhost() {
@@ -344,5 +365,40 @@ mod tests {
             }
         }
         panic!("no tcp frame");
+    }
+
+    #[test]
+    fn tcp_fallback_delivers_the_sealed_relay_payload() {
+        let (secret_a, pub_a) = crate::policy::generate_e2e_keypair();
+        let (secret_b, pub_b) = crate::policy::generate_e2e_keypair();
+        let payload = b"tcp-relay-secret";
+        let sealed = crate::policy::seal_relay_body(&secret_a, &pub_a, &pub_b, payload);
+        let frame = crate::policy::encode_relay(&[9u8; 16], crate::messages::MESSAGE_TYPE_DATA, &sealed);
+        let server = MeshSocket::open("127.0.0.1:0", true).expect("listen");
+        let addr = server.udp.local_addr().expect("addr");
+        let client = MeshSocket::open("127.0.0.1:0", false).expect("client");
+        client.connect_stream(addr).expect("connect");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let mut c = client;
+        let mut s = server;
+        Socket::send(&mut c, &frame, addr).expect("send");
+        let mut buf = MsgBuffer::new(0);
+        for _ in 0..50 {
+            match s.receive(&mut buf) {
+                Ok(_) if buf.message() == frame.as_slice() => {
+                    assert_eq!(buf.message()[16], crate::messages::MESSAGE_TYPE_DATA);
+                    assert_eq!(crate::policy::open_relay_body(&secret_b, &buf.message()[17..]).as_deref(), Some(payload.as_slice()));
+                    let (plain, _, _) = crate::crypto::Crypto::parse_algorithms(&[]).unwrap();
+                    assert!(!plain);
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("{e}")
+            }
+        }
+        panic!("no tcp relay frame");
     }
 }

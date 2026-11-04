@@ -8,7 +8,7 @@ mod init;
 #[cfg(feature = "noise")] mod noise;
 mod rotate;
 
-pub use self::core::{EXTRA_LEN, TAG_LEN};
+pub use self::core::{open_raw, seal_raw, EXTRA_LEN, TAG_LEN};
 pub use common::*;
 #[cfg(feature = "noise")]
 pub use noise::is_noise_frame;

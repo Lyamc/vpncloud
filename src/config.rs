@@ -22,7 +22,11 @@ use std::{
 
 pub const DEFAULT_PEER_TIMEOUT: u16 = 300;
 pub const DEFAULT_PORT: u16 = 3210;
-pub const DEFAULT_SOCKET_BUFFER: usize = 2 * 1024 * 1024;
+pub const DEFAULT_SOCKET_BUFFER: usize = 32 * 1024 * 1024;
+
+/// Public STUN servers used when `--stun-server` is not set. Two, so one outage is not fatal.
+pub const DEFAULT_STUN_SERVERS: [&str; 2] =
+    ["stun.l.google.com:19302", "stun1.l.google.com:19302"];
 
 /// DATA crypto workers. Tests stay on the wait thread. Otherwise use extra cores, capped at 4.
 pub fn default_crypto_threads() -> usize {
@@ -174,8 +178,24 @@ pub struct Config {
     pub require_signed_config: bool,
     /// Linux: install a seccomp blacklist after bind/TUN/privdrop.
     pub seccomp: bool,
-    /// `SO_RCVBUF` / `SO_SNDBUF` in bytes (default 2 MiB).
-    pub socket_buffer_bytes: usize
+    /// `SO_RCVBUF` / `SO_SNDBUF` in bytes (default 32 MiB).
+    pub socket_buffer_bytes: usize,
+    /// `prefix:CIDR` and `group:name` grants. Empty does not enforce claims.
+    pub grants: Vec<String>,
+    /// Split-tunnel prefixes. Empty forwards every overlay destination.
+    pub split: Vec<String>,
+    /// Forward a default route to `exit_node` when that node is authorized.
+    pub full_tunnel: bool,
+    /// Hex node id of the full-tunnel exit.
+    pub exit_node: Option<String>,
+    /// Hex node ids allowed to be an exit. Empty means `exit_node` itself.
+    pub exit_allow: Vec<String>,
+    /// `name=overlay-ip` records for the built-in resolver.
+    pub peer_names: Vec<String>,
+    /// Allow the reverse of a flow this node originated. Drop the unsolicited reverse.
+    pub stateful_filter: bool,
+    /// Group name advertised in node info.
+    pub announce_group: Option<String>
 }
 
 impl Default for Config {
@@ -219,7 +239,7 @@ impl Default for Config {
             stun_servers: if cfg!(test) {
                 vec![]
             } else {
-                vec!["stun.l.google.com:19302".into(), "stun1.l.google.com:19302".into()]
+                DEFAULT_STUN_SERVERS.iter().map(|s| (*s).to_string()).collect()
             },
             lan_only: false,
             init_rate_limit: 20,
@@ -228,7 +248,15 @@ impl Default for Config {
             crypto_threads: default_crypto_threads(),
             require_signed_config: false,
             seccomp: !cfg!(test),
-            socket_buffer_bytes: DEFAULT_SOCKET_BUFFER
+            socket_buffer_bytes: DEFAULT_SOCKET_BUFFER,
+            grants: vec![],
+            split: vec![],
+            full_tunnel: false,
+            exit_node: None,
+            exit_allow: vec![],
+            peer_names: vec![],
+            stateful_filter: false,
+            announce_group: None
         }
     }
 }
@@ -383,6 +411,30 @@ impl Config {
         }
         if let Some(val) = file.socket_buffer {
             self.socket_buffer_bytes = val;
+        }
+        if let Some(mut val) = file.grants {
+            self.grants.append(&mut val);
+        }
+        if let Some(mut val) = file.split {
+            self.split.append(&mut val);
+        }
+        if let Some(val) = file.full_tunnel {
+            self.full_tunnel = val;
+        }
+        if let Some(val) = file.exit_node {
+            self.exit_node = Some(val);
+        }
+        if let Some(mut val) = file.exit_allow {
+            self.exit_allow.append(&mut val);
+        }
+        if let Some(mut val) = file.peer_names {
+            self.peer_names.append(&mut val);
+        }
+        if let Some(val) = file.stateful_filter {
+            self.stateful_filter = val;
+        }
+        if let Some(val) = file.announce_group {
+            self.announce_group = Some(val);
         }
     }
 
@@ -543,6 +595,22 @@ impl Config {
         if let Some(val) = args.socket_buffer {
             self.socket_buffer_bytes = val;
         }
+        self.grants.append(&mut args.grants);
+        self.split.append(&mut args.split);
+        if args.full_tunnel {
+            self.full_tunnel = true;
+        }
+        if let Some(val) = args.exit_node {
+            self.exit_node = Some(val);
+        }
+        self.exit_allow.append(&mut args.exit_allow);
+        self.peer_names.append(&mut args.peer_names);
+        if args.stateful_filter {
+            self.stateful_filter = true;
+        }
+        if let Some(val) = args.announce_group {
+            self.announce_group = Some(val);
+        }
     }
 
     pub fn into_config_file(self) -> ConfigFile {
@@ -592,6 +660,14 @@ impl Config {
             require_signed_config: Some(self.require_signed_config),
             seccomp: Some(self.seccomp),
             socket_buffer: Some(self.socket_buffer_bytes),
+            grants: if self.grants.is_empty() { None } else { Some(self.grants) },
+            split: if self.split.is_empty() { None } else { Some(self.split) },
+            full_tunnel: Some(self.full_tunnel),
+            exit_node: self.exit_node,
+            exit_allow: if self.exit_allow.is_empty() { None } else { Some(self.exit_allow) },
+            peer_names: if self.peer_names.is_empty() { None } else { Some(self.peer_names) },
+            stateful_filter: Some(self.stateful_filter),
+            announce_group: self.announce_group,
             signature: None
         }
     }
@@ -868,9 +944,33 @@ pub struct Args {
     /// Do not install seccomp
     #[arg(long, conflicts_with = "seccomp")]
     pub no_seccomp: bool,
-    /// UDP SO_RCVBUF/SO_SNDBUF in bytes [default: 2097152]
+    /// UDP SO_RCVBUF/SO_SNDBUF in bytes [default: 33554432]
     #[arg(long = "socket-buffer")]
     pub socket_buffer: Option<usize>,
+    /// Claim grant `prefix:CIDR` or `group:name`
+    #[arg(long = "grant")]
+    pub grants: Vec<String>,
+    /// Split-tunnel prefix (repeatable). Only these overlay destinations enter the mesh.
+    #[arg(long = "split")]
+    pub split: Vec<String>,
+    /// Send every overlay destination to the authorized exit node
+    #[arg(long = "full-tunnel")]
+    pub full_tunnel: bool,
+    /// Hex node id of the full-tunnel exit
+    #[arg(long = "exit-node")]
+    pub exit_node: Option<String>,
+    /// Hex node id allowed to be an exit (repeatable)
+    #[arg(long = "exit-allow")]
+    pub exit_allow: Vec<String>,
+    /// Built-in DNS record `name=overlay-ip`
+    #[arg(long = "peer-name")]
+    pub peer_names: Vec<String>,
+    /// Stateful filter: allow the reply to a flow this node opened
+    #[arg(long = "stateful-filter")]
+    pub stateful_filter: bool,
+    /// Group name to advertise to peers
+    #[arg(long = "announce-group")]
+    pub announce_group: Option<String>,
 
     #[command(subcommand)]
     pub cmd: Option<Command>
@@ -1101,6 +1201,22 @@ pub struct ConfigFile {
     pub seccomp: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub socket_buffer: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_tunnel: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_allow: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_names: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stateful_filter: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub announce_group: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>
 }

@@ -142,6 +142,10 @@ mod tests {
         let sig = sign_body(&body, &privk).unwrap();
         let signed = append_signature_line(raw, &sig, false);
         verify_config(&signed, &[pubk.clone()]).unwrap();
-        assert!(verify_config(raw, &[pubk]).is_err());
+        assert!(verify_config(raw, &[pubk.clone()]).is_err());
+        let expired = format!("{}:2000-01-01", pubk);
+        assert!(verify_config(&signed, &[expired]).is_err());
+        let live = format!("{}:2099-01-01", pubk);
+        verify_config(&signed, &[live]).unwrap();
     }
 }

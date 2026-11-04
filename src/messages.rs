@@ -39,7 +39,15 @@ pub struct NodeInfo {
     pub peers: PeerList,
     pub claims: RangeList,
     pub peer_timeout: Option<u16>,
-    pub addrs: AddrList
+    pub addrs: AddrList,
+    /// This node's underlay interface MTU. Peers take the minimum.
+    pub underlay_mtu: Option<u16>,
+    /// Mesh group this node claims to belong to.
+    pub group: Option<String>,
+    /// X25519 public key for relay end-to-end seals.
+    pub e2e_public: Option<[u8; 32]>,
+    /// Public keys of nodes this node has learned, so peers can seal toward them.
+    pub peer_e2e: Vec<(NodeId, [u8; 32])>
 }
 
 impl NodeInfo {
@@ -50,6 +58,10 @@ impl NodeInfo {
     const PART_NODEID: u8 = 4;
     const PART_PEERS: u8 = 1;
     const PART_PEER_TIMEOUT: u8 = 3;
+    const PART_UNDERLAY_MTU: u8 = 7;
+    const PART_GROUP: u8 = 8;
+    const PART_E2E: u8 = 9;
+    const PART_PEER_E2E: u8 = 10;
 
     fn read_addr_list<R: Read>(r: &mut Take<R>) -> Result<AddrList, io::Error> {
         let flags = r.read_u8()?;
@@ -108,6 +120,10 @@ impl NodeInfo {
         let mut peer_timeout = None;
         let mut node_id = None;
         let mut addrs = smallvec![];
+        let mut underlay_mtu = None;
+        let mut group = None;
+        let mut e2e_public = None;
+        let mut peer_e2e = Vec::new();
         loop {
             let part = r.read_u8().map_err(|_| Error::Message("Truncated message"))?;
             if part == Self::PART_END {
@@ -139,6 +155,35 @@ impl NodeInfo {
                 Self::PART_ADDRS => {
                     addrs = Self::read_addr_list(&mut rp).map_err(|_| Error::Message("Truncated message"))?;
                 }
+                Self::PART_UNDERLAY_MTU => {
+                    underlay_mtu =
+                        Some(rp.read_u16::<NetworkEndian>().map_err(|_| Error::Message("Truncated message"))?)
+                }
+                Self::PART_GROUP => {
+                    let mut data = vec![0; part_len];
+                    rp.read_exact(&mut data).map_err(|_| Error::Message("Truncated message"))?;
+                    group = Some(String::from_utf8_lossy(&data).into_owned());
+                }
+                Self::PART_E2E => {
+                    let mut data = vec![0; part_len];
+                    rp.read_exact(&mut data).map_err(|_| Error::Message("Truncated message"))?;
+                    if data.len() == 32 {
+                        let mut pk = [0u8; 32];
+                        pk.copy_from_slice(&data);
+                        e2e_public = Some(pk);
+                    }
+                }
+                Self::PART_PEER_E2E => {
+                    let mut data = vec![0; part_len];
+                    rp.read_exact(&mut data).map_err(|_| Error::Message("Truncated message"))?;
+                    for chunk in data.chunks_exact(48) {
+                        let mut id = [0u8; 16];
+                        let mut pk = [0u8; 32];
+                        id.copy_from_slice(&chunk[..16]);
+                        pk.copy_from_slice(&chunk[16..]);
+                        peer_e2e.push((id, pk));
+                    }
+                }
                 _ => {
                     let mut data = vec![0; part_len];
                     rp.read_exact(&mut data).map_err(|_| Error::Message("Truncated message"))?;
@@ -150,7 +195,7 @@ impl NodeInfo {
             Some(node_id) => node_id,
             None => return Err(Error::Message("Payload without node_id"))
         };
-        Ok(Self { node_id, peers, claims, peer_timeout, addrs })
+        Ok(Self { node_id, peers, claims, peer_timeout, addrs, underlay_mtu, group, e2e_public, peer_e2e })
     }
 
     pub fn decode<R: Read>(r: R) -> Result<Self, Error> {
@@ -262,6 +307,26 @@ impl NodeInfo {
                 })?
             }
             Self::encode_part(&mut cursor, Self::PART_ADDRS, |cursor| self.encode_addrs_part(cursor))?;
+            if let Some(mtu) = self.underlay_mtu {
+                Self::encode_part(&mut cursor, Self::PART_UNDERLAY_MTU, |cursor| {
+                    cursor.write_u16::<NetworkEndian>(mtu)
+                })?;
+            }
+            if let Some(group) = &self.group {
+                Self::encode_part(&mut cursor, Self::PART_GROUP, |cursor| cursor.write_all(group.as_bytes()))?;
+            }
+            if let Some(pk) = self.e2e_public {
+                Self::encode_part(&mut cursor, Self::PART_E2E, |cursor| cursor.write_all(&pk))?;
+            }
+            if !self.peer_e2e.is_empty() {
+                Self::encode_part(&mut cursor, Self::PART_PEER_E2E, |cursor| {
+                    for (id, pk) in &self.peer_e2e {
+                        cursor.write_all(id)?;
+                        cursor.write_all(pk)?;
+                    }
+                    Ok(())
+                })?;
+            }
             cursor.write_u8(Self::PART_END)?;
             len = cursor.position() as usize;
         }
@@ -281,5 +346,37 @@ impl Payload for NodeInfo {
 
     fn read_from<R: Read>(r: R) -> Result<Self, Error> {
         Self::decode(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(mtu: Option<u16>) -> NodeInfo {
+        NodeInfo {
+            node_id: [7; NODE_ID_BYTES],
+            peers: smallvec![],
+            claims: smallvec![],
+            peer_timeout: None,
+            addrs: smallvec![],
+            underlay_mtu: mtu,
+            group: None,
+            e2e_public: None,
+            peer_e2e: Vec::new()
+        }
+    }
+
+    #[test]
+    fn underlay_mtu_roundtrips_and_old_messages_omit_it() {
+        let mut buf = MsgBuffer::new(0);
+        sample(None).encode(&mut buf);
+        let decoded = NodeInfo::decode(buf.message()).expect("decode");
+        assert_eq!(decoded.underlay_mtu, None);
+        buf.clear();
+        sample(Some(1280)).encode(&mut buf);
+        let decoded = NodeInfo::decode(buf.message()).expect("decode");
+        assert_eq!(decoded.underlay_mtu, Some(1280));
+        assert_eq!(decoded.node_id, [7; NODE_ID_BYTES]);
     }
 }

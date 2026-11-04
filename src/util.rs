@@ -29,6 +29,10 @@ pub struct MsgBuffer {
     // Heap buffer so moving a packet between the TUN queue, crypto workers, and the
     // UDP outbox is a pointer swap. An inline 64KB array made every `mem::swap` copy
     // the whole allocation and capped forwarding well below line rate.
+    //
+    // 65535 is one UDP datagram. A 44-segment UDP_GRO train (44 * 1472 = 64768)
+    // still fits after the 100-byte headroom. A larger box pushed TCP retransmits
+    // up without raising the line rate. `mem::swap` still moves only the Box pointer.
     buffer: Box<[u8]>,
     start: usize,
     end: usize

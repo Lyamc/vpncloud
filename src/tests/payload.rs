@@ -5,6 +5,8 @@
 use super::common::*;
 use crate::{
     gso::{GsoMeta, GSO_TCPV4, GSO_UDP_L4, VIRTIO_F_NEEDS_CSUM},
+    mtu::path_fit,
+    payload::udp_gso_span,
     types::Mode
 };
 
@@ -86,6 +88,158 @@ fn switch_coalesces_udp_datagrams_into_one_gso() {
     assert_eq!(u16::from_be_bytes([got[2], got[3]]) as usize, got.len());
     assert!(sim.pop_gso_meta(node2).is_none());
     assert!(sim.pop_payload(node2).is_none());
+}
+
+#[test]
+fn switch_keeps_mtu_sized_udp_datagrams_separate() {
+    let config = Config { device_type: Type::Tun, mode: Mode::Switch, ..Config::default() };
+    let mut sim = TunSimulator::new();
+    let node1 = sim.add_node(false, &config);
+    let node2 = sim.add_node(false, &config);
+    sim.connect(node1, node2);
+    sim.simulate_all_messages();
+
+    // 1348-byte IP datagrams are what iperf offered on the 1400-byte tunnel.
+    // Two of them must not become one GSO message: that message does not fit
+    // in a 1500-byte underlay datagram.
+    let first = udp_datagram(1320, 4000, 0xab);
+    let second = udp_datagram(1320, 4000, 0xcd);
+    assert_eq!(first.len(), 1348);
+    sim.put_plains(node1, vec![(None, first.clone()), (None, second.clone())]);
+    sim.simulate_all_messages();
+    assert!(sim.pop_gso_meta(node2).is_none());
+    let got_a = sim.pop_payload(node2).expect("first datagram");
+    let got_b = sim.pop_payload(node2).expect("second datagram");
+    assert_eq!(got_a.len(), first.len());
+    assert_eq!(got_b.len(), second.len());
+    assert_eq!(&got_a[28..], &first[28..]);
+    assert_eq!(&got_b[28..], &second[28..]);
+    assert!(sim.pop_payload(node2).is_none());
+}
+
+fn udp_datagram_v6(total: usize) -> Vec<u8> {
+    assert!(total >= 48, "ipv6 udp packet {total}");
+    let udp_len = (total - 40) as u16;
+    let mut pkt = vec![0u8; total];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&udp_len.to_be_bytes());
+    pkt[6] = 17;
+    pkt[7] = 64;
+    pkt[8..24].fill(0x11);
+    pkt[24..40].fill(0x22);
+    pkt[40..42].copy_from_slice(&4000u16.to_be_bytes());
+    pkt[42..44].copy_from_slice(&9u16.to_be_bytes());
+    pkt[44..46].copy_from_slice(&udp_len.to_be_bytes());
+    pkt
+}
+
+fn assert_outer_fits(lens: &[usize], header: usize, l2: usize) {
+    assert!(!lens.is_empty(), "forward path sent nothing");
+    for len in lens {
+        assert!(len + header <= l2, "outer udp payload {len} + {header} exceeds underlay {l2}");
+    }
+}
+
+/// Both peers end on the smaller underlay. Full datagrams stay separate,
+/// small ones still coalesce, and nothing larger than the fit is sent whole.
+fn exercise_mismatched_forward(local_a: usize, local_b: usize, ipv6: bool) {
+    let config = Config { device_type: Type::Tun, mode: Mode::Switch, ..Config::default() };
+    let mut sim = TunSimulator::new();
+    let node_a = sim.add_node(false, &config);
+    let node_b = sim.add_node(false, &config);
+    sim.set_underlay(node_a, local_a, ipv6);
+    sim.set_underlay(node_b, local_b, ipv6);
+    sim.connect(node_a, node_b);
+    sim.simulate_all_messages();
+    assert!(sim.is_connected(node_a, node_b));
+
+    let fit = path_fit(local_a, Some(local_b), ipv6, false, None);
+    assert_eq!(path_fit(local_b, Some(local_a), ipv6, false, None), fit);
+    let gso_a = sim.get_node(node_a).device().gso_limit();
+    let plain_a = sim.get_node(node_a).device().plain_limit();
+    let gso_b = sim.get_node(node_b).device().gso_limit();
+    let plain_b = sim.get_node(node_b).device().plain_limit();
+    assert_eq!(gso_a, fit.max_gso, "local {local_a} vs {local_b}");
+    assert_eq!(gso_b, fit.max_gso, "local {local_b} vs {local_a}");
+    assert_eq!(plain_a, fit.device_mtu);
+    assert_eq!(plain_b, fit.device_mtu);
+    assert!(fit.max_gso < 60_000);
+
+    let header = if ipv6 { 48 } else { 28 };
+    let full = udp_datagram(fit.device_mtu - 28, 4000, 0xab);
+    let full_b = udp_datagram(fit.device_mtu - 28, 4000, 0xcd);
+    assert_eq!(full.len(), fit.device_mtu);
+    assert_eq!(udp_gso_span(&[&full, &full_b], fit.max_gso), 0);
+    let small = udp_datagram(100, 4000, 0x11);
+    let small_b = udp_datagram(100, 4000, 0x22);
+    assert_eq!(udp_gso_span(&[&small, &small_b], fit.max_gso), 2);
+    let v6 = udp_datagram_v6(fit.device_mtu);
+    let v6_b = udp_datagram_v6(fit.device_mtu);
+    assert_eq!(udp_gso_span(&[&v6, &v6_b], fit.max_gso), 0);
+    let v6_small = udp_datagram_v6(48 + 100);
+    assert_eq!(udp_gso_span(&[&v6_small, &v6_small], fit.max_gso), 2);
+
+    // The side with the larger NIC must not emit a datagram the smaller path cannot carry.
+    let sender = if local_a >= local_b { node_a } else { node_b };
+    let receiver = if sender == node_a { node_b } else { node_a };
+    sim.put_plains(sender, vec![(None, full.clone()), (None, full_b.clone())]);
+    assert_eq!(sim.pending_payload_lens().len(), 2, "mtu-sized datagrams were coalesced");
+    assert_outer_fits(&sim.pending_payload_lens(), header, fit.l2_mtu);
+    sim.simulate_all_messages();
+    assert!(sim.pop_gso_meta(receiver).is_none());
+    assert_eq!(sim.pop_payload(receiver).expect("first").len(), full.len());
+    assert_eq!(sim.pop_payload(receiver).expect("second").len(), full_b.len());
+
+    sim.put_plains(sender, vec![(None, small), (None, small_b)]);
+    assert_eq!(sim.pending_payload_lens().len(), 1, "small datagrams were not coalesced");
+    assert_outer_fits(&sim.pending_payload_lens(), header, fit.l2_mtu);
+    sim.simulate_all_messages();
+    let meta = sim.pop_gso_meta(receiver).expect("small udp coalesced");
+    assert_eq!(meta.gso_type, GSO_UDP_L4);
+    assert!(sim.pop_payload(receiver).is_some());
+
+    sim.put_plains(sender, vec![(None, v6.clone())]);
+    assert_outer_fits(&sim.pending_payload_lens(), header, fit.l2_mtu);
+    sim.simulate_all_messages();
+    assert_eq!(sim.pop_payload(receiver).expect("inner ipv6").len(), v6.len());
+
+    let v6_small_b = v6_small.clone();
+    sim.put_plains(sender, vec![(None, v6_small), (None, v6_small_b)]);
+    assert_eq!(sim.pending_payload_lens().len(), 1, "small inner ipv6 datagrams were not coalesced");
+    assert_outer_fits(&sim.pending_payload_lens(), header, fit.l2_mtu);
+    sim.simulate_all_messages();
+    assert_eq!(sim.pop_gso_meta(receiver).expect("small ipv6 udp coalesced").gso_type, GSO_UDP_L4);
+    assert!(sim.pop_payload(receiver).is_some());
+
+    sim.put_plains(sender, vec![(None, vec![0u8; 60_000])]);
+    assert!(sim.pending_payload_lens().is_empty(), "a 60KB inner packet was sent whole on underlay {}", fit.l2_mtu);
+}
+
+#[test]
+fn mismatched_underlays_cap_both_directions_and_keep_small_coalesce() {
+    exercise_mismatched_forward(9000, 1500, false);
+    exercise_mismatched_forward(1500, 1280, true);
+    exercise_mismatched_forward(1280, 1280, true);
+    exercise_mismatched_forward(1500, 1500, false);
+}
+
+#[test]
+fn requested_inner_mtu_is_kept_when_smaller_and_lowered_when_larger() {
+    let low = Config { device_type: Type::Tun, mode: Mode::Switch, mtu: Some(1000), ..Config::default() };
+    let high = Config { device_type: Type::Tun, mode: Mode::Switch, mtu: Some(8000), ..Config::default() };
+    let mut sim = TunSimulator::new();
+    let node_low = sim.add_node(false, &low);
+    let node_high = sim.add_node(false, &high);
+    sim.set_underlay(node_low, 1500, false);
+    sim.set_underlay(node_high, 1500, false);
+    let kept = path_fit(1500, None, false, false, Some(1000));
+    let lowered = path_fit(1500, None, false, false, Some(8000));
+    let natural = path_fit(1500, None, false, false, None);
+    assert_eq!(sim.get_node(node_low).device().plain_limit(), kept.device_mtu);
+    assert_eq!(kept.device_mtu, 1000);
+    assert_eq!(sim.get_node(node_high).device().plain_limit(), lowered.device_mtu);
+    assert_eq!(lowered.device_mtu, natural.device_mtu);
+    assert!(lowered.device_mtu < 8000);
 }
 
 #[test]

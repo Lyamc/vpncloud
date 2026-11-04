@@ -173,4 +173,14 @@ mod tests {
         let got = parse_binding_success(&msg, &tx).unwrap();
         assert_eq!(got, SocketAddr::new(IpAddr::V4(ip), port));
     }
+
+    #[test]
+    fn two_discovery_servers_both_resolve() {
+        assert!(crate::config::DEFAULT_STUN_SERVERS.len() >= 2);
+        let servers = vec!["203.0.113.1:19302".to_string(), "203.0.113.2:19302".to_string()];
+        let got = resolve_stun_servers(&servers);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], "203.0.113.1:19302".parse().unwrap());
+        assert_eq!(got[1], "203.0.113.2:19302".parse().unwrap());
+    }
 }

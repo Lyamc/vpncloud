@@ -775,4 +775,11 @@ mod tests {
     fn pbkdf2_requires_salt() {
         assert!(Crypto::password_seed("secret", None, Some("pbkdf2")).is_err());
     }
+
+    #[test]
+    fn node_expiry_rejects_a_past_date() {
+        assert!(Crypto::date_expired("2000-01-01"));
+        assert!(!Crypto::date_expired("2099-12-31"));
+        assert!(Crypto::date_expired("not-a-date"));
+    }
 }

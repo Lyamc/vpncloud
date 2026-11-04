@@ -163,6 +163,15 @@ impl<P: Protocol> Simulator<P> {
         }
     }
 
+    pub fn set_underlay(&mut self, addr: SocketAddr, l2: usize, ipv6: bool) {
+        let node = self.nodes.get_mut(&addr).unwrap();
+        node.set_local_underlay(l2, ipv6);
+    }
+
+    pub fn pending_payload_lens(&self) -> Vec<usize> {
+        self.messages.iter().map(|(_, _, data)| data.len()).collect()
+    }
+
     pub fn connect(&mut self, src: SocketAddr, dst: SocketAddr) {
         let node = self.nodes.get_mut(&src).unwrap();
         DebugLogger::set_node(node.get_num());

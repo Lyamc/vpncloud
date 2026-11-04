@@ -54,6 +54,10 @@ impl Address {
         data[0..4].copy_from_slice(&ip.octets());
         Self { data, len: 4 }
     }
+
+    pub fn from_ipv6(ip: Ipv6Addr) -> Self {
+        Self { data: ip.octets(), len: 16 }
+    }
 }
 
 impl PartialEq for Address {

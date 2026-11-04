@@ -36,10 +36,10 @@
 // message back to the sender because then the assumed nonce will be wrong and the message fails to decrypt. Otherwise,
 // this could lead to problems as nodes would be able to accidentally decrypt their own messages.
 //
-// In order to be resistent against replay attacks but allow for reordering of messages, the crypto core uses nonce
-// pinning. For every active key, the biggest nonce seen so far is being tracked. Every second, the biggest nonce seen
-// one second ago plus 1 becomes the minimum nonce that is accepted for that key. That means, that reordering can
-// happen within one second but after a second, old messages will not be accepted anymore.
+// Replay protection has two layers. Exact duplicates inside the current window are dropped
+// (a 64-nonce bitmap), while a later fresh nonce is accepted. Every second, the biggest nonce
+// seen one second ago plus 1 becomes the minimum nonce, so messages older than that second are
+// rejected even if they fall outside the bitmap.
 
 use crate::crypto_ring::{
     aead::{self, LessSafeKey, UnboundKey},
@@ -100,12 +100,16 @@ impl Nonce {
     }
 }
 
+const REPLAY_WINDOW: u64 = 64;
+
 struct CryptoKey {
     key: LessSafeKey,
     send_nonce: Nonce,
     min_nonce: Nonce,
     next_min_nonce: Nonce,
-    seen_nonce: Nonce
+    seen_nonce: Nonce,
+    /// Bit 0 is `seen_nonce`. Bit i is `seen_nonce - i` when that nonce was accepted.
+    replay_mask: u64
 }
 
 impl CryptoKey {
@@ -117,7 +121,8 @@ impl CryptoKey {
             send_nonce,
             min_nonce: Nonce::zero(),
             next_min_nonce: Nonce::zero(),
-            seen_nonce: Nonce::zero()
+            seen_nonce: Nonce::zero(),
+            replay_mask: 0
         }
     }
 
@@ -126,6 +131,62 @@ impl CryptoKey {
         self.next_min_nonce = self.seen_nonce.clone();
         self.next_min_nonce.increment();
     }
+}
+
+/// Distance `high - low` when it fits in the low 8 bytes and the high 4 bytes match.
+fn nonce_delta(low: &Nonce, high: &Nonce) -> Option<u64> {
+    if high.0[..4] != low.0[..4] {
+        return None;
+    }
+    let mut acc = 0u64;
+    let mut borrow = 0i16;
+    for i in (4..NONCE_LEN).rev() {
+        let mut n = high.0[i] as i16 - low.0[i] as i16 - borrow;
+        if n < 0 {
+            n += 256;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        acc |= (n as u64) << ((11 - i) * 8);
+    }
+    if borrow != 0 {
+        None
+    } else {
+        Some(acc)
+    }
+}
+
+fn accept_nonce(key: &mut CryptoKey, nonce: Nonce) -> Result<(), Error> {
+    if nonce == key.seen_nonce {
+        if key.replay_mask & 1 != 0 {
+            return Err(Error::Crypto("Replay rejected"));
+        }
+        key.replay_mask |= 1;
+        return Ok(());
+    }
+    if nonce > key.seen_nonce {
+        let delta = nonce_delta(&key.seen_nonce, &nonce).unwrap_or(REPLAY_WINDOW);
+        if delta == 0 || delta >= REPLAY_WINDOW {
+            key.replay_mask = 1;
+        } else {
+            key.replay_mask = (key.replay_mask << (delta as u32)) | 1;
+        }
+        key.seen_nonce = nonce;
+        return Ok(());
+    }
+    let Some(delta) = nonce_delta(&nonce, &key.seen_nonce) else {
+        return Err(Error::Crypto("Replay rejected"));
+    };
+    if delta == 0 || delta >= REPLAY_WINDOW {
+        return Err(Error::Crypto("Replay rejected"));
+    }
+    let bit = 1u64 << (delta as u32);
+    if key.replay_mask & bit != 0 {
+        return Err(Error::Crypto("Replay rejected"));
+    }
+    key.replay_mask |= bit;
+    Ok(())
 }
 
 pub struct CryptoCore {
@@ -184,11 +245,7 @@ impl CryptoCore {
         key.key
             .open_in_place(crypto_nonce, aead::Aad::empty(), data_and_tag)
             .map_err(|_| Error::Crypto("Failed to decrypt data"))?;
-        // last seen nonce
-        if key.seen_nonce < nonce {
-            key.seen_nonce = nonce;
-        }
-        Ok(())
+        accept_nonce(key, nonce)
     }
 
     pub fn decrypt(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
@@ -229,6 +286,36 @@ impl CryptoCore {
             k.update_min_nonce();
         }
     }
+}
+
+/// Encrypt one payload with a fresh core. The nonce travels in the ciphertext.
+pub fn seal_raw(key: &[u8], nonce_half: bool, plain: &[u8]) -> Result<Vec<u8>, Error> {
+    if key.len() < 16 {
+        return Err(Error::Crypto("short key"));
+    }
+    let ls = LessSafeKey::new(
+        UnboundKey::new(&aead::AES_128_GCM, &key[..16]).map_err(|_| Error::Crypto("bad key"))?
+    );
+    let mut core = CryptoCore::new(ls, nonce_half);
+    let mut buf = MsgBuffer::new(EXTRA_LEN);
+    buf.clone_from(plain);
+    core.encrypt(&mut buf);
+    Ok(buf.message().to_vec())
+}
+
+/// Decrypt one payload produced by [`seal_raw`] on the other nonce half.
+pub fn open_raw(key: &[u8], nonce_half: bool, sealed: &[u8]) -> Result<Vec<u8>, Error> {
+    if key.len() < 16 {
+        return Err(Error::Crypto("short key"));
+    }
+    let ls = LessSafeKey::new(
+        UnboundKey::new(&aead::AES_128_GCM, &key[..16]).map_err(|_| Error::Crypto("bad key"))?
+    );
+    let mut core = CryptoCore::new(ls, nonce_half);
+    let mut buf = MsgBuffer::new(0);
+    buf.clone_from(sealed);
+    core.decrypt(&mut buf)?;
+    Ok(buf.message().to_vec())
 }
 
 pub fn create_dummy_pair(algo: &'static aead::Algorithm) -> (CryptoCore, CryptoCore) {
@@ -318,9 +405,11 @@ mod tests {
         d = buffer.clone();
         d.message_mut()[EXTRA_LEN] ^= 1;
         assert!(receiver.decrypt(&mut d).is_err());
-        // Check everything still works
-        d = buffer;
-        assert!(receiver.decrypt(&mut d).is_ok());
+        // The original ciphertext is now a replay. A later fresh nonce still opens.
+        let mut again = MsgBuffer::new(EXTRA_LEN);
+        again.clone_from(&plain);
+        sender.encrypt(&mut again);
+        assert!(receiver.decrypt(&mut again).is_ok());
     }
 
     #[test]
@@ -351,7 +440,7 @@ mod tests {
         receiver.every_second();
         {
             let mut d = buffer.clone();
-            assert!(receiver.decrypt(&mut d).is_ok());
+            assert!(receiver.decrypt(&mut d).is_err());
         }
         receiver.every_second();
         {
@@ -362,6 +451,25 @@ mod tests {
         buffer.clone_from(&plain);
         sender.encrypt(&mut buffer);
         assert!(receiver.decrypt(&mut buffer).is_ok());
+    }
+
+    #[test]
+    fn replay_drops_exact_duplicate_inside_window() {
+        let (mut sender, mut receiver) = create_dummy_pair(&aead::AES_128_GCM);
+        let plain = b"fresh-then-replay";
+        let mut buffer = MsgBuffer::new(EXTRA_LEN);
+        buffer.clone_from(plain);
+        sender.encrypt(&mut buffer);
+        let mut first = buffer.clone();
+        assert!(receiver.decrypt(&mut first).is_ok());
+        assert_eq!(first.message(), plain);
+        let mut replay = buffer.clone();
+        assert!(receiver.decrypt(&mut replay).is_err());
+        let mut next = MsgBuffer::new(EXTRA_LEN);
+        next.clone_from(plain);
+        sender.encrypt(&mut next);
+        assert!(receiver.decrypt(&mut next).is_ok());
+        assert_eq!(next.message(), plain);
     }
 
     #[test]
@@ -432,7 +540,7 @@ mod tests {
     fn test_core_size() {
         let size = mem::size_of::<CryptoCore>();
         #[cfg(not(feature = "aws-lc"))]
-        assert_eq!(size, 2384);
+        assert_eq!(size, 2448);
         // aws-lc-rs stores a smaller handle than ring's in-process key material.
         #[cfg(feature = "aws-lc")]
         assert!((200..512).contains(&size), "unexpected CryptoCore size {size}");

@@ -11,10 +11,13 @@ use std::{
     io::{self, Cursor, Seek, SeekFrom, Write},
     marker::PhantomData,
     mem,
-    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     path::Path,
     str::FromStr,
-    sync::{Arc, Mutex}
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex
+    }
 };
 
 use fnv::FnvHasher;
@@ -40,6 +43,7 @@ use crate::{
     natpmp,
     net::{mapped_addr, parse_listen, Socket},
     payload::Protocol,
+    policy,
     poll::{Pollable, WaitImpl, WaitResult},
     port_forwarding::PortForwarding,
     rate_limit::InitRateLimit,
@@ -65,6 +69,43 @@ pub const STATS_INTERVAL: Time = 60;
 const OWN_ADDRESS_RESET_INTERVAL: Time = 30;
 const SPACE_BEFORE: usize = 100;
 const BATCH_SIZE: usize = 128;
+/// Segments to gather before one TUN write. One read at line rate is about
+/// eight segments, and flushing there makes the peer ACK every train. Sixteen
+/// is past that read, so the hold below collects another before the write.
+/// Stretching the hold itself added delay and cut goodput, so it stays.
+const GRO_TRAIN: usize = 16;
+/// Longest a short batch may sit before it is written. The other direction is
+/// still read while this window is open.
+const GRO_HOLD_NS: u64 = 150_000;
+/// UDP datagrams kept for a paced inject. One recvmmsg is [`BATCH_SIZE`].
+/// Above this the pacer writes without waiting so 64 KiB buffers cannot pile up.
+const UDP_INJECT_QUEUE_CAP: usize = 160;
+
+/// A TUN batch is ready when it is full, the clock has run out, or no hold was armed.
+pub(crate) fn gro_batch_ready(queued: usize, now_ns: u64, deadline_ns: u64) -> bool {
+    queued >= GRO_TRAIN || deadline_ns == 0 || now_ns >= deadline_ns
+}
+
+fn note_tun_flush(n: usize) {
+    static FLUSHES: AtomicU64 = AtomicU64::new(0);
+    static PACKETS: AtomicU64 = AtomicU64::new(0);
+    static MAX_BATCH: AtomicUsize = AtomicUsize::new(0);
+    let flush = FLUSHES.fetch_add(1, Ordering::Relaxed) + 1;
+    let packets = PACKETS.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+    let mut max_batch = MAX_BATCH.load(Ordering::Relaxed);
+    while n > max_batch {
+        match MAX_BATCH.compare_exchange_weak(max_batch, n, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => {
+                max_batch = n;
+                break;
+            }
+            Err(cur) => max_batch = cur
+        }
+    }
+    if flush % 4000 == 0 {
+        info!("TUN write batches={flush} packets={packets} max={max_batch}");
+    }
+}
 
 enum PeerCryptoSlot {
     Direct(PeerCrypto<NodeInfo>),
@@ -112,7 +153,13 @@ struct PeerData {
     timeout: Time,
     peer_timeout: u16,
     node_id: NodeId,
-    crypto: PeerCryptoSlot
+    crypto: PeerCryptoSlot,
+    /// Smoothed underlay RTT in microseconds. `u64::MAX` until a sample arrives.
+    rtt_us: u64,
+    /// When grants are enforced, false rejects this peer's group.
+    group_ok: bool,
+    /// Prefixes this peer was allowed to claim.
+    auth_claims: RangeList
 }
 
 #[derive(Clone)]
@@ -128,17 +175,47 @@ pub struct ReconnectEntry {
     try_index: usize
 }
 
-fn ensure_peer_port(addr: &str) -> String {
+/// Append [`DEFAULT_PORT`] when the peer string has none.
+///
+/// A colon inside `[ipv6]` is not a port separator. `[fd00::2]:3210` stays as
+/// written; `[fd00::2]` and a bare address gain `:3210`.
+pub(crate) fn ensure_peer_port(addr: &str) -> String {
+    let addr = addr.trim();
     let addr = addr.strip_prefix("ws://").or_else(|| addr.strip_prefix("wss://")).unwrap_or(addr);
-    if addr.find(':').unwrap_or(0) <= addr.find(']').unwrap_or(0) {
-        format!("{}:{}", addr, DEFAULT_PORT)
-    } else {
-        addr.to_string()
+    if let Some(inner) = addr.strip_prefix('[') {
+        if let Some(bracket) = inner.find(']') {
+            let after = &inner[bracket + 1..];
+            if after.is_empty() {
+                return format!("[{}]:{}", &inner[..bracket], DEFAULT_PORT);
+            }
+            return addr.to_string();
+        }
     }
+    if let Ok(ip) = addr.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => format!("{}:{}", v4, DEFAULT_PORT),
+            IpAddr::V6(v6) => format!("[{}]:{}", v6, DEFAULT_PORT)
+        };
+    }
+    if let Some((host, port)) = addr.rsplit_once(':') {
+        if !host.is_empty() && !port.is_empty() && !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) {
+            return addr.to_string();
+        }
+    }
+    format!("{}:{}", addr, DEFAULT_PORT)
 }
 
 fn split_peer_group(add: &str) -> Vec<String> {
     add.split(',').map(str::trim).filter(|s| !s.is_empty()).map(ensure_peer_port).collect()
+}
+
+/// Host route for a configured IPv6 `--ip`. A /64 would match the peer as well.
+/// IPv4 keeps the interface /32 from `Device::address`.
+fn configured_ipv6_host_claim(spec: Option<&str>) -> Option<Range> {
+    let spec = spec?;
+    let ip_str = spec.split('/').next().unwrap_or(spec).trim();
+    let v6 = ip_str.parse::<Ipv6Addr>().ok()?;
+    Some(Range { base: Address::from(v6), prefix_len: 128, metric: 0 })
 }
 
 fn resolve_peer_group(names: &[String]) -> AddrList {
@@ -176,6 +253,14 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     rx_addrs: Vec<SocketAddr>,
     tun_bufs: Vec<MsgBuffer>,
     tun_out: Vec<MsgBuffer>,
+    /// Monotonic deadline for the current TUN batch. 0 when no batch is held.
+    gro_deadline_ns: u64,
+    /// Monotonic deadline for the next UDP inject. 0 when not pacing.
+    udp_gap_deadline_ns: u64,
+    /// Datagrams the pacer may read from the underlay before that deadline.
+    udp_gap_budget: usize,
+    /// Set by the event loop. Tests flush each batch immediately.
+    defer_tun_flush: bool,
     gso_out: VecDeque<(GsoMeta, MsgBuffer)>,
     next_peers: Time,
     peer_timeout_publish: u16,
@@ -193,6 +278,23 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     stun_reflexive: AddrList,
     beacon_serializer: BeaconSerializer<TS>,
     acl: crate::acl::Acl,
+    /// Local underlay interface MTU. 0 until [`Self::set_local_underlay`].
+    local_l2: usize,
+    ipv6_underlay: bool,
+    /// Smallest underlay MTU a peer has advertised.
+    peer_l2: Option<usize>,
+    /// Underlay MTU currently applied to the device. 0 before the first apply.
+    applied_l2: usize,
+    e2e_secret: [u8; 32],
+    e2e_public: [u8; 32],
+    known_e2e: HashMap<NodeId, [u8; 32], Hash>,
+    grants: policy::Grants,
+    flows: policy::FlowTable,
+    names: Vec<(String, Address)>,
+    split_prefixes: RangeList,
+    exit_node: Option<NodeId>,
+    exit_allow: Vec<NodeId>,
+    last_node_info_ns: u64,
     _dummy_p: PhantomData<P>,
     _dummy_ts: PhantomData<TS>
 }
@@ -218,22 +320,44 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             claims.push(try_fail!(Range::from_str(s), "Invalid subnet format: {} ({})", s));
         }
         if device.get_type() == Type::Tun && config.auto_claim {
+            let mut claimed = false;
             match device.address() {
                 Ok(ip) => {
                     let range = Range { base: Address::from(ip), prefix_len: 32, metric: 0 };
                     info!("Auto-claiming {} due to interface address", range);
                     claims.push(range);
+                    claimed = true;
                 }
-                Err(Error::DeviceIo(_, e)) if e.kind() == io::ErrorKind::AddrNotAvailable => {
-                    info!("No address set on interface.")
-                }
+                Err(Error::DeviceIo(_, e)) if e.kind() == io::ErrorKind::AddrNotAvailable => {}
+                Err(Error::Device(_)) => {}
                 Err(e) => error!("{}", e)
+            }
+            if let Some(range) = configured_ipv6_host_claim(config.ip.as_deref()) {
+                info!("Auto-claiming {} due to interface address", range);
+                claims.push(range);
+                claimed = true;
+            }
+            if !claimed {
+                info!("No address set on interface.")
             }
         }
         let now = TS::now();
         let update_freq = config.get_keepalive() as u16;
         let node_id = random();
         let crypto = Crypto::new(node_id, &config.crypto).unwrap();
+        let (e2e_secret, e2e_public) = policy::generate_e2e_keypair();
+        let grants = try_fail!(policy::parse_grants(&config.grants), "Invalid grant: {}");
+        let mut split_prefixes = RangeList::new();
+        for s in &config.split {
+            split_prefixes.push(try_fail!(Range::from_str(s), "Invalid split prefix: {} ({})", s));
+        }
+        let exit_node = config.exit_node.as_deref().and_then(policy::parse_node_id);
+        let mut exit_allow: Vec<NodeId> = config.exit_allow.iter().filter_map(|s| policy::parse_node_id(s)).collect();
+        if exit_allow.is_empty() {
+            if let Some(id) = exit_node {
+                exit_allow.push(id);
+            }
+        }
         let beacon_key = config.beacon_password.as_ref().map(|s| s.as_bytes()).unwrap_or(&[]);
         let mut res = GenericCloud {
             node_id,
@@ -275,9 +399,27 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             rx_addrs: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)); BATCH_SIZE],
             tun_bufs: (0..BATCH_SIZE).map(|_| MsgBuffer::new(SPACE_BEFORE)).collect(),
             tun_out: Vec::with_capacity(BATCH_SIZE),
+            gro_deadline_ns: 0,
+            udp_gap_deadline_ns: 0,
+            udp_gap_budget: 0,
+            defer_tun_flush: false,
             gso_out: VecDeque::new(),
             acl: try_fail!(crate::acl::Acl::parse(&config.acl), "Invalid ACL: {}"),
             config: config.clone(),
+            local_l2: 0,
+            ipv6_underlay: false,
+            peer_l2: None,
+            applied_l2: 0,
+            e2e_secret,
+            e2e_public,
+            known_e2e: HashMap::default(),
+            grants,
+            flows: policy::FlowTable::default(),
+            names: policy::parse_peer_names(&config.peer_names),
+            split_prefixes,
+            exit_node,
+            exit_allow,
+            last_node_info_ns: 0,
             _dummy_p: PhantomData,
             _dummy_ts: PhantomData
         };
@@ -421,15 +563,36 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         if self.outbox.is_empty() {
             return Ok(());
         }
-        let pkts = mem::take(&mut self.outbox);
-        let refs: Vec<(&SocketAddr, &[u8])> = pkts.iter().map(|(a, d)| (a, d.message())).collect();
-        let send_res = self.socket.send_batch(&refs);
-        for (_, buf) in pkts {
-            self.buf_spare.push(buf);
-        }
+        let mut pkts = mem::take(&mut self.outbox);
+        // `send_batch` reports how many leading packets were queued. Keep the
+        // rest: dropping them is how a full UDP socket turned a line-rate
+        // offer into loss. The borrow of `pkts` ends before the split.
+        let send_res = {
+            let refs: Vec<(&SocketAddr, &[u8])> = pkts.iter().map(|(a, d)| (a, d.message())).collect();
+            self.socket.send_batch(&refs)
+        };
         match send_res {
-            Ok(_) => Ok(()),
-            Err(e) => Err(Error::SocketIo("IOError when sending", e))
+            Ok(n) => {
+                let sent = n.min(pkts.len());
+                let rest = pkts.split_off(sent);
+                for (_, buf) in pkts {
+                    self.buf_spare.push(buf);
+                }
+                if !rest.is_empty() {
+                    self.outbox = rest;
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.outbox = pkts;
+                Ok(())
+            }
+            Err(e) => {
+                for (_, buf) in pkts {
+                    self.buf_spare.push(buf);
+                }
+                Err(Error::SocketIo("IOError when sending", e))
+            }
         }
     }
 
@@ -437,17 +600,58 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         if self.tun_out.is_empty() {
             return Ok(());
         }
+        // The airtime clock starts before the write. Time spent injecting
+        // counts toward the gap; starting it afterward slept a full gap on
+        // top of the write and the underlay socket overflowed.
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        let started = crate::net::mono_now().unwrap_or(0);
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+        let started = 0u64;
         let mut pkts = mem::take(&mut self.tun_out);
         match self.device.write_batch(&mut pkts) {
-            Ok(_) => {
+            Ok(n) if n < pkts.len() => {
+                note_tun_flush(n);
+                // The written prefix is what just hit the TUN. A short count
+                // below a chunk is the TUN queue blocking, not a finished inject.
+                let udp = n > 0
+                    && pkts.first().is_some_and(|b| crate::payload::udp_segment(b.message()).is_some());
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+                let blocked = udp && n < crate::device::UDP_INJECT_CHUNK;
+                #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+                let blocked = false;
+                let rest = pkts.split_off(n);
                 for buf in pkts {
                     self.buf_spare.push(buf);
+                }
+                self.tun_out = rest;
+                if udp && !blocked {
+                    self.arm_udp_inject_gap(n, started);
+                } else {
+                    self.udp_gap_deadline_ns = 0;
+                    self.udp_gap_budget = 0;
+                }
+                Ok(())
+            }
+            Ok(n) => {
+                note_tun_flush(n);
+                let udp = n > 0
+                    && pkts.first().is_some_and(|b| crate::payload::udp_segment(b.message()).is_some());
+                for buf in pkts {
+                    self.buf_spare.push(buf);
+                }
+                if udp {
+                    self.arm_udp_inject_gap(n, started);
+                } else {
+                    self.udp_gap_deadline_ns = 0;
+                    self.udp_gap_budget = 0;
                 }
                 Ok(())
             }
             // Keep the packets. Dropping them forces TCP to retransmit and the window collapses.
             Err(Error::DeviceIo(_, ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
                 self.tun_out = pkts;
+                self.udp_gap_deadline_ns = 0;
+                self.udp_gap_budget = 0;
                 Ok(())
             }
             Err(e) => {
@@ -456,6 +660,74 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 }
                 Err(e)
             }
+        }
+    }
+
+    fn udp_inject_backlog(&self) -> bool {
+        match self.tun_out.first() {
+            Some(buf) => crate::payload::udp_segment(buf.message()).is_some(),
+            None => false
+        }
+    }
+
+    fn arm_udp_inject_gap(&mut self, packets: usize, started_ns: u64) {
+        self.udp_gap_budget = packets;
+        self.udp_gap_deadline_ns = 0;
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        if packets > 0 && started_ns > 0 {
+            let ns = (packets as u64).saturating_mul(crate::device::UDP_INJECT_PACKET_NS);
+            self.udp_gap_deadline_ns = started_ns.saturating_add(ns.min(crate::device::UDP_INJECT_GAP_NS));
+        }
+    }
+
+    /// Hold the airtime of the UDP inject that just completed. An empty queue
+    /// still waits: that is the common case, a batch shorter than one chunk.
+    /// During the wait, read at most as many datagrams as were just written.
+    ///
+    /// Returns true when the caller must not run the normal socket drain.
+    fn pace_udp_inject(&mut self) -> bool {
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+        {
+            return false;
+        }
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            if self.udp_gap_deadline_ns == 0 {
+                return false;
+            }
+            if !self.tun_out.is_empty() && !self.udp_inject_backlog() {
+                self.udp_gap_deadline_ns = 0;
+                self.udp_gap_budget = 0;
+                return false;
+            }
+            let now = crate::net::mono_now().unwrap_or(0);
+            // 512 MsgBuffers is 32MB. Do not sleep on a runaway queue.
+            let runaway = self.tun_out.len() >= 512;
+            if !runaway && now < self.udp_gap_deadline_ns {
+                if self.tun_out.len() < crate::device::UDP_INJECT_CHUNK && self.udp_gap_budget > 0 {
+                    let room = crate::device::UDP_INJECT_CHUNK - self.tun_out.len();
+                    let quota = room.min(self.udp_gap_budget);
+                    if let Some(fd) = self.socket.gro_wait_fd() {
+                        if crate::net::wait_for_read(fd, 0) {
+                            let _ = self.pull_socket(1, quota, false);
+                            self.udp_gap_budget = 0;
+                        }
+                    }
+                }
+                let now2 = crate::net::mono_now().unwrap_or(now);
+                if now2 < self.udp_gap_deadline_ns {
+                    crate::device::hold_udp_inject_gap(self.udp_gap_deadline_ns.saturating_sub(now2));
+                }
+            }
+            if self.tun_out.is_empty() {
+                self.udp_gap_deadline_ns = 0;
+                self.udp_gap_budget = 0;
+                return false;
+            }
+            if let Err(e) = self.flush_tun_out() {
+                error!("{}", e);
+            }
+            self.udp_gap_deadline_ns != 0
         }
     }
 
@@ -583,12 +855,70 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             let _ = peers.partial_shuffle(&mut rng, 20);
             peers.truncate(20);
         }
+        let mut peer_e2e = Vec::new();
+        for (id, pk) in self.known_e2e.iter().take(16) {
+            peer_e2e.push((*id, *pk));
+        }
         NodeInfo {
             node_id: self.node_id,
             peers,
             claims: self.claims.clone(),
             peer_timeout: Some(self.peer_timeout_publish),
-            addrs: self.own_addresses.clone()
+            addrs: self.own_addresses.clone(),
+            underlay_mtu: u16::try_from(self.local_l2).ok().filter(|_| self.local_l2 >= 68),
+            group: self.config.announce_group.clone(),
+            e2e_public: Some(self.e2e_public),
+            peer_e2e
+        }
+    }
+
+    /// Remember the local NIC MTU and size the tunnel for it. A later peer
+    /// advertisement can only lower this.
+    pub fn set_local_underlay(&mut self, l2_mtu: usize, ipv6: bool) {
+        if !(68..=65535).contains(&l2_mtu) {
+            return;
+        }
+        self.local_l2 = l2_mtu;
+        self.ipv6_underlay = ipv6;
+        self.apply_underlay_limit();
+    }
+
+    fn note_peer_underlay(&mut self, mtu: Option<u16>) {
+        let Some(mtu) = mtu else {
+            return;
+        };
+        let mtu = mtu as usize;
+        if !(68..=65535).contains(&mtu) {
+            return;
+        }
+        let next = self.peer_l2.map_or(mtu, |cur| cur.min(mtu));
+        if self.peer_l2 == Some(next) {
+            return;
+        }
+        self.peer_l2 = Some(next);
+        self.apply_underlay_limit();
+    }
+
+    fn apply_underlay_limit(&mut self) {
+        if self.local_l2 == 0 {
+            return;
+        }
+        let l2 = crate::mtu::limiting_l2(self.local_l2, self.peer_l2);
+        if self.applied_l2 == l2 || (self.applied_l2 != 0 && l2 > self.applied_l2) {
+            return;
+        }
+        match self.device.set_path_budget(self.config.mtu, l2, self.ipv6_underlay) {
+            Ok(()) => {
+                info!(
+                    "Underlay MTU {} (peer {:?}), tunnel payload {} gso {}",
+                    l2,
+                    self.peer_l2,
+                    self.device.max_plain_payload(),
+                    self.device.max_gso_payload()
+                );
+                self.applied_l2 = l2;
+            }
+            Err(err) => warn!("Could not apply underlay MTU {}: {}", l2, err)
         }
     }
 
@@ -744,6 +1074,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             debug!("Send peer list to all peers");
             let info = self.create_node_info();
             info.encode(&mut buffer);
+            self.last_node_info_ns = crate::net::mono_now().unwrap_or(0);
             self.broadcast_msg(MESSAGE_TYPE_NODE_INFO, &mut buffer)?;
             // Reschedule for next update
             let min_peer_timeout = self.peers.iter().map(|p| p.1.peer_timeout).min().unwrap_or(DEFAULT_PEER_TIMEOUT);
@@ -778,6 +1109,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 info!("Local addresses changed, publishing update: {:?}", self.own_addresses);
                 let info = self.create_node_info();
                 info.encode(&mut buffer);
+                self.last_node_info_ns = crate::net::mono_now().unwrap_or(0);
                 self.broadcast_msg(MESSAGE_TYPE_NODE_INFO, &mut buffer)?;
                 self.reconnect_to_peers()?;
             }
@@ -785,7 +1117,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             self.send_stun_probes();
         }
         self.flush_pending_crypto()?;
-        self.flush_tun_out()?;
+        self.flush_tun_out_due()?;
         self.flush_outbox()?;
         Ok(())
     }
@@ -937,47 +1269,87 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         Ok(())
     }
 
+    fn relay_hops(&self) -> Vec<policy::RelayHop> {
+        self.peers
+            .iter()
+            .map(|(addr, peer)| policy::RelayHop {
+                node_id: peer.node_id,
+                addr: *addr,
+                rtt_us: peer.rtt_us,
+                alive: true
+            })
+            .collect()
+    }
+
     fn pick_relay(&self, except: SocketAddr) -> Option<SocketAddr> {
-        self.peers.iter().filter(|(addr, _)| **addr != except).max_by_key(|(_, p)| p.last_seen).map(|(addr, _)| *addr)
+        match policy::choose_delivery(false, &self.relay_hops(), except) {
+            policy::Delivery::Relay(addr) => Some(addr),
+            _ => None
+        }
     }
 
     fn send_relay(&mut self, via: SocketAddr, dest: NodeId, inner: u8, msg: &mut MsgBuffer) -> Result<(), Error> {
-        msg.prepend_byte(inner);
-        for b in dest.iter().rev() {
-            msg.prepend_byte(*b);
-        }
+        let plain = msg.message().to_vec();
+        let pk = self.known_e2e.get(&dest).copied();
+        let body = if let Some(pk) = pk {
+            policy::seal_relay_body(&self.e2e_secret, &self.e2e_public, &pk, &plain)
+        } else {
+            plain
+        };
+        let frame = policy::encode_relay(&dest, inner, &body);
+        msg.clear();
+        msg.clone_from(&frame);
         debug!("Relaying type {} for node via {}", inner, addr_nice(via));
         self.send_msg(via, MESSAGE_TYPE_RELAY, msg)
     }
 
     fn handle_relay(&mut self, src: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
-        let msg = data.message();
-        if msg.len() < 17 {
-            return Err(Error::Message("Truncated relay"));
-        }
-        let mut dest = [0u8; 16];
-        dest.copy_from_slice(&msg[..16]);
-        let inner = msg[16];
-        let start = data.get_start();
-        data.set_start(start + 17);
-        if inner == MESSAGE_TYPE_RELAY {
-            return Ok(());
-        }
-        if dest == self.node_id {
-            return self.handle_message(src, MessageResult::Message(inner), data);
-        }
-        if let Some(addr) = self.peers.iter().find(|(_, p)| p.node_id == dest).map(|(a, _)| *a) {
-            self.send_msg(addr, inner, data)
-        } else {
-            debug!("Relay dest unknown, dropping");
-            Ok(())
+        let hops = self.relay_hops();
+        let decision = policy::decide_relay(&self.node_id, data.message(), &hops, Some(src));
+        match decision {
+            policy::RelayDecision::Drop => {
+                debug!("Relay dest unknown, dropping");
+                Ok(())
+            }
+            policy::RelayDecision::Deliver { inner_type, inner } => {
+                let plain = policy::open_relay_body(&self.e2e_secret, &inner).unwrap_or(inner);
+                let mut buf = self.take_spare();
+                buf.clone_from(&plain);
+                let result = self.handle_message(src, MessageResult::Message(inner_type), &mut buf);
+                self.buf_spare.push(buf);
+                result
+            }
+            policy::RelayDecision::Forward { via, dest, inner_type, inner } => {
+                let frame = policy::encode_relay(&dest, inner_type, &inner);
+                let mut buf = self.take_spare();
+                buf.clone_from(&frame);
+                let result = self.send_msg(via, MESSAGE_TYPE_RELAY, &mut buf);
+                self.buf_spare.push(buf);
+                result
+            }
         }
     }
 
     fn route_message(&mut self, dst: Address, type_: u8, data: &mut MsgBuffer) -> Result<(), Error> {
+        if self.config.full_tunnel {
+            let exit = policy::full_tunnel_target(&self.exit_allow, self.exit_node);
+            if let Some(exit) = exit {
+                if let Some(addr) = self.peers.iter().find(|(_, peer)| peer.node_id == exit).map(|(addr, _)| *addr) {
+                    match policy::choose_delivery(true, &[], addr) {
+                        policy::Delivery::Direct => self.send_msg(addr, type_, data)?,
+                        _ => self.traffic.count_dropped_payload(data.len())
+                    }
+                    return Ok(());
+                }
+            }
+            self.traffic.count_dropped_payload(data.len());
+            return Ok(());
+        }
         match self.table.lookup(dst) {
             Some((addr, dest_id)) => {
-                if self.peers.contains_key(&addr) {
+                if self.peers.contains_key(&addr)
+                    && policy::choose_delivery(true, &[], addr) == policy::Delivery::Direct
+                {
                     self.send_msg(addr, type_, data)?;
                 } else if let Some(via) = self.pick_relay(addr) {
                     self.send_relay(via, dest_id, type_, data)?;
@@ -1006,6 +1378,12 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             self.traffic.count_dropped_payload(data.len());
             return Ok(());
         }
+        let gso_limit = self.device.max_gso_payload();
+        if data.len() > gso_limit {
+            debug!("Dropping {} byte GSO aggregate; underlay fits {}", data.len(), gso_limit);
+            self.traffic.count_dropped_payload(data.len());
+            return Ok(());
+        }
         let (src, dst) = P::parse(data.message())?;
         self.traffic.count_out_payload(dst, src, data.len());
         if data.get_start() < GSO_META_LEN {
@@ -1028,6 +1406,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         let (src, dst) = {
             let ip = &data.message()[GSO_META_LEN..];
             let (src, dst) = P::parse(ip)?;
+            if !self.ingress_allowed(peer, ip, src) {
+                return Ok(());
+            }
             if !self.acl.is_empty() {
                 let tap = self.config.device_type == Type::Tap;
                 let l4 = crate::payload::overlay_l4(ip, tap);
@@ -1079,6 +1460,23 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     pub fn handle_interface_data(&mut self, data: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
         let (src, dst) = P::parse(data.message())?;
+        if !self.names.is_empty() {
+            if let Some(mut resp) = policy::answer_dns(data.message(), &self.names) {
+                crate::payload::fix_ipv4_checksums(&mut resp);
+                let _ = self.device.write(&resp);
+                return Ok(());
+            }
+        }
+        if !self.split_prefixes.is_empty() && !policy::split_forwards(&self.split_prefixes, dst) {
+            debug!("Split tunnel dropped {}", dst);
+            self.traffic.count_dropped_payload(data.len());
+            return Ok(());
+        }
+        if self.config.stateful_filter {
+            if let Some(flow) = policy::ipv4_flow(data.message()) {
+                self.flows.note_outbound(flow);
+            }
+        }
         debug!("Read data from interface: src: {}, dst: {}, {} bytes", src, dst, data.len());
         self.traffic.count_out_payload(dst, src, data.len());
         self.route_message(dst, MESSAGE_TYPE_DATA, data)
@@ -1104,7 +1502,10 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 node_id: info.node_id,
                 peer_timeout: info.peer_timeout.unwrap_or(DEFAULT_PEER_TIMEOUT),
                 last_seen: TS::now(),
-                timeout: TS::now() + self.config.peer_timeout as Time
+                timeout: TS::now() + self.config.peer_timeout as Time,
+                rtt_us: u64::MAX,
+                group_ok: true,
+                auth_claims: RangeList::new()
             });
             self.update_peer_info(addr, Some(info))?;
         } else {
@@ -1158,6 +1559,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     }
 
     fn update_peer_info(&mut self, addr: SocketAddr, info: Option<NodeInfo>) -> Result<(), Error> {
+        let peer_mtu = info.as_ref().and_then(|info| info.underlay_mtu);
         if let Some(peer) = self.peers.get_mut(&addr) {
             peer.last_seen = TS::now();
             peer.timeout = TS::now() + self.config.peer_timeout as Time;
@@ -1173,22 +1575,53 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 let prefixes = lan::interface_prefixes();
                 lan::sort_lan_first(&mut peer.addrs, &prefixes);
             }
+            if self.last_node_info_ns > 0 {
+                if let Some(now) = crate::net::mono_now() {
+                    if now >= self.last_node_info_ns {
+                        peer.rtt_us = ((now - self.last_node_info_ns) / 1_000).max(1);
+                    }
+                }
+            }
         } else {
             error!("Received peer update from non peer {}", addr_nice(addr));
             return Ok(());
         }
         if let Some(info) = info {
-            debug!("Adding claims of peer {}: {:?}", addr_nice(addr), info.claims);
-            self.table.set_claims(addr, info.node_id, info.claims);
+            if let Some(pk) = info.e2e_public {
+                self.known_e2e.insert(info.node_id, pk);
+            }
+            for (id, pk) in &info.peer_e2e {
+                self.known_e2e.entry(*id).or_insert(*pk);
+            }
+            let decision = policy::filter_announcement(
+                &self.grants,
+                &policy::Announcement { claims: info.claims.iter().copied().collect(), group: info.group.clone() }
+            );
+            if self.grants.enforcing {
+                if let Some(peer) = self.peers.get_mut(&addr) {
+                    peer.group_ok = decision.group_ok;
+                    peer.auth_claims.clear();
+                    peer.auth_claims.extend(decision.claims.iter().copied());
+                }
+            }
+            let mut claims = RangeList::new();
+            claims.extend(decision.claims.iter().copied());
+            debug!("Adding claims of peer {}: {:?}", addr_nice(addr), claims);
+            self.table.set_claims(addr, info.node_id, claims);
             debug!("Received {} peers from {}: {:?}", info.peers.len(), addr_nice(addr), info.peers);
             self.connect_to_peers(&info.peers)?;
         }
+        self.note_peer_underlay(peer_mtu);
         Ok(())
     }
 
     fn handle_payload_from(&mut self, peer: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
         let (src, dst) = P::parse(data.message())?;
+        if !self.ingress_allowed(peer, data.message(), src) {
+            self.traffic.count_dropped_payload(data.len());
+            return Ok(());
+        }
         if !self.acl.is_empty() {
             let tap = self.config.device_type == Type::Tap;
             let l4 = crate::payload::overlay_l4(data.message(), tap);
@@ -1205,11 +1638,78 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             let nid = self.peers.get(&peer).map(|p| p.node_id).unwrap_or([0; 16]);
             self.table.cache(src, peer, nid);
         }
+        let tcp_data = crate::payload::ipv4_tcp_data(data.message());
+        let tcp = tcp_data || crate::payload::ipv4_tcp_segment(data.message());
         let mut owned = self.take_spare();
         mem::swap(data, &mut owned);
         self.tun_out.push(owned);
+        if tcp_data {
+            self.arm_gro_hold();
+        } else if !tcp {
+            // UDP was sitting in the TCP train and arrived short. A pure ACK
+            // does not start a train and does not flush one already gathering.
+            self.gro_deadline_ns = 0;
+        }
         data.clear();
         Ok(())
+    }
+
+    fn ingress_allowed(&self, peer: SocketAddr, pkt: &[u8], src: Address) -> bool {
+        if self.config.stateful_filter {
+            if let Some(flow) = policy::ipv4_flow(pkt) {
+                if !self.flows.allow_inbound(&flow) {
+                    debug!("Stateful filter dropped unsolicited flow");
+                    return false;
+                }
+            }
+        }
+        if self.grants.enforcing {
+            let allowed = self
+                .peers
+                .get(&peer)
+                .map(|p| policy::source_allowed(true, p.group_ok, &p.auth_claims, src))
+                .unwrap_or(false);
+            if !allowed {
+                debug!("Capability dropped source {}", src);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn arm_gro_hold(&mut self) {
+        if !self.defer_tun_flush || self.gro_deadline_ns != 0 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(now) = crate::net::mono_now() {
+            self.gro_deadline_ns = now.saturating_add(GRO_HOLD_NS);
+        }
+    }
+
+    fn gro_hold_active(&self) -> bool {
+        if !self.defer_tun_flush || self.tun_out.is_empty() {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let now = crate::net::mono_now().unwrap_or(u64::MAX);
+            return !gro_batch_ready(self.tun_out.len(), now, self.gro_deadline_ns);
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    /// Write the TUN batch unless a short train is still gathering.
+    fn flush_tun_out_due(&mut self) -> Result<(), Error> {
+        if self.gro_hold_active() {
+            return Ok(());
+        }
+        let result = self.flush_tun_out();
+        if self.tun_out.is_empty() {
+            self.gro_deadline_ns = 0;
+        }
+        result
     }
 
     fn handle_message(
@@ -1381,25 +1881,48 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     }
 
     fn handle_socket_event(&mut self, _buffer: &mut MsgBuffer) -> bool {
+        self.pull_socket(4, usize::MAX, true)
+    }
+
+    /// Read at most `max_rounds` recvmmsg calls and `max_pkts` datagrams.
+    /// `flush` writes the TUN queue. The UDP pacer uses one short round and
+    /// writes the next chunk on its own deadline.
+    fn pull_socket(&mut self, max_rounds: usize, max_pkts: usize, flush: bool) -> bool {
         // HOT PATH
+        // A side-thread TUN read copied every frame and lost more than the
+        // syscall it hid. Read the TUN on this thread.
         let mut bufs = mem::take(&mut self.rx_bufs);
         let mut addrs = mem::take(&mut self.rx_addrs);
         let mut got = false;
         let mut again = false;
         let mut rounds = 0usize;
+        let mut taken = 0usize;
         loop {
-            if rounds >= 4 {
-                again = true;
+            if rounds >= max_rounds {
+                again = flush && max_rounds >= 4;
+                break;
+            }
+            // UDP already queued is paced a chunk at a time. Another full
+            // batch here is how the inject outran iperf.
+            if flush && self.udp_inject_backlog() {
+                break;
+            }
+            if taken >= max_pkts {
                 break;
             }
             rounds += 1;
-            let n = match self.socket.receive_batch(&mut bufs, &mut addrs) {
+            let room = max_pkts.saturating_sub(taken).min(bufs.len()).min(addrs.len());
+            if room == 0 {
+                break;
+            }
+            let n = match self.socket.receive_batch(&mut bufs[..room], &mut addrs[..room]) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => try_fail!(Err(e), "Failed to read from network socket: {}")
             };
             got = true;
+            taken += n;
             let mut decrypt: HashMap<SocketAddr, (CryptoBoxHandle, Vec<MsgBuffer>), Hash> = HashMap::default();
             for i in 0..n {
                 if bufs[i].is_empty() {
@@ -1456,43 +1979,81 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         self.rx_bufs = bufs;
         self.rx_addrs = addrs;
         let _ = self.flush_pending_crypto();
-        if let Err(e) = self.flush_tun_out() {
-            error!("{}", e);
+        // A gap already armed owns the queue. Flushing with nothing new
+        // would write the next chunk before its airtime.
+        if flush && !(taken == 0 && self.udp_gap_deadline_ns != 0) {
+            if let Err(e) = self.flush_tun_out_due() {
+                error!("{}", e);
+            }
         }
         if let Err(e) = self.flush_gso_out() {
             error!("{}", e);
         }
         let _ = self.flush_outbox();
         let _ = got;
-        if !self.tun_out.is_empty() || !self.gso_out.is_empty() {
+        if again {
+            return true;
+        }
+        if self.gro_hold_active() {
             return false;
         }
-        again
+        if !self.tun_out.is_empty() || !self.gso_out.is_empty() || !self.outbox.is_empty() {
+            return false;
+        }
+        false
     }
 
-    /// Largest inner IP packet that still fits in one outer IPv4 UDP datagram
-    /// after the message type, GSO prefix, crypto header, and AEAD tag.
-    const UDP_GSO_MAX: usize = 60_000;
-
     /// Finish checksums and, for a run of equal UDP datagrams, ship one GSO aggregate.
+    ///
+    /// The span stops at [`Device::max_gso_payload`], which is one underlay
+    /// datagram. Two MTU-sized datagrams therefore stay separate.
+    fn udp_span_front(rest: &VecDeque<(MsgBuffer, Option<(u16, u16)>)>, max_len: usize) -> usize {
+        if rest.len() < 2 {
+            return 0;
+        }
+        let Some((first, _)) = rest.front() else {
+            return 0;
+        };
+        // TCP segments and pure ACKs are not UDP trains. Skip the view allocation.
+        if crate::payload::udp_segment(first.message()).is_none() {
+            return 0;
+        }
+        let views: Vec<&[u8]> = rest.iter().map(|(buf, _)| buf.message()).collect();
+        crate::payload::udp_gso_span(&views, max_len)
+    }
+
     fn forward_plain_batch(&mut self, batch: &mut Vec<(MsgBuffer, Option<(u16, u16)>)>) {
-        let mut rest = mem::take(batch);
+        // Pop from the front. Shifting a Vec with `remove(0)`, and allocating a
+        // view of every remaining packet, ran once per TCP segment. TCP is not
+        // a UDP aggregate, so that work never coalesced anything.
+        let mut rest = VecDeque::from(mem::take(batch));
+        let max = self.device.max_gso_payload();
         while !rest.is_empty() {
-            let n = {
-                let views: Vec<&[u8]> = rest.iter().map(|(buf, _)| buf.message()).collect();
-                crate::payload::udp_gso_span(&views, Self::UDP_GSO_MAX)
-            };
+            let n = Self::udp_span_front(&rest, max);
             if n >= 2 {
-                let run: Vec<_> = rest.drain(..n).collect();
+                let mut run = Vec::with_capacity(n);
+                for _ in 0..n {
+                    if let Some(pkt) = rest.pop_front() {
+                        run.push(pkt);
+                    }
+                }
                 self.emit_udp_gso(run);
-            } else {
-                let (buf, partial) = rest.remove(0);
+            } else if let Some((buf, partial)) = rest.pop_front() {
                 self.forward_one_plain(buf, partial);
             }
         }
     }
 
     fn forward_one_plain(&mut self, mut buf: MsgBuffer, partial: Option<(u16, u16)>) {
+        let limit = self.device.max_plain_payload();
+        if buf.len() > limit {
+            // One datagram this large becomes an outer datagram the path
+            // cannot carry. Drop it instead of IP-fragmenting it.
+            debug!("Dropping {} byte inner packet; underlay fits {}", buf.len(), limit);
+            self.traffic.count_dropped_payload(buf.len());
+            self.buf_spare.push(buf);
+            return;
+        }
         if let Some((start, off)) = partial {
             crate::payload::finish_virtio_l4_csum(buf.message_mut(), start, off);
         }
@@ -1536,13 +2097,30 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
 
     fn handle_device_event(&mut self, _buffer: &mut MsgBuffer) -> bool {
         // HOT PATH
+        // The prefetch thread is the other reader of this TUN. Finish its batch
+        // before this thread calls read, or the two reads split one packet stream.
+        self.device.join_tun_prefetch();
         // mio registers the TUN fd edge-triggered. One read leaves the rest queued
         // with no further wakeup, so TCP stalls after a single batch. Drain until
         // the device would block, then encrypt and send once.
+        if !self.outbox.is_empty() {
+            let _ = self.flush_outbox();
+            if !self.outbox.is_empty() {
+                // The UDP socket is full. Reading more from the TUN would only
+                // grow a queue the NIC cannot take, and then we would drop it.
+                return false;
+            }
+        }
         if !self.tun_out.is_empty() {
-            let _ = self.flush_tun_out();
-            if !self.tun_out.is_empty() {
-                // TUN tx is full. Spinning here starves the overlay reader.
+            // The pacer writes this queue. Flushing here drops the airtime gap,
+            // and the following socket read then outruns the inject.
+            if self.udp_gap_deadline_ns != 0 {
+                return false;
+            }
+            let _ = self.flush_tun_out_due();
+            // A held batch is not a full TX queue. Keep reading the TUN so the
+            // other direction moves while segments gather.
+            if !self.tun_out.is_empty() && !self.gro_hold_active() {
                 return false;
             }
         }
@@ -1612,35 +2190,35 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
         self.forward_plain_batch(&mut plain_batch);
         if use_batch {
-        loop {
-            let mut bufs = mem::take(&mut self.tun_bufs);
-            let n = match self.device.read_batch(&mut bufs) {
-                Ok(0) => {
-                    self.tun_bufs = bufs;
-                    break;
+            loop {
+                let mut bufs = mem::take(&mut self.tun_bufs);
+                let n = match self.device.read_batch(&mut bufs) {
+                    Ok(0) => {
+                        self.tun_bufs = bufs;
+                        break;
+                    }
+                    Ok(n) => n,
+                    Err(Error::DeviceIo(_, ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                        self.tun_bufs = bufs;
+                        break;
+                    }
+                    Err(Error::Device(_)) => {
+                        self.tun_bufs = bufs;
+                        break;
+                    }
+                    Err(e) => try_fail!(Err(e), "Failed to read from device: {}")
+                };
+                got = true;
+                for buf in bufs.iter_mut().take(n) {
+                    if let Err(e) = self.handle_interface_data(buf) {
+                        error!("{}", e);
+                    }
                 }
-                Ok(n) => n,
-                Err(Error::DeviceIo(_, ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.tun_bufs = bufs;
-                    break;
-                }
-                Err(Error::Device(_)) => {
-                    self.tun_bufs = bufs;
-                    break;
-                }
-                Err(e) => try_fail!(Err(e), "Failed to read from device: {}")
-            };
-            got = true;
-            for buf in bufs.iter_mut().take(n) {
-                if let Err(e) = self.handle_interface_data(buf) {
-                    error!("{}", e);
-                }
+                self.tun_bufs = bufs;
             }
-            self.tun_bufs = bufs;
-        }
         }
         let _ = self.flush_pending_crypto();
-        if let Err(e) = self.flush_tun_out() {
+        if let Err(e) = self.flush_tun_out_due() {
             error!("{}", e);
         }
         if let Err(e) = self.flush_gso_out() {
@@ -1648,10 +2226,16 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
         let _ = self.flush_outbox();
         let _ = got;
-        if !self.tun_out.is_empty() || !self.gso_out.is_empty() {
+        if again {
+            return true;
+        }
+        if self.gro_hold_active() {
             return false;
         }
-        again
+        if !self.tun_out.is_empty() || !self.gso_out.is_empty() || !self.outbox.is_empty() {
+            return false;
+        }
+        false
     }
 
     /// The main method of the node
@@ -1662,10 +2246,12 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     /// `handle_interface_data` for each packet read.
     /// Also, this method will call `housekeep` every second.
     pub fn run(&mut self) {
+        pin_datapath_thread();
         let mut ctrlc = CtrlC::new();
         let mut waiter = try_fail!(WaitImpl::new(&self.socket, &self.device, 1000), "Failed to setup poll: {}");
         let mut buffer = MsgBuffer::new(SPACE_BEFORE);
         let mut poll_error = false;
+        self.defer_tun_flush = true;
         self.config.call_hook("vpn_started", vec![("IFNAME", self.device.ifname())], true);
         // mio is edge-triggered. On every wakeup, drain both the TUN and the UDP
         // socket until they would block so a single edge cannot leave packets stuck.
@@ -1679,7 +2265,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                     poll_error = true;
                 }
                 WaitResult::Timeout => {
-                    let _ = self.flush_tun_out();
+                    let _ = self.flush_tun_out_due();
                     let _ = self.flush_gso_out();
                     let _ = self.flush_outbox();
                 }
@@ -1689,11 +2275,19 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                     // returns true when the peer is still producing, which keeps
                     // the UDP socket and the TUN interleaved.
                     loop {
+                        if self.pace_udp_inject() {
+                            if self.next_housekeep < TS::now() {
+                                if !CtrlC::is_paused() {
+                                    if let Err(e) = self.housekeep() {
+                                        error!("{}", e)
+                                    }
+                                }
+                                self.next_housekeep = TS::now() + 1
+                            }
+                            continue;
+                        }
                         let more_dev = self.handle_device_event(&mut buffer);
                         let more_sock = self.handle_socket_event(&mut buffer);
-                        if !more_dev && !more_sock {
-                            break;
-                        }
                         if self.next_housekeep < TS::now() {
                             if !CtrlC::is_paused() {
                                 if let Err(e) = self.housekeep() {
@@ -1702,6 +2296,55 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                             }
                             self.next_housekeep = TS::now() + 1
                         }
+                        if more_dev || more_sock {
+                            continue;
+                        }
+                        // The socket handler kicked a TUN read. Drain it before
+                        // sleeping: the bytes are no longer in the kernel queue,
+                        // so an edge-triggered poll will not wake for them.
+                        self.device.join_tun_prefetch();
+                        if self.device.tun_prefetch_pending() {
+                            continue;
+                        }
+                        // Gather a few more inbound segments before the TUN write.
+                        // Wait only for the next datagram. The TUN and a UDP socket
+                        // that is not full are always writable, so watching that
+                        // wakes immediately and the batch never grows. Watching the
+                        // TUN for reads also busy-spins when the queue stays
+                        // readable, and that stall dropped a whole TCP run. The TUN
+                        // is read at the top of this loop, between datagrams.
+                        // An inject gap stays armed after a short batch, when the
+                        // queue is already empty. wait_for_io on a writable TUN
+                        // would return immediately and the next read would write
+                        // with no airtime.
+                        if self.udp_gap_deadline_ns != 0 {
+                            continue;
+                        }
+                        #[cfg(target_os = "linux")]
+                        if self.gro_hold_active() {
+                            let now = crate::net::mono_now().unwrap_or(0);
+                            let remain_ns = self.gro_deadline_ns.saturating_sub(now);
+                            let remain_us = (remain_ns / 1_000).clamp(1, 1_000_000) as i64;
+                            let _ = crate::net::wait_for_read(self.socket.get_fd(), remain_us);
+                            continue;
+                        }
+                        // A full UDP socket used to be waited out inside send, which
+                        // left the opposite direction unread. Wait until that socket
+                        // can take the outbox or deliver inbound packets. Do not
+                        // watch the TUN for read: it stays readable, and polling it
+                        // spins without draining it.
+                        #[cfg(target_os = "linux")]
+                        if !self.outbox.is_empty() || !self.tun_out.is_empty() || !self.gso_out.is_empty() {
+                            let _ = crate::net::wait_for_io(
+                                self.socket.get_fd(),
+                                self.device.get_fd(),
+                                !self.outbox.is_empty(),
+                                !self.tun_out.is_empty() || !self.gso_out.is_empty(),
+                                1
+                            );
+                            continue;
+                        }
+                        break;
                     }
                 }
                 WaitResult::Socket | WaitResult::Device => {}
@@ -1774,5 +2417,315 @@ impl<P: Protocol> GenericCloud<MockDevice, P, MockSocket, MockTimeSource> {
 
     pub fn get_num(&self) -> usize {
         self.socket.address().unwrap().port() as usize
+    }
+}
+
+#[cfg(test)]
+mod gro_hold_tests {
+    use super::gro_batch_ready;
+
+    #[test]
+    fn gro_batch_waits_for_a_train_and_then_flushes() {
+        let start = 1_000_000u64;
+        let deadline = start + super::GRO_HOLD_NS;
+        // One socket read is about eight segments. Flushing there ACKs every
+        // eight. The train has to outlast that read; the deadline still writes
+        // a short batch, and an unarmed hold still writes immediately.
+        assert!(super::GRO_TRAIN > 8);
+        assert!(!gro_batch_ready(1, start, deadline));
+        assert!(!gro_batch_ready(8, start, deadline));
+        assert!(!gro_batch_ready(super::GRO_TRAIN - 1, start, deadline));
+        assert!(gro_batch_ready(super::GRO_TRAIN, start, deadline));
+        assert!(gro_batch_ready(8, deadline, deadline));
+        assert!(gro_batch_ready(3, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod ensure_peer_port_tests {
+    use super::ensure_peer_port;
+
+    #[test]
+    fn bracketed_ipv6_keeps_an_explicit_port() {
+        assert_eq!(ensure_peer_port("[fd00:88::2]:3210"), "[fd00:88::2]:3210");
+        assert_eq!(ensure_peer_port("wss://[fd00:88::2]:3210"), "[fd00:88::2]:3210");
+        assert_eq!(ensure_peer_port("[fd00:88::2]"), "[fd00:88::2]:3210");
+        assert_eq!(ensure_peer_port("fd00:88::2"), "[fd00:88::2]:3210");
+    }
+
+    #[test]
+    fn ipv4_and_hostnames_gain_a_port_once() {
+        assert_eq!(ensure_peer_port("192.168.88.2"), "192.168.88.2:3210");
+        assert_eq!(ensure_peer_port("192.168.88.2:3210"), "192.168.88.2:3210");
+        assert_eq!(ensure_peer_port("example.com"), "example.com:3210");
+        assert_eq!(ensure_peer_port("example.com:3210"), "example.com:3210");
+        assert_eq!(ensure_peer_port("ws://example.com"), "example.com:3210");
+    }
+}
+
+#[cfg(test)]
+mod ipv6_claim_tests {
+    use super::configured_ipv6_host_claim;
+    use crate::types::Address;
+    use std::str::FromStr;
+
+    #[test]
+    fn ipv6_overlay_claims_the_host_not_the_prefix() {
+        let range = configured_ipv6_host_claim(Some("fd00:8::1/64")).unwrap();
+        assert_eq!(range.prefix_len, 128);
+        assert!(range.matches(Address::from_str("fd00:8::1").unwrap()));
+        assert!(!range.matches(Address::from_str("fd00:8::2").unwrap()));
+        assert!(configured_ipv6_host_claim(Some("10.8.0.1/24")).is_none());
+        assert!(configured_ipv6_host_claim(None).is_none());
+    }
+}
+
+/// CPUs in the fastest frequency cluster, lowest id first. Empty when every
+/// CPU reports the same maximum, so a uniform machine is left unpinned.
+pub(crate) fn fast_cluster(freqs: &[(usize, u64)]) -> Vec<usize> {
+    let Some(max) = freqs.iter().map(|(_, freq)| *freq).max() else {
+        return Vec::new();
+    };
+    let Some(min) = freqs.iter().map(|(_, freq)| *freq).min() else {
+        return Vec::new();
+    };
+    if max == 0 || max == min {
+        return Vec::new();
+    }
+    let mut cpus: Vec<usize> = freqs.iter().filter(|(_, freq)| *freq == max).map(|(cpu, _)| *cpu).collect();
+    cpus.sort_unstable();
+    cpus.dedup();
+    cpus
+}
+
+#[cfg(target_os = "linux")]
+fn online_cpu_freqs() -> Vec<(usize, u64)> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(rest) = name.strip_prefix("cpu") else {
+            continue;
+        };
+        let Ok(cpu) = rest.parse::<usize>() else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(entry.path().join("cpufreq/cpuinfo_max_freq")) else {
+            continue;
+        };
+        let Ok(freq) = text.trim().parse::<u64>() else {
+            continue;
+        };
+        out.push((cpu, freq));
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn set_thread_affinity(cpus: &[usize]) -> bool {
+    if cpus.is_empty() || cpus.iter().any(|cpu| *cpu >= 1024) {
+        return false;
+    }
+    let mut mask = [0u64; 16];
+    for cpu in cpus {
+        mask[cpu / 64] |= 1u64 << (cpu % 64);
+    }
+    let rc = unsafe {
+        libc::sched_setaffinity(0, std::mem::size_of_val(&mask), mask.as_ptr() as *const libc::cpu_set_t)
+    };
+    rc == 0
+}
+
+/// One sibling group inside the fast cluster. Two processes with different
+/// pids land on different physical cores. Pinning both to every fast CPU let
+/// the scheduler park them on the interrupt core together.
+#[cfg(target_os = "linux")]
+pub(crate) fn datapath_cpus(groups: &[Vec<usize>], slot: usize) -> Vec<usize> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    groups[slot % groups.len()].clone()
+}
+
+/// A different physical core from [`datapath_cpus`] for the same pid, so the
+/// TUN read overlaps encryption instead of sharing one core.
+#[cfg(target_os = "linux")]
+pub(crate) fn reader_slot(ngroups: usize, main_slot: usize) -> usize {
+    if ngroups < 2 {
+        return main_slot;
+    }
+    (main_slot + ngroups / 2) % ngroups
+}
+
+#[cfg(target_os = "linux")]
+fn sibling_groups(cluster: &[usize]) -> Vec<Vec<usize>> {
+    let members: std::collections::BTreeSet<usize> = cluster.iter().copied().collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut groups = Vec::new();
+    for cpu in cluster {
+        if !seen.insert(*cpu) {
+            continue;
+        }
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+        let text = fs::read_to_string(path).unwrap_or_default();
+        let mut group: Vec<usize> = parse_cpu_list(&text).into_iter().filter(|cpu| members.contains(cpu)).collect();
+        if group.is_empty() {
+            group.push(*cpu);
+        }
+        group.sort_unstable();
+        group.dedup();
+        for cpu in &group {
+            seen.insert(*cpu);
+        }
+        groups.push(group);
+    }
+    groups
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cpu_list(list: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for part in list.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = part.split_once('-') {
+            let Ok(start) = start.parse::<usize>() else {
+                continue;
+            };
+            let Ok(end) = end.parse::<usize>() else {
+                continue;
+            };
+            if end >= start && end - start < 4096 {
+                out.extend(start..=end);
+            }
+        } else if let Ok(cpu) = part.parse::<usize>() {
+            out.push(cpu);
+        }
+    }
+    out
+}
+
+/// Hybrid chips report the same capacity for a 4.7 GHz core and a 3.5 GHz
+/// core, so the scheduler will park this thread on the slow cluster. Pin this
+/// thread to every fast CPU. One sibling group was slower: the thread stayed
+/// on a busy core. Leaving out the interrupt cores was slower too. A uniform
+/// machine is left alone.
+#[cfg(target_os = "linux")]
+fn pin_datapath_thread() {
+    let cpus = fast_cluster(&online_cpu_freqs());
+    if cpus.is_empty() {
+        return;
+    }
+    if set_thread_affinity(&cpus) {
+        info!("Pinned datapath thread to cpus {cpus:?}");
+    }
+}
+
+/// The TUN prefetch thread inherits the datapath pin. Move it to another fast
+/// core so the read is not fighting the encrypt loop for the same core.
+#[cfg(target_os = "linux")]
+pub(crate) fn pin_reader_thread() {
+    let groups = sibling_groups(&fast_cluster(&online_cpu_freqs()));
+    if groups.len() < 2 {
+        return;
+    }
+    let slot = reader_slot(groups.len(), std::process::id() as usize);
+    let cpus = datapath_cpus(&groups, slot);
+    if set_thread_affinity(&cpus) {
+        info!("Pinned TUN read thread to cpus {cpus:?}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_datapath_thread() {}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::fast_cluster;
+
+    #[test]
+    fn fast_cluster_skips_a_uniform_machine() {
+        assert!(fast_cluster(&[]).is_empty());
+        assert!(fast_cluster(&[(0, 0), (1, 0)]).is_empty());
+        assert!(fast_cluster(&[(0, 4700), (1, 4700), (2, 4700)]).is_empty());
+    }
+
+    #[test]
+    fn fast_cluster_is_every_cpu_at_the_top_frequency() {
+        assert_eq!(fast_cluster(&[(0, 4700), (12, 3500), (2, 4700)]), vec![0, 2]);
+        assert_eq!(fast_cluster(&[(3, 2000), (8, 4000), (1, 4000)]), vec![1, 8]);
+    }
+
+    #[test]
+    fn datapath_cpus_are_one_sibling_group() {
+        let groups = vec![vec![0, 1], vec![2, 3], vec![4, 5]];
+        assert_eq!(super::datapath_cpus(&groups, 0), vec![0, 1]);
+        assert_eq!(super::datapath_cpus(&groups, 1), vec![2, 3]);
+        assert_eq!(super::datapath_cpus(&groups, 5), vec![4, 5]);
+        assert!(super::datapath_cpus(&[], 3).is_empty());
+        assert_eq!(super::reader_slot(4, 1), 3);
+        assert_ne!(1 % 4, super::reader_slot(4, 1));
+        assert_eq!(super::reader_slot(1, 0), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn datapath_thread_pins_only_when_a_slower_cluster_exists() {
+        let freqs = super::online_cpu_freqs();
+        let want = fast_cluster(&freqs);
+        let before = allowed_cpus();
+        let _restore = AffinityGuard(before.clone());
+        super::pin_datapath_thread();
+        let after = allowed_cpus();
+        if want.is_empty() {
+            assert_eq!(after, before, "uniform machine changed affinity");
+        } else {
+            assert_eq!(after, want, "freqs {freqs:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct AffinityGuard(Vec<usize>);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for AffinityGuard {
+        fn drop(&mut self) {
+            let _ = super::set_thread_affinity(&self.0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn allowed_cpus() -> Vec<usize> {
+        let text = std::fs::read_to_string("/proc/thread-self/status").expect("status");
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("Cpus_allowed_list:") {
+                return parse_cpu_list(rest);
+            }
+        }
+        panic!("Cpus_allowed_list missing:\n{text}");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_cpu_list(list: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        for part in list.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((start, end)) = part.split_once('-') {
+                let start: usize = start.parse().expect(start);
+                let end: usize = end.parse().expect(end);
+                out.extend(start..=end);
+            } else {
+                out.push(part.parse().expect(part));
+            }
+        }
+        out
     }
 }

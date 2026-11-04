@@ -114,4 +114,13 @@ mod tests {
         sort_lan_first(&mut addrs, &[p]);
         assert_eq!(addrs[0], "10.1.2.3:3210".parse().unwrap());
     }
+
+    #[test]
+    fn lan_only_keeps_local_prefix_and_drops_the_rest() {
+        let p = Prefix { addr: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), len: 24 };
+        let local: SocketAddr = "192.168.1.5:3210".parse().unwrap();
+        let remote: SocketAddr = "8.8.8.8:3210".parse().unwrap();
+        assert!(addr_on_local_prefix(local, &[p]));
+        assert!(!addr_on_local_prefix(remote, &[p]));
+    }
 }
