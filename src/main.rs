@@ -3,7 +3,7 @@
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
 use clap::{CommandFactory, Parser};
-use vpncloud::crypto_ring::signature::{Ed25519KeyPair, KeyPair};
+use vpncloud::crypto::Ed25519KeyPair;
 
 use std::{
     fs::{self, File},
@@ -102,9 +102,8 @@ fn verify_signature(config: &Config, raw: &str) -> Result<(), String> {
         if let Some(ref password) = config.crypto.password {
             let seed = Crypto::password_seed(password, config.crypto.salt.as_deref(), config.crypto.kdf.as_deref())
                 .map_err(|e| format!("{}", e))?;
-            let pair =
-                Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|_| "Failed to derive signing key from password")?;
-            keys.push(vpncloud::util::to_base62(pair.public_key().as_ref()));
+            let pair = Ed25519KeyPair::from_seed(&seed).map_err(|_| "Failed to derive signing key from password")?;
+            keys.push(vpncloud::util::to_base62(pair.public_key()));
         }
     }
     if keys.is_empty() {

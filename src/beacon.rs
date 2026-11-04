@@ -2,7 +2,7 @@
 // Copyright (C) 2015-2021  Dennis Schwerdel
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
-use crate::crypto_ring::digest;
+use crate::crypto::sha512;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -34,8 +34,8 @@ fn base_62_sanitize(data: &str) -> String {
     data.chars().filter(|c| c.is_ascii_alphanumeric()).collect()
 }
 
-fn sha512(data: &[u8]) -> SmallVec<[u8; 64]> {
-    digest::digest(&digest::SHA512, data).as_ref().into()
+fn sha512_bytes(data: &[u8]) -> SmallVec<[u8; 64]> {
+    sha512(data).as_slice().into()
 }
 
 struct FutureResult<T> {
@@ -67,7 +67,7 @@ impl<TS: TimeSource> BeaconSerializer<TS> {
         let mut data = SmallVec::<[u8; 128]>::new();
         data.extend_from_slice(&[type_, seed, iter]);
         data.extend_from_slice(&self.shared_key);
-        sha512(&data)
+        sha512_bytes(&data)
     }
 
     #[allow(clippy::needless_range_loop)]

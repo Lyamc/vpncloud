@@ -41,10 +41,7 @@
 // seen one second ago plus 1 becomes the minimum nonce, so messages older than that second are
 // rejected even if they fall outside the bitmap.
 
-use crate::crypto_ring::{
-    aead::{self, LessSafeKey, UnboundKey},
-    rand::{SecureRandom, SystemRandom}
-};
+use super::{fill_random, AeadAlgo, AeadKey};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 
 use std::{
@@ -60,9 +57,8 @@ pub const TAG_LEN: usize = 16;
 pub const EXTRA_LEN: usize = 8;
 
 fn random_data(size: usize) -> Vec<u8> {
-    let rand = SystemRandom::new();
     let mut data = vec![0; size];
-    rand.fill(&mut data).expect("Failed to obtain random bytes");
+    fill_random(&mut data);
     data
 }
 
@@ -74,9 +70,9 @@ impl Nonce {
         Nonce([0; NONCE_LEN])
     }
 
-    fn random(rand: &SystemRandom) -> Self {
+    fn random() -> Self {
         let mut nonce = Nonce::zero();
-        rand.fill(&mut nonce.0[6..]).expect("Failed to obtain random bytes");
+        fill_random(&mut nonce.0[6..]);
         nonce
     }
 
@@ -103,7 +99,7 @@ impl Nonce {
 const REPLAY_WINDOW: u64 = 64;
 
 struct CryptoKey {
-    key: LessSafeKey,
+    key: AeadKey,
     send_nonce: Nonce,
     min_nonce: Nonce,
     next_min_nonce: Nonce,
@@ -113,8 +109,8 @@ struct CryptoKey {
 }
 
 impl CryptoKey {
-    fn new(rand: &SystemRandom, key: LessSafeKey, nonce_half: bool) -> Self {
-        let mut send_nonce = Nonce::random(rand);
+    fn new(key: AeadKey, nonce_half: bool) -> Self {
+        let mut send_nonce = Nonce::random();
         send_nonce.set_msb(if nonce_half { 0x80 } else { 0x00 });
         CryptoKey {
             key,
@@ -190,29 +186,27 @@ fn accept_nonce(key: &mut CryptoKey, nonce: Nonce) -> Result<(), Error> {
 }
 
 pub struct CryptoCore {
-    rand: SystemRandom,
     keys: [CryptoKey; 4],
     current_key: usize,
     nonce_half: bool
 }
 
 impl CryptoCore {
-    pub fn new(key: LessSafeKey, nonce_half: bool) -> Self {
-        let rand = SystemRandom::new();
-        let dummy_key_data = random_data(key.algorithm().key_len());
-        let dummy_key1 = LessSafeKey::new(UnboundKey::new(key.algorithm(), &dummy_key_data).unwrap());
-        let dummy_key2 = LessSafeKey::new(UnboundKey::new(key.algorithm(), &dummy_key_data).unwrap());
-        let dummy_key3 = LessSafeKey::new(UnboundKey::new(key.algorithm(), &dummy_key_data).unwrap());
+    pub fn new(key: AeadKey, nonce_half: bool) -> Self {
+        let algo = key.algorithm();
+        let dummy_key_data = random_data(algo.key_len());
+        let dummy_key1 = AeadKey::new(algo, &dummy_key_data).unwrap();
+        let dummy_key2 = AeadKey::new(algo, &dummy_key_data).unwrap();
+        let dummy_key3 = AeadKey::new(algo, &dummy_key_data).unwrap();
         Self {
             keys: [
-                CryptoKey::new(&rand, key, nonce_half),
-                CryptoKey::new(&rand, dummy_key1, nonce_half),
-                CryptoKey::new(&rand, dummy_key2, nonce_half),
-                CryptoKey::new(&rand, dummy_key3, nonce_half)
+                CryptoKey::new(key, nonce_half),
+                CryptoKey::new(dummy_key1, nonce_half),
+                CryptoKey::new(dummy_key2, nonce_half),
+                CryptoKey::new(dummy_key3, nonce_half)
             ],
             current_key: 0,
-            nonce_half,
-            rand
+            nonce_half
         }
     }
 
@@ -231,9 +225,8 @@ impl CryptoCore {
             extra.write_u8(self.current_key as u8).unwrap();
             extra.write_all(&key.send_nonce.as_bytes()[5..]).unwrap();
         }
-        let nonce = aead::Nonce::assume_unique_for_key(*key.send_nonce.as_bytes());
-        let tag = key.key.seal_in_place_separate_tag(nonce, aead::Aad::empty(), data).expect("Failed to encrypt");
-        tag_space.clone_from_slice(tag.as_ref());
+        let tag = key.key.seal(key.send_nonce.as_bytes(), data).expect("Failed to encrypt");
+        tag_space.copy_from_slice(&tag);
     }
 
     fn decrypt_with_key(key: &mut CryptoKey, nonce: Nonce, data_and_tag: &mut [u8]) -> Result<(), Error> {
@@ -241,10 +234,7 @@ impl CryptoCore {
             return Err(Error::Crypto("Old nonce rejected"));
         }
         // decrypt
-        let crypto_nonce = aead::Nonce::assume_unique_for_key(*nonce.as_bytes());
-        key.key
-            .open_in_place(crypto_nonce, aead::Aad::empty(), data_and_tag)
-            .map_err(|_| Error::Crypto("Failed to decrypt data"))?;
+        key.key.open(nonce.as_bytes(), data_and_tag).map_err(|_| Error::Crypto("Failed to decrypt data"))?;
         accept_nonce(key, nonce)
     }
 
@@ -267,16 +257,16 @@ impl CryptoCore {
         result
     }
 
-    pub fn rotate_key(&mut self, key: LessSafeKey, id: u64, use_for_sending: bool) {
+    pub fn rotate_key(&mut self, key: AeadKey, id: u64, use_for_sending: bool) {
         debug!("Rotated key {} (use for sending: {})", id, use_for_sending);
         let id = (id % 4) as usize;
-        self.keys[id] = CryptoKey::new(&self.rand, key, self.nonce_half);
+        self.keys[id] = CryptoKey::new(key, self.nonce_half);
         if use_for_sending {
             self.current_key = id
         }
     }
 
-    pub fn algorithm(&self) -> &'static aead::Algorithm {
+    pub fn algorithm(&self) -> AeadAlgo {
         self.keys[self.current_key].key.algorithm()
     }
 
@@ -293,9 +283,7 @@ pub fn seal_raw(key: &[u8], nonce_half: bool, plain: &[u8]) -> Result<Vec<u8>, E
     if key.len() < 16 {
         return Err(Error::Crypto("short key"));
     }
-    let ls = LessSafeKey::new(
-        UnboundKey::new(&aead::AES_128_GCM, &key[..16]).map_err(|_| Error::Crypto("bad key"))?
-    );
+    let ls = AeadKey::new(AeadAlgo::Aes128Gcm, &key[..16]).map_err(|_| Error::Crypto("bad key"))?;
     let mut core = CryptoCore::new(ls, nonce_half);
     let mut buf = MsgBuffer::new(EXTRA_LEN);
     buf.clone_from(plain);
@@ -308,9 +296,7 @@ pub fn open_raw(key: &[u8], nonce_half: bool, sealed: &[u8]) -> Result<Vec<u8>, 
     if key.len() < 16 {
         return Err(Error::Crypto("short key"));
     }
-    let ls = LessSafeKey::new(
-        UnboundKey::new(&aead::AES_128_GCM, &key[..16]).map_err(|_| Error::Crypto("bad key"))?
-    );
+    let ls = AeadKey::new(AeadAlgo::Aes128Gcm, &key[..16]).map_err(|_| Error::Crypto("bad key"))?;
     let mut core = CryptoCore::new(ls, nonce_half);
     let mut buf = MsgBuffer::new(0);
     buf.clone_from(sealed);
@@ -318,14 +304,14 @@ pub fn open_raw(key: &[u8], nonce_half: bool, sealed: &[u8]) -> Result<Vec<u8>, 
     Ok(buf.message().to_vec())
 }
 
-pub fn create_dummy_pair(algo: &'static aead::Algorithm) -> (CryptoCore, CryptoCore) {
+pub fn create_dummy_pair(algo: AeadAlgo) -> (CryptoCore, CryptoCore) {
     let key_data = random_data(algo.key_len());
-    let sender = CryptoCore::new(LessSafeKey::new(UnboundKey::new(algo, &key_data).unwrap()), true);
-    let receiver = CryptoCore::new(LessSafeKey::new(UnboundKey::new(algo, &key_data).unwrap()), false);
+    let sender = CryptoCore::new(AeadKey::new(algo, &key_data).unwrap(), true);
+    let receiver = CryptoCore::new(AeadKey::new(algo, &key_data).unwrap(), false);
     (sender, receiver)
 }
 
-pub fn test_speed(algo: &'static aead::Algorithm, max_time: &Duration) -> f64 {
+pub fn test_speed(algo: AeadAlgo, max_time: &Duration) -> f64 {
     let mut buffer = MsgBuffer::new(EXTRA_LEN);
     buffer.set_length(1000);
     let (mut sender, mut receiver) = create_dummy_pair(algo);
@@ -346,7 +332,6 @@ pub fn test_speed(algo: &'static aead::Algorithm, max_time: &Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto_ring::aead::{self, LessSafeKey, UnboundKey};
 
     #[test]
     fn test_nonce() {
@@ -358,7 +343,7 @@ mod tests {
         assert_eq!(nonce.as_bytes(), &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
     }
 
-    fn test_encrypt_decrypt(algo: &'static aead::Algorithm) {
+    fn test_encrypt_decrypt(algo: AeadAlgo) {
         let (mut sender, mut receiver) = create_dummy_pair(algo);
         let plain = random_data(1000);
         let mut buffer = MsgBuffer::new(EXTRA_LEN);
@@ -372,20 +357,20 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_aes128() {
-        test_encrypt_decrypt(&aead::AES_128_GCM)
+        test_encrypt_decrypt(AeadAlgo::Aes128Gcm)
     }
 
     #[test]
     fn test_encrypt_decrypt_aes256() {
-        test_encrypt_decrypt(&aead::AES_256_GCM)
+        test_encrypt_decrypt(AeadAlgo::Aes256Gcm)
     }
 
     #[test]
     fn test_encrypt_decrypt_chacha() {
-        test_encrypt_decrypt(&aead::CHACHA20_POLY1305)
+        test_encrypt_decrypt(AeadAlgo::ChaCha20Poly1305)
     }
 
-    fn test_tampering(algo: &'static aead::Algorithm) {
+    fn test_tampering(algo: AeadAlgo) {
         let (mut sender, mut receiver) = create_dummy_pair(algo);
         let plain = random_data(1000);
         let mut buffer = MsgBuffer::new(EXTRA_LEN);
@@ -414,20 +399,20 @@ mod tests {
 
     #[test]
     fn test_tampering_aes128() {
-        test_tampering(&aead::AES_128_GCM)
+        test_tampering(AeadAlgo::Aes128Gcm)
     }
 
     #[test]
     fn test_tampering_aes256() {
-        test_tampering(&aead::AES_256_GCM)
+        test_tampering(AeadAlgo::Aes256Gcm)
     }
 
     #[test]
     fn test_tampering_chacha() {
-        test_tampering(&aead::CHACHA20_POLY1305)
+        test_tampering(AeadAlgo::ChaCha20Poly1305)
     }
 
-    fn test_nonce_pinning(algo: &'static aead::Algorithm) {
+    fn test_nonce_pinning(algo: AeadAlgo) {
         let (mut sender, mut receiver) = create_dummy_pair(algo);
         let plain = random_data(1000);
         let mut buffer = MsgBuffer::new(EXTRA_LEN);
@@ -455,7 +440,7 @@ mod tests {
 
     #[test]
     fn replay_drops_exact_duplicate_inside_window() {
-        let (mut sender, mut receiver) = create_dummy_pair(&aead::AES_128_GCM);
+        let (mut sender, mut receiver) = create_dummy_pair(AeadAlgo::Aes128Gcm);
         let plain = b"fresh-then-replay";
         let mut buffer = MsgBuffer::new(EXTRA_LEN);
         buffer.clone_from(plain);
@@ -474,20 +459,20 @@ mod tests {
 
     #[test]
     fn test_nonce_pinning_aes128() {
-        test_nonce_pinning(&aead::AES_128_GCM)
+        test_nonce_pinning(AeadAlgo::Aes128Gcm)
     }
 
     #[test]
     fn test_nonce_pinning_aes256() {
-        test_nonce_pinning(&aead::AES_256_GCM)
+        test_nonce_pinning(AeadAlgo::Aes256Gcm)
     }
 
     #[test]
     fn test_nonce_pinning_chacha() {
-        test_nonce_pinning(&aead::CHACHA20_POLY1305)
+        test_nonce_pinning(AeadAlgo::ChaCha20Poly1305)
     }
 
-    fn test_key_rotation(algo: &'static aead::Algorithm) {
+    fn test_key_rotation(algo: AeadAlgo) {
         let (mut sender, mut receiver) = create_dummy_pair(algo);
         let plain = random_data(1000);
         let mut buffer = MsgBuffer::new(EXTRA_LEN);
@@ -497,24 +482,24 @@ mod tests {
         assert!(receiver.decrypt(&mut buffer).is_ok());
 
         let new_key = random_data(algo.key_len());
-        receiver.rotate_key(LessSafeKey::new(UnboundKey::new(algo, &new_key).unwrap()), 1, false);
+        receiver.rotate_key(AeadKey::new(algo, &new_key).unwrap(), 1, false);
         receiver.encrypt(&mut buffer);
         assert!(sender.decrypt(&mut buffer).is_ok());
         sender.encrypt(&mut buffer);
         assert!(receiver.decrypt(&mut buffer).is_ok());
-        sender.rotate_key(LessSafeKey::new(UnboundKey::new(algo, &new_key).unwrap()), 1, true);
+        sender.rotate_key(AeadKey::new(algo, &new_key).unwrap(), 1, true);
         receiver.encrypt(&mut buffer);
         assert!(sender.decrypt(&mut buffer).is_ok());
         sender.encrypt(&mut buffer);
         assert!(receiver.decrypt(&mut buffer).is_ok());
         let new_key = random_data(algo.key_len());
-        sender.rotate_key(LessSafeKey::new(UnboundKey::new(algo, &new_key).unwrap()), 2, true);
+        sender.rotate_key(AeadKey::new(algo, &new_key).unwrap(), 2, true);
         sender.encrypt(&mut buffer);
         assert!(receiver.decrypt(&mut buffer).is_err());
         receiver.encrypt(&mut buffer);
         assert!(sender.decrypt(&mut buffer).is_ok());
 
-        receiver.rotate_key(LessSafeKey::new(UnboundKey::new(algo, &new_key).unwrap()), 2, false);
+        receiver.rotate_key(AeadKey::new(algo, &new_key).unwrap(), 2, false);
         receiver.encrypt(&mut buffer);
         assert!(sender.decrypt(&mut buffer).is_ok());
         sender.encrypt(&mut buffer);
@@ -523,40 +508,40 @@ mod tests {
 
     #[test]
     fn test_key_rotation_aes128() {
-        test_key_rotation(&aead::AES_128_GCM);
+        test_key_rotation(AeadAlgo::Aes128Gcm);
     }
 
     #[test]
     fn test_key_rotation_aes256() {
-        test_key_rotation(&aead::AES_256_GCM);
+        test_key_rotation(AeadAlgo::Aes256Gcm);
     }
 
     #[test]
     fn test_key_rotation_chacha() {
-        test_key_rotation(&aead::CHACHA20_POLY1305);
+        test_key_rotation(AeadAlgo::ChaCha20Poly1305);
     }
 
     #[test]
     fn test_core_size() {
         let size = mem::size_of::<CryptoCore>();
-        assert_eq!(size, 4368);
+        assert_eq!(size, 4304);
     }
 
     #[test]
     fn test_speed_aes128() {
-        let speed = test_speed(&aead::AES_128_GCM, &Duration::from_secs_f32(0.2));
+        let speed = test_speed(AeadAlgo::Aes128Gcm, &Duration::from_secs_f32(0.2));
         assert!(speed > 10.0);
     }
 
     #[test]
     fn test_speed_aes256() {
-        let speed = test_speed(&aead::AES_256_GCM, &Duration::from_secs_f32(0.2));
+        let speed = test_speed(AeadAlgo::Aes256Gcm, &Duration::from_secs_f32(0.2));
         assert!(speed > 10.0);
     }
 
     #[test]
     fn test_speed_chacha() {
-        let speed = test_speed(&aead::CHACHA20_POLY1305, &Duration::from_secs_f32(0.2));
+        let speed = test_speed(AeadAlgo::ChaCha20Poly1305, &Duration::from_secs_f32(0.2));
         assert!(speed > 10.0);
     }
 }

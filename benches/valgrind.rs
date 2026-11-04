@@ -5,7 +5,7 @@
 use iai::{black_box, main};
 
 use smallvec::smallvec;
-use vpncloud::crypto_ring::aead;
+use vpncloud::crypto::AeadAlgo;
 
 use std::str::FromStr;
 use std::net::{SocketAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -71,7 +71,7 @@ fn lookup_cold() {
     }
 }
 
-fn crypto_bench(algo: &'static aead::Algorithm) {
+fn crypto_bench(algo: AeadAlgo) {
     let mut buffer = MsgBuffer::new(EXTRA_LEN);
     buffer.set_length(1400);
     let (mut sender, mut receiver) = create_dummy_pair(algo);
@@ -82,15 +82,15 @@ fn crypto_bench(algo: &'static aead::Algorithm) {
 }
 
 fn crypto_chacha20() {
-    crypto_bench(&aead::CHACHA20_POLY1305)
+    crypto_bench(AeadAlgo::ChaCha20Poly1305)
 }
 
 fn crypto_aes128() {
-    crypto_bench(&aead::AES_128_GCM)
+    crypto_bench(AeadAlgo::Aes128Gcm)
 }
 
 fn crypto_aes256() {
-    crypto_bench(&aead::AES_256_GCM)
+    crypto_bench(AeadAlgo::Aes256Gcm)
 }
 
 fn full_communication_tun_router() {

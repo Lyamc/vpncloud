@@ -4,10 +4,8 @@
 
 //! Ed25519 signatures over config file bodies (signature lines stripped).
 
-use crate::crypto_ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
-
 use crate::{
-    crypto::Crypto,
+    crypto::{Crypto, Ed25519KeyPair},
     error::Error,
     util::{from_base62, to_base62}
 };
@@ -31,23 +29,20 @@ pub fn sign_body(body: &str, private_key_b62: &str) -> Result<String, Error> {
     if seed.len() != 32 {
         return Err(Error::InvalidConfig("Failed to parse private key"));
     }
-    let pair = Ed25519KeyPair::from_seed_unchecked(&seed)
-        .map_err(|_| Error::InvalidConfig("Key rejected by crypto library"))?;
-    Ok(to_base62(pair.sign(body.as_bytes()).as_ref()))
+    let pair = Ed25519KeyPair::from_seed(&seed).map_err(|_| Error::InvalidConfig("Key rejected by crypto library"))?;
+    Ok(to_base62(&pair.sign(body.as_bytes())))
 }
 
 pub fn sign_with_password(body: &str, password: &str, salt: Option<&str>, kdf: Option<&str>) -> Result<String, Error> {
     let seed = Crypto::password_seed(password, salt, kdf)?;
-    let pair = Ed25519KeyPair::from_seed_unchecked(&seed)
-        .map_err(|_| Error::InvalidConfig("Key rejected by crypto library"))?;
-    Ok(to_base62(pair.sign(body.as_bytes()).as_ref()))
+    let pair = Ed25519KeyPair::from_seed(&seed).map_err(|_| Error::InvalidConfig("Key rejected by crypto library"))?;
+    Ok(to_base62(&pair.sign(body.as_bytes())))
 }
 
 pub fn verify_body(body: &str, signature_b62: &str, public_key_b62: &str) -> Result<(), Error> {
     let sig = from_base62(signature_b62).map_err(|_| Error::InvalidConfig("Invalid config signature"))?;
     let pk = from_base62(public_key_b62).map_err(|_| Error::InvalidConfig("Failed to parse public key"))?;
-    UnparsedPublicKey::new(&ED25519, pk)
-        .verify(body.as_bytes(), &sig)
+    Ed25519KeyPair::verify(&pk, body.as_bytes(), &sig)
         .map_err(|_| Error::InvalidConfig("Config signature verification failed"))
 }
 

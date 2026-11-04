@@ -6,23 +6,15 @@ mod common;
 mod core;
 mod init;
 #[cfg(feature = "noise")] mod noise;
+mod prim;
 mod rotate;
 
 pub use self::core::{open_raw, seal_raw, EXTRA_LEN, TAG_LEN};
 pub use common::*;
+pub use prim::{fill_random, sha256, sha512, AeadAlgo, AeadKey, Ed25519KeyPair, ED25519_PUBLIC_KEY_LEN};
+use prim::pbkdf2_hmac_sha256;
 #[cfg(feature = "noise")]
 pub use noise::is_noise_frame;
-
-/// X25519 agreement. The private key is consumed so it is used once.
-pub(crate) fn agree_ephemeral<B, R>(
-    my_private_key: crate::crypto_ring::agreement::EphemeralPrivateKey,
-    peer_public_key: &crate::crypto_ring::agreement::UnparsedPublicKey<B>, kdf: impl FnOnce(&[u8]) -> R
-) -> Result<R, crate::crypto_ring::error::Unspecified>
-where
-    B: AsRef<[u8]>
-{
-    crate::crypto_ring::agreement::agree_ephemeral(my_private_key, peer_public_key, kdf)
-}
 
 #[cfg(not(feature = "noise"))]
 pub fn is_noise_frame(_msg: &[u8]) -> bool {

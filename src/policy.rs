@@ -7,8 +7,7 @@
 
 use std::{collections::HashSet, net::SocketAddr, str::FromStr};
 
-use crate::crypto_ring::rand::SecureRandom;
-
+use crate::crypto::fill_random;
 use crate::types::{Address, NodeId, Range};
 
 pub const SEAL_MARK: u8 = 0xE2;
@@ -86,7 +85,7 @@ pub fn choose_delivery(dest_connected: bool, hops: &[RelayHop], exclude: SocketA
 
 pub fn generate_e2e_keypair() -> ([u8; 32], [u8; 32]) {
     let mut secret = [0u8; 32];
-    crate::crypto_ring::rand::SystemRandom::new().fill(&mut secret).expect("e2e key");
+    fill_random(&mut secret);
     #[cfg(feature = "noise")]
     {
         let sk = x25519_dalek::StaticSecret::from(secret);

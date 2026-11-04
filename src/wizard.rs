@@ -1,7 +1,6 @@
 use crate::{
     config::{load_config_file, resolve_config_path, write_config_file, Config},
-    crypto::Crypto,
-    crypto_ring::aead,
+    crypto::{AeadAlgo, Crypto},
     device,
     types::Mode
 };
@@ -147,9 +146,9 @@ fn configure_crypto(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
             .with_prompt("Allowed encryption algorithms (select multiple)")
             .items_checked([
                 ("Unencrypted (dangerous)", unencrypted),
-                ("AES-128 in GCM mode", allowed_algos.contains(&&aead::AES_128_GCM)),
-                ("AES-256 in GCM mode", allowed_algos.contains(&&aead::AES_256_GCM)),
-                ("ChaCha20-Poly1305 (RFC 7539)", allowed_algos.contains(&&aead::CHACHA20_POLY1305)),
+                ("AES-128 in GCM mode", allowed_algos.contains(&AeadAlgo::Aes128Gcm)),
+                ("AES-256 in GCM mode", allowed_algos.contains(&AeadAlgo::Aes256Gcm)),
+                ("ChaCha20-Poly1305 (RFC 7539)", allowed_algos.contains(&AeadAlgo::ChaCha20Poly1305)),
                 ("Noise_XX (X25519 / ChaChaPoly / SHA-256)", use_noise)
             ])
             .interact()?;

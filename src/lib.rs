@@ -7,9 +7,6 @@ extern crate log;
 #[macro_use]
 extern crate serde;
 
-/// Pure-Rust crypto (AEAD, signatures, hashing, agreement). No C is compiled.
-pub mod crypto_ring;
-
 #[cfg(test)]
 extern crate tempfile;
 

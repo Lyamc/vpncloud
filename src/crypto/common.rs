@@ -5,28 +5,23 @@ use super::{
     init::{self, InitResult, InitState, CLOSING},
     rotate::RotationState
 };
+use super::{
+    fill_random, pbkdf2_hmac_sha256, AeadAlgo, AeadKey, Ed25519KeyPair, ED25519_PUBLIC_KEY_LEN
+};
 use crate::{
-    crypto_ring::{
-        aead::{self, Algorithm, LessSafeKey, UnboundKey},
-        agreement::{EphemeralPrivateKey, UnparsedPublicKey},
-        pbkdf2,
-        rand::{SecureRandom, SystemRandom},
-        signature::{Ed25519KeyPair, KeyPair, ED25519_PUBLIC_KEY_LEN}
-    },
     error::Error,
     types::NodeId,
     util::{from_base62, to_base62, MsgBuffer}
 };
 use smallvec::{smallvec, SmallVec};
-use std::{fmt::Debug, io::Read, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{fmt::Debug, io::Read, sync::Arc, time::Duration};
 
 const SALT: &[u8; 32] = b"vpncloudVPNCLOUDvpncl0udVpnCloud";
 const INIT_MESSAGE_FIRST_BYTE: u8 = 0xff;
 const MESSAGE_TYPE_ROTATION: u8 = 0x10;
 
 pub type Ed25519PublicKey = [u8; ED25519_PUBLIC_KEY_LEN];
-pub type EcdhPublicKey = UnparsedPublicKey<SmallVec<[u8; 96]>>;
-pub type EcdhPrivateKey = EphemeralPrivateKey;
+pub use super::prim::{EcdhPublic as EcdhPublicKey, EcdhSecret as EcdhPrivateKey};
 pub type Key = SmallVec<[u8; 32]>;
 
 const DEFAULT_ALGORITHMS: [&str; 3] = ["AES128", "AES256", "CHACHA20"];
@@ -45,7 +40,7 @@ pub trait Payload: Debug + PartialEq + Sized {
 
 #[derive(Clone)]
 pub struct Algorithms {
-    pub algorithm_speeds: SmallVec<[(&'static Algorithm, f32); 3]>,
+    pub algorithm_speeds: SmallVec<[(AeadAlgo, f32); 3]>,
     pub allow_unencrypted: bool
 }
 
@@ -85,7 +80,7 @@ pub struct Crypto {
 }
 
 impl Crypto {
-    pub fn parse_algorithms(algos: &[String]) -> Result<(bool, bool, Vec<&'static aead::Algorithm>), Error> {
+    pub fn parse_algorithms(algos: &[String]) -> Result<(bool, bool, Vec<AeadAlgo>), Error> {
         let algorithms = algos.iter().map(|a| a as &str).collect::<Vec<_>>();
         let allowed = if algorithms.is_empty() { &DEFAULT_ALGORITHMS } else { &algorithms as &[&str] };
         let mut algos = vec![];
@@ -109,9 +104,9 @@ impl Crypto {
                         ));
                     }
                 }
-                "AES128" | "AES128_GCM" | "AES_128" | "AES_128_GCM" => algos.push(&aead::AES_128_GCM),
-                "AES256" | "AES256_GCM" | "AES_256" | "AES_256_GCM" => algos.push(&aead::AES_256_GCM),
-                "CHACHA" | "CHACHA20" | "CHACHA20_POLY1305" => algos.push(&aead::CHACHA20_POLY1305),
+                "AES128" | "AES128_GCM" | "AES_128" | "AES_128_GCM" => algos.push(AeadAlgo::Aes128Gcm),
+                "AES256" | "AES256_GCM" | "AES_256" | "AES_256_GCM" => algos.push(AeadAlgo::Aes256Gcm),
+                "CHACHA" | "CHACHA20" | "CHACHA20_POLY1305" => algos.push(AeadAlgo::ChaCha20Poly1305),
                 _ => return Err(Error::InvalidConfig("Unknown crypto method"))
             }
         }
@@ -146,13 +141,7 @@ impl Crypto {
         } else {
             (4096, SALT.as_ref())
         };
-        pbkdf2::derive(
-            pbkdf2::PBKDF2_HMAC_SHA256,
-            NonZeroU32::new(iters).expect("kdf iterations"),
-            salt_bytes,
-            password.as_bytes(),
-            &mut key
-        );
+        pbkdf2_hmac_sha256(password.as_bytes(), salt_bytes, iters, &mut key);
         Ok(key)
     }
 
@@ -165,8 +154,7 @@ impl Crypto {
                 Self::parse_private_key(priv_key)?
             }
         } else {
-            Ed25519KeyPair::from_seed_unchecked(&seed)
-                .map_err(|_| Error::InvalidConfig("Key rejected by crypto library"))?
+            Ed25519KeyPair::from_seed(&seed).map_err(|_| Error::InvalidConfig("Key rejected by crypto library"))?
         };
         let mut trusted_keys = vec![];
         for tn in &config.trusted_keys {
@@ -185,7 +173,7 @@ impl Crypto {
         if trusted_keys.is_empty() {
             info!("Trusted keys not set, trusting only own public key");
             let mut key = [0; ED25519_PUBLIC_KEY_LEN];
-            key.clone_from_slice(key_pair.public_key().as_ref());
+            key.clone_from_slice(key_pair.public_key());
             trusted_keys.push(key);
         }
         let (unencrypted, use_noise, allowed_algos) = Self::parse_algorithms(&config.algorithms)?;
@@ -239,45 +227,34 @@ impl Crypto {
     pub fn generate_keypair(password: Option<&str>) -> (String, String) {
         let mut bytes = [0; 32];
         match password {
-            None => {
-                let rng = SystemRandom::new();
-                rng.fill(&mut bytes).unwrap();
-            }
-            Some(password) => {
-                pbkdf2::derive(
-                    pbkdf2::PBKDF2_HMAC_SHA256,
-                    NonZeroU32::new(4096).unwrap(),
-                    SALT,
-                    password.as_bytes(),
-                    &mut bytes
-                );
-            }
+            None => fill_random(&mut bytes),
+            Some(password) => pbkdf2_hmac_sha256(password.as_bytes(), SALT, 4096, &mut bytes)
         }
-        let keypair = Ed25519KeyPair::from_seed_unchecked(&bytes).unwrap();
+        let keypair = Ed25519KeyPair::from_seed(&bytes).unwrap();
         let privkey = to_base62(&bytes);
-        let pubkey = to_base62(keypair.public_key().as_ref());
+        let pubkey = to_base62(keypair.public_key());
         (privkey, pubkey)
     }
 
     #[allow(dead_code)]
     fn keypair_from_password(password: &str) -> Ed25519KeyPair {
         let mut key = [0; 32];
-        pbkdf2::derive(pbkdf2::PBKDF2_HMAC_SHA256, NonZeroU32::new(4096).unwrap(), SALT, password.as_bytes(), &mut key);
-        Ed25519KeyPair::from_seed_unchecked(&key).unwrap()
+        pbkdf2_hmac_sha256(password.as_bytes(), SALT, 4096, &mut key);
+        Ed25519KeyPair::from_seed(&key).unwrap()
     }
 
     fn parse_keypair(privkey: &str, pubkey: &str) -> Result<Ed25519KeyPair, Error> {
         let privkey = from_base62(privkey).map_err(|_| Error::InvalidConfig("Failed to parse private key"))?;
         let pubkey = from_base62(pubkey).map_err(|_| Error::InvalidConfig("Failed to parse public key"))?;
-        let keypair = Ed25519KeyPair::from_seed_and_public_key(&privkey, &pubkey)
+        let keypair = Ed25519KeyPair::from_seed_and_public(&privkey, &pubkey)
             .map_err(|_| Error::InvalidConfig("Keys rejected by crypto library"))?;
         Ok(keypair)
     }
 
     fn parse_private_key(privkey: &str) -> Result<Ed25519KeyPair, Error> {
         let privkey = from_base62(privkey).map_err(|_| Error::InvalidConfig("Failed to parse private key"))?;
-        let keypair = Ed25519KeyPair::from_seed_unchecked(&privkey)
-            .map_err(|_| Error::InvalidConfig("Key rejected by crypto library"))?;
+        let keypair =
+            Ed25519KeyPair::from_seed(&privkey).map_err(|_| Error::InvalidConfig("Key rejected by crypto library"))?;
         Ok(keypair)
     }
 
@@ -308,7 +285,7 @@ impl Crypto {
 
     pub fn public_key_from_private_key(privkey: &str) -> Result<String, Error> {
         let keypair = Self::parse_private_key(privkey)?;
-        Ok(to_base62(keypair.public_key().as_ref()))
+        Ok(to_base62(keypair.public_key()))
     }
 
     pub fn peer_instance<P: Payload>(&self, payload: P) -> PeerCrypto<P> {
@@ -470,14 +447,10 @@ impl<P: Payload> PeerCrypto<P> {
         }
         if let Some(ref core) = self.core {
             let algo = core.algorithm();
-            if algo == &aead::CHACHA20_POLY1305 {
-                "CHACHA20"
-            } else if algo == &aead::AES_128_GCM {
-                "AES128"
-            } else if algo == &aead::AES_256_GCM {
-                "AES256"
-            } else {
-                unreachable!()
+            match algo {
+                AeadAlgo::ChaCha20Poly1305 => "CHACHA20",
+                AeadAlgo::Aes128Gcm => "AES128",
+                AeadAlgo::Aes256Gcm => "AES256"
             }
         } else {
             "PLAIN"
@@ -549,7 +522,7 @@ impl<P: Payload> PeerCrypto<P> {
         if let Some(rot) = self.get_rotation()?.handle_message(data)? {
             let core = self.get_core()?;
             let algo = core.algorithm();
-            let key = LessSafeKey::new(UnboundKey::new(algo, &rot.key[..algo.key_len()]).unwrap());
+            let key = AeadKey::new(algo, &rot.key[..algo.key_len()]).unwrap();
             core.rotate_key(key, rot.id, rot.use_for_sending);
         }
         Ok(())
@@ -651,7 +624,7 @@ impl<P: Payload> PeerCrypto<P> {
                 if let Some(rot) = rotate.cycle(out) {
                     let core = self.get_core()?;
                     let algo = core.algorithm();
-                    let key = LessSafeKey::new(UnboundKey::new(algo, &rot.key[..algo.key_len()]).unwrap());
+                    let key = AeadKey::new(algo, &rot.key[..algo.key_len()]).unwrap();
                     core.rotate_key(key, rot.id, rot.use_for_sending);
                 }
                 if !out.is_empty() {
@@ -677,9 +650,8 @@ mod tests {
     use crate::types::NODE_ID_BYTES;
 
     fn create_node(config: &Config) -> PeerCrypto<Vec<u8>> {
-        let rng = SystemRandom::new();
         let mut node_id = [0; NODE_ID_BYTES];
-        rng.fill(&mut node_id).unwrap();
+        fill_random(&mut node_id);
         let crypto = Crypto::new(node_id, config).unwrap();
         crypto.peer_instance(vec![])
     }
@@ -715,9 +687,8 @@ mod tests {
         assert!(msg.is_empty());
 
         let mut buffer = MsgBuffer::new(16);
-        let rng = SystemRandom::new();
         buffer.set_length(1000);
-        rng.fill(buffer.message_mut()).unwrap();
+        fill_random(buffer.message_mut());
         for _ in 0..1000 {
             node1.send_message(1, &mut buffer).unwrap();
             let res = node2.handle_message(&mut buffer).unwrap();

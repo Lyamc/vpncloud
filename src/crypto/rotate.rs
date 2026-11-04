@@ -29,21 +29,11 @@
 //
 // The whole communication is sent via the crypto stream and is therefore encrypted and protected against tampering.
 
-use super::{agree_ephemeral, Key};
-use crate::{
-    crypto_ring::{
-        agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519},
-        rand::SystemRandom
-    },
-    error::Error,
-    util::MsgBuffer
-};
+use super::{EcdhPrivateKey, EcdhPublicKey, Key};
+use crate::{error::Error, util::MsgBuffer};
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use smallvec::{smallvec, SmallVec};
 use std::io::{self, Cursor, Read, Write};
-
-type EcdhPublicKey = UnparsedPublicKey<SmallVec<[u8; 96]>>;
-type EcdhPrivateKey = EphemeralPrivateKey;
 
 pub struct RotationMessage {
     message_id: u64,
@@ -58,12 +48,12 @@ impl RotationMessage {
         let key_len = r.read_u8()? as usize;
         let mut key_data = smallvec![0; key_len];
         r.read_exact(&mut key_data)?;
-        let propose = EcdhPublicKey::new(&X25519, key_data);
+        let propose = EcdhPublicKey::new(key_data);
         let key_len = r.read_u8()? as usize;
         let confirm = if key_len > 0 {
             let mut key_data = smallvec![0; key_len];
             r.read_exact(&mut key_data)?;
-            Some(EcdhPublicKey::new(&X25519, key_data))
+            Some(EcdhPublicKey::new(key_data))
         } else {
             None
         };
@@ -126,26 +116,23 @@ impl RotationState {
     }
 
     fn create_key() -> (EcdhPrivateKey, EcdhPublicKey) {
-        let rand = SystemRandom::new();
-        let private_key = EcdhPrivateKey::generate(&X25519, &rand).unwrap();
+        let private_key = EcdhPrivateKey::generate();
         let public_key = Self::compute_public_key(&private_key);
         (private_key, public_key)
     }
 
     fn compute_public_key(private_key: &EcdhPrivateKey) -> EcdhPublicKey {
-        let public_key = private_key.compute_public_key().unwrap();
+        let public_key = private_key.public_key();
         let mut vec = SmallVec::<[u8; 96]>::new();
-        vec.extend_from_slice(public_key.as_ref());
-        EcdhPublicKey::new(&X25519, vec)
+        vec.extend_from_slice(&public_key);
+        EcdhPublicKey::new(vec)
     }
 
     fn derive_key(private_key: EcdhPrivateKey, public_key: EcdhPublicKey) -> Key {
-        agree_ephemeral(private_key, &public_key, |k| {
-            let mut vec = Key::new();
-            vec.extend_from_slice(k);
-            vec
-        })
-        .unwrap()
+        let shared = private_key.agree(public_key.bytes()).unwrap();
+        let mut vec = Key::new();
+        vec.extend_from_slice(&shared);
+        vec
     }
 
     pub fn handle_message(&mut self, msg: &[u8]) -> Result<Option<RotatedKey>, Error> {

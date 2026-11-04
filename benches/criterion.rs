@@ -5,7 +5,7 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
 use smallvec::smallvec;
-use vpncloud::crypto_ring::aead;
+use vpncloud::crypto::AeadAlgo;
 
 use std::str::FromStr;
 use std::net::{SocketAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -104,7 +104,7 @@ fn lookup_cold(c: &mut Criterion) {
     g.finish();
 }
 
-fn crypto_bench(c: &mut Criterion, algo: &'static aead::Algorithm) {
+fn crypto_bench(c: &mut Criterion, algo: AeadAlgo) {
     let mut buffer = MsgBuffer::new(EXTRA_LEN);
     buffer.set_length(1400);
     let (mut sender, mut receiver) = create_dummy_pair(algo);
@@ -120,15 +120,15 @@ fn crypto_bench(c: &mut Criterion, algo: &'static aead::Algorithm) {
 }
 
 fn crypto_chacha20(c: &mut Criterion) {
-    crypto_bench(c, &aead::CHACHA20_POLY1305)
+    crypto_bench(c, AeadAlgo::ChaCha20Poly1305)
 }
 
 fn crypto_aes128(c: &mut Criterion) {
-    crypto_bench(c, &aead::AES_128_GCM)
+    crypto_bench(c, AeadAlgo::Aes128Gcm)
 }
 
 fn crypto_aes256(c: &mut Criterion) {
-    crypto_bench(c, &aead::AES_256_GCM)
+    crypto_bench(c, AeadAlgo::Aes256Gcm)
 }
 
 fn full_communication_tun_router(c: &mut Criterion) {
