@@ -295,3 +295,71 @@ fn crypto_housekeep_forgets_claims_for_the_dead_peer() {
     assert!(drain(&mut sim, e).is_empty());
     assert!(drain(&mut sim, b).is_empty());
 }
+
+fn router_grants(claim: &str, grants: &[&str]) -> Config {
+    let mut config = router(claim, true);
+    config.grants = grants.iter().map(|line| (*line).to_string()).collect();
+    config
+}
+
+#[test]
+fn higher_transit_metric_loses_to_the_direct_claim() {
+    let mut sim = TunSimulator::new();
+    sim.set_time(10);
+    let a = sim.add_node(false, &router("10.1.0.0/24", true));
+    let b = sim.add_node(false, &router("10.2.0.0/24", true));
+    let e = sim.add_node(false, &router("10.9.0.0/16@10", true));
+    let c = sim.add_node(false, &router("10.9.0.0/16@40", true));
+    bring_up(&mut sim, b, c);
+    bring_up(&mut sim, a, e);
+    sim.block_pair(a, c);
+    bring_up(&mut sim, a, b);
+    assert!(sim.is_connected(a, e));
+    assert!(!sim.is_connected(a, c));
+
+    let pkt = ipv4([10, 1, 0, 9], [10, 9, 1, 9], SECRET);
+    sim.clear_messages();
+    sim.put_payload(a, pkt.clone());
+    let front = sim.front_message().expect("direct preferred over transit");
+    assert_eq!(front.0, a);
+    assert_eq!(front.1, e);
+    assert_eq!(front.2[0], MESSAGE_TYPE_DATA);
+    assert_ne!(front.2[0], MESSAGE_TYPE_RELAY);
+    assert_eq!(&front.2[1..], pkt.as_slice());
+    sim.simulate_all_messages();
+    assert_eq!(drain(&mut sim, e), vec![pkt]);
+    assert!(drain(&mut sim, b).is_empty());
+    assert!(drain(&mut sim, c).is_empty());
+}
+
+#[test]
+fn relay_delivery_authorizes_the_origin_not_the_hop() {
+    let mut sim = TunSimulator::new();
+    sim.set_time(10);
+    let a = sim.add_node(false, &router_grants("10.1.0.0/24", &["prefix:10.3.0.0/24", "prefix:10.1.0.0/24"]));
+    let b = sim.add_node(false, &router_grants("10.2.0.0/24", &["prefix:10.1.0.0/24", "prefix:10.3.0.0/24"]));
+    let c = sim.add_node(false, &router_grants("10.3.0.0/24", &["prefix:10.1.0.0/24", "prefix:10.2.0.0/24"]));
+    bring_up(&mut sim, a, b);
+    sim.block_pair(a, c);
+    bring_up(&mut sim, b, c);
+    assert!(!sim.is_connected(a, c));
+    sim.trigger_node_housekeep(b);
+    sim.simulate_all_messages();
+    assert!(!sim.is_connected(a, c));
+    assert!(sim.is_connected(b, c));
+
+    let pkt = ipv4([10, 1, 0, 9], [10, 3, 0, 9], SECRET);
+    sim.clear_messages();
+    sim.put_payload(a, pkt.clone());
+    let relays = drive(&mut sim);
+    assert!(relays.iter().any(|(src, dst, _)| *src == b && *dst == c), "hop did not forward: {relays:?}");
+    assert!(drain(&mut sim, b).is_empty());
+    assert_eq!(drain(&mut sim, c), vec![pkt]);
+
+    let foreign = ipv4([192, 168, 9, 9], [10, 3, 0, 9], SECRET);
+    sim.clear_messages();
+    sim.put_payload(a, foreign);
+    sim.simulate_all_messages();
+    assert!(drain(&mut sim, c).is_empty());
+    assert!(drain(&mut sim, b).is_empty());
+}

@@ -246,7 +246,8 @@ impl NodeInfo {
                 }
                 _ => return Err(Error::Message("Truncated message"))
             };
-            let claim = Range::read_from(&mut *r)?;
+            let mut claim = Range::read_from(&mut *r)?;
+            claim.metric = r.read_u8().map_err(|_| Error::Message("Truncated message"))?;
             out.push(TransitClaim { node_id, addr, claim });
         }
         Ok(out)
@@ -267,6 +268,7 @@ impl NodeInfo {
             }
         }
         hop.claim.write_to(&mut *out);
+        out.write_u8(hop.claim.metric)?;
         Ok(())
     }
 
@@ -455,17 +457,19 @@ mod tests {
         info.transit.push(TransitClaim {
             node_id: [9; NODE_ID_BYTES],
             addr: "192.0.2.8:3210".parse::<SocketAddr>().unwrap(),
-            claim: Range { base: crate::types::Address::from_ipv4("10.9.0.0".parse().unwrap()), prefix_len: 24, metric: 0 }
+            claim: Range { base: crate::types::Address::from_ipv4("10.9.0.0".parse().unwrap()), prefix_len: 16, metric: 40 }
         });
         info.transit.push(TransitClaim {
             node_id: [8; NODE_ID_BYTES],
             addr: "[2001:db8::8]:3211".parse::<SocketAddr>().unwrap(),
-            claim: Range { base: crate::types::Address::from_ipv4("10.8.0.0".parse().unwrap()), prefix_len: 16, metric: 0 }
+            claim: Range { base: crate::types::Address::from_ipv4("10.8.0.0".parse().unwrap()), prefix_len: 16, metric: 10 }
         });
         let mut buf = MsgBuffer::new(0);
         info.encode(&mut buf);
         let decoded = NodeInfo::decode(buf.message()).expect("decode");
         assert_eq!(decoded.transit, info.transit);
+        assert_eq!(decoded.transit[0].claim.metric, 40);
+        assert_eq!(decoded.transit[1].claim.metric, 10);
         buf.clear();
         sample(None).encode(&mut buf);
         let decoded = NodeInfo::decode(buf.message()).expect("decode");

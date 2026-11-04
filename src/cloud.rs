@@ -737,7 +737,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         for (result, mut data) in packets {
             match result {
                 Ok(val) => {
-                    if let Err(e) = self.handle_message(src, val, &mut data) {
+                    if let Err(e) = self.handle_message(src, val, &mut data, false) {
                         error!("{}", e);
                     }
                     if data.is_empty() {
@@ -1337,7 +1337,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 };
                 let mut buf = self.take_spare();
                 buf.clone_from(&plain);
-                let result = self.handle_message(src, MessageResult::Message(inner_type), &mut buf);
+                let result = self.handle_message(src, MessageResult::Message(inner_type), &mut buf, true);
                 self.buf_spare.push(buf);
                 result
             }
@@ -1416,7 +1416,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         self.route_message(dst, MESSAGE_TYPE_DATA_GSO, data)
     }
 
-    fn handle_gso_payload_from(&mut self, peer: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
+    fn handle_gso_payload_from(&mut self, peer: SocketAddr, data: &mut MsgBuffer, relayed: bool) -> Result<(), Error> {
         let Some(meta) = GsoMeta::read(data.message()) else {
             self.traffic.count_invalid_protocol(data.len());
             return Err(Error::Message("Truncated GSO message"));
@@ -1428,7 +1428,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         let (src, dst) = {
             let ip = &data.message()[GSO_META_LEN..];
             let (src, dst) = P::parse(ip)?;
-            if !self.ingress_allowed(peer, ip, src) {
+            if !self.ingress_allowed(peer, ip, src, relayed) {
                 return Ok(());
             }
             if !self.acl.is_empty() {
@@ -1676,10 +1676,10 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         Ok(())
     }
 
-    fn handle_payload_from(&mut self, peer: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
+    fn handle_payload_from(&mut self, peer: SocketAddr, data: &mut MsgBuffer, relayed: bool) -> Result<(), Error> {
         // HOT PATH
         let (src, dst) = P::parse(data.message())?;
-        if !self.ingress_allowed(peer, data.message(), src) {
+        if !self.ingress_allowed(peer, data.message(), src, relayed) {
             self.traffic.count_dropped_payload(data.len());
             return Ok(());
         }
@@ -1715,7 +1715,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         Ok(())
     }
 
-    fn ingress_allowed(&self, peer: SocketAddr, pkt: &[u8], src: Address) -> bool {
+    fn ingress_allowed(&self, peer: SocketAddr, pkt: &[u8], src: Address, relayed: bool) -> bool {
         if self.config.stateful_filter {
             if let Some(flow) = policy::ipv4_flow(pkt) {
                 if !self.flows.allow_inbound(&flow) {
@@ -1725,15 +1725,30 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             }
         }
         if self.grants.enforcing {
-            let allowed = self
-                .peers
-                .get(&peer)
-                .map(|p| policy::source_allowed(true, p.group_ok, &p.auth_claims, src))
-                .unwrap_or(false);
+            let allowed = if relayed {
+                self.relay_source_allowed(src)
+            } else {
+                self.peers
+                    .get(&peer)
+                    .map(|p| policy::source_allowed(true, p.group_ok, &p.auth_claims, src))
+                    .unwrap_or(false)
+            };
             if !allowed {
                 debug!("Capability dropped source {}", src);
                 return false;
             }
+        }
+        true
+    }
+
+    /// A relayed packet's previous hop is not the origin. The source has to
+    /// match the origin's installed claim. That row already passed the grants.
+    fn relay_source_allowed(&self, src: Address) -> bool {
+        let Some((_, origin_id, _)) = self.table.best_claim(src) else {
+            return false;
+        };
+        if let Some(peer) = self.peers.values().find(|peer| peer.node_id == origin_id) {
+            return policy::source_allowed(true, peer.group_ok, &peer.auth_claims, src);
         }
         true
     }
@@ -1774,7 +1789,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     }
 
     fn handle_message(
-        &mut self, src: SocketAddr, msg_result: MessageResult<NodeInfo>, data: &mut MsgBuffer
+        &mut self, src: SocketAddr, msg_result: MessageResult<NodeInfo>, data: &mut MsgBuffer, relayed: bool
     ) -> Result<(), Error> {
         // HOT PATH
         match msg_result {
@@ -1783,11 +1798,11 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 match type_ {
                     MESSAGE_TYPE_DATA => {
                         // HOT PATH
-                        self.handle_payload_from(src, data)?
+                        self.handle_payload_from(src, data, relayed)?
                     }
                     MESSAGE_TYPE_DATA_GSO => {
                         // HOT PATH
-                        self.handle_gso_payload_from(src, data)?
+                        self.handle_gso_payload_from(src, data, relayed)?
                     }
                     MESSAGE_TYPE_RELAY => self.handle_relay(src, data)?,
                     MESSAGE_TYPE_NODE_INFO => {
@@ -1925,7 +1940,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         match msg_result {
             Ok(val) => {
                 // HOT PATH
-                self.handle_message(src, val, data)
+                self.handle_message(src, val, data, false)
             }
             Err(err) => {
                 // COLD PATH

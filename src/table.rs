@@ -88,35 +88,43 @@ impl<TS: TimeSource> ClaimTable<TS> {
         self.housekeep()
     }
 
+    fn best_index(&self, addr: Address) -> Option<usize> {
+        let mut found = None;
+        let mut prefix_len = -1isize;
+        let mut metric = u8::MAX;
+        for (i, entry) in self.claims.iter().enumerate() {
+            if !entry.claim.matches(addr) {
+                continue;
+            }
+            let pl = entry.claim.prefix_len as isize;
+            if pl > prefix_len || (pl == prefix_len && entry.claim.metric < metric) {
+                found = Some(i);
+                prefix_len = pl;
+                metric = entry.claim.metric;
+            }
+        }
+        found
+    }
+
+    /// Longest prefix, then lowest metric. Ignores the forwarding cache.
+    pub fn best_claim(&self, addr: Address) -> Option<(SocketAddr, NodeId, Range)> {
+        let entry = &self.claims[self.best_index(addr)?];
+        Some((entry.peer, entry.node_id, entry.claim))
+    }
+
     pub fn lookup(&mut self, addr: Address) -> Option<(SocketAddr, NodeId)> {
         // HOT PATH
         if let Some(entry) = self.cache.get(&addr) {
             return Some((entry.peer, entry.node_id));
         }
         // COLD PATH
-        let mut found = None;
-        let mut prefix_len = -1;
-        let mut metric = u8::MAX;
-        for entry in &self.claims {
-            if !entry.claim.matches(addr) {
-                continue;
-            }
-            let pl = entry.claim.prefix_len as isize;
-            if pl > prefix_len || (pl == prefix_len && entry.claim.metric < metric) {
-                found = Some(entry);
-                prefix_len = pl;
-                metric = entry.claim.metric;
-            }
-        }
-        if let Some(entry) = found {
-            self.cache.insert(addr, CacheValue {
-                peer: entry.peer,
-                node_id: entry.node_id,
-                timeout: min(TS::now() + self.cache_timeout as Time, entry.timeout)
-            });
-            return Some((entry.peer, entry.node_id));
-        }
-        None
+        let idx = self.best_index(addr)?;
+        let entry = &self.claims[idx];
+        let peer = entry.peer;
+        let node_id = entry.node_id;
+        let timeout = min(TS::now() + self.cache_timeout as Time, entry.timeout);
+        self.cache.insert(addr, CacheValue { peer, node_id, timeout });
+        Some((peer, node_id))
     }
 
     pub fn housekeep(&mut self) {
