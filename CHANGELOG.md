@@ -2,9 +2,15 @@
 
 This project follows [semantic versioning](http://semver.org).
 
-### UNRELEASED
+### v2.5.0 (2026-11-04)
 
 - [added] Windows NSIS installer and portable zip (CLI + GUI + official Wintun 0.14.1). Optional TAP component downloads OpenVPN's tap-windows6 installer at install time (not shipped).
+- [changed] Crypto is pure Rust (`aes-gcm`, `chacha20poly1305`, `ed25519-dalek`, `x25519-dalek`, `sha2`, `pbkdf2`). `ring`, AWS-LC, and the `aws-lc` feature are gone, so a default build does not compile C.
+- [added] A Linux TUN GSO frame, and a run of same-flow UDP datagrams, cross the mesh as one AEAD message. The peer writes that aggregate back with its virtio header.
+- [added] Multi-hop relay seals the inner payload to the destination and sends it through the lowest-RTT live hop. A missing end-to-end key or a failed seal drops the packet.
+- [added] Transit records carry the claim metric and the announced group. Relay delivery checks the sealer's own claims. A group that is not granted installs nothing.
+- [changed] Direct UDP to a connected peer is still one datagram. The relay header is not on that wire.
+- Direct AEAD with a 2.4.x peer uses the same algorithms. A 2.4.x peer does not parse the new transit tail or the sealed relay body.
 
 ### v2.4.3 (2026-08-23)
 

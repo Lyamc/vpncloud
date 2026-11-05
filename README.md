@@ -14,10 +14,11 @@ of [dswd/vpncloud](https://github.com/dswd/vpncloud). The fork adds **macOS**,
 protocol, config, and dependency fixes. Upstream documentation lives at
 [vpncloud.ddswd.de](https://vpncloud.ddswd.de).
 
-Prebuilt **2.4.3** binaries are on
-[GitHub Releases](https://github.com/Lyamc/vpncloud/releases/tag/v2.4.3)
-(`SHA256SUMS` in the same release). Mesh protocol is compatible with 2.4.0
-peers.
+Prebuilt **2.5.0** binaries are on
+[GitHub Releases](https://github.com/Lyamc/vpncloud/releases/tag/v2.5.0)
+(`SHA256SUMS` in the same release). Direct AEAD with a 2.4.x peer uses the
+same algorithms. A 2.4.x peer does not parse the 2.5.0 transit tail or the
+sealed relay body.
 
 ```sh
 vpncloud -c REMOTE_HOST:PORT -p 'mypassword' --ip 10.0.0.1/24
@@ -68,7 +69,7 @@ TAP. For a process that outlives the terminal, use `vpncloud install`
 
 ### Project status
 
-VpnCloud 2.4.3 on this fork is usable on Linux, macOS, FreeBSD, Windows,
+VpnCloud 2.5.0 on this fork is usable on Linux, macOS, FreeBSD, Windows,
 Android, and iOS (TUN). It includes:
 
 * Automatic peer-to-peer meshing, no central servers
@@ -88,6 +89,43 @@ Known limits: on macOS, TAP L2/ARP works but ICMP through `feth` is often
 lossy — prefer TUN there. Windows TUN needs `wintun.dll` (bundled in the
 setup.exe / portable zip). TAP can be downloaded by the NSIS setup from
 OpenVPN (not shipped).
+
+
+### Performance
+
+Rates below are iperf3 at the receiver. TCP is bidirectional for 30 seconds.
+UDP is one direction with an unlimited offer (`-b 0`). Ping loss was 0% in
+every row. These are single-host measurements, not a promise for another
+machine.
+
+**Gigabit switch, this host, 2026-11-04.** One pass. `enp4s0` at
+`192.168.88.1` talked to `enp0s20f0u5` in a network namespace at
+`192.168.88.2`. Neighbor MACs showed the frames crossed the L2 switch.
+VpnCloud's TUN MTU was 1400. WireGuard's MTU was 1420. Numbers are Mbps.
+
+| Path | TCP each way | UDP received | Average ping |
+|---|---:|---:|---:|
+| No VPN | 936 / 933 | 956 | 0.37 ms |
+| VpnCloud (this fork) | 956 / 956 | 83 | 0.50 ms |
+| WireGuard | 856 / 879 | 899 | 0.76 ms |
+
+VpnCloud TCP filled the gigabit link (3083 and 572 retransmits on the two
+directions). Its UDP receive was 83 Mbps from an offer of about 9.75 Gbit/s,
+so almost all of that offer was lost. No VPN and WireGuard stayed near line
+rate on UDP.
+
+**Same host, veth.** This is not a NIC test and it is not comparable to the
+switch row or to vpn-bench. Two 30 second runs, encryption on, inner MTU
+1400: VpnCloud TCP was about 6.7–7.2 and 5.9–6.9 Gbit/s, kernel WireGuard
+about 3.7 and 3.8–4.3 Gbit/s. UDP received was about 8.3 Gbit/s versus
+5.9–6.0 Gbit/s. An earlier 10 second pass had WireGuard ahead on TCP (about
+5.4 Gbit/s versus 2.6–2.9 Gbit/s).
+
+**Published vpn-bench, 18 Dec 2025, Hetzner host lom.** That column is
+upstream VpnCloud, not this 2.5.0 build. Dedicated machines, separate NICs.
+TCP each way and UDP received, in Mbps: no VPN about 939 / 931 and 956;
+upstream VpnCloud about 525 / 355 and 726 (about 85% of the UDP offer lost);
+WireGuard about 823 / 882 and 898.
 
 
 ### Platforms
@@ -161,28 +199,28 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 
 ### Installing
 
-Download a 2.4.3 binary from
-[GitHub Releases](https://github.com/Lyamc/vpncloud/releases/tag/v2.4.3)
+Download a 2.5.0 binary from
+[GitHub Releases](https://github.com/Lyamc/vpncloud/releases/tag/v2.5.0)
 (checksums in `SHA256SUMS`):
 
 | File | Platform |
 |---|---|
-| `vpncloud-2.4.3-linux-x86_64` | Linux CLI, x86_64, static musl |
-| `vpncloud-2.4.3-linux-aarch64` | Linux CLI, ARM64, static musl |
-| `vpncloud-2.4.3-freebsd-x86_64` | FreeBSD CLI, x86_64 (FreeBSD 15 `libc.so.7`) |
-| `vpncloud-2.4.3-macos-universal` | macOS CLI, Intel + Apple silicon |
-| `vpncloud-gui-2.4.3-macos-universal` | macOS GUI |
-| `vpncloud-2.4.3-windows-x86_64-setup.exe` | Windows installer (x86_64): CLI, GUI, Wintun |
-| `vpncloud-2.4.3-windows-aarch64-setup.exe` | Windows installer (ARM64): CLI, GUI, Wintun |
-| `vpncloud-2.4.3-windows-x86_64.zip` | Windows portable zip (x86_64) |
-| `vpncloud-2.4.3-windows-aarch64.zip` | Windows portable zip (ARM64) |
-| `vpncloud-2.4.3-windows-x86_64.exe` | Windows CLI only, x86_64 (needs `wintun.dll` for TUN) |
-| `vpncloud-2.4.3-windows-aarch64.exe` | Windows CLI only, ARM64 (needs `wintun.dll` for TUN) |
-| `vpncloud-gui-2.4.3-windows-x86_64.exe` | Windows GUI only, x86_64 |
-| `vpncloud-gui-2.4.3-windows-aarch64.exe` | Windows GUI only, ARM64 |
-| `vpncloud-2.4.3-android-debug.apk` | Android, signed debug, arm64-v8a + armeabi-v7a |
-| `vpncloud-2.4.3-android-release-unsigned.apk` | Android, unsigned release |
-| `libvpncloud-2.4.3.xcframework.tar.gz` | iOS static lib (device + simulator arm64) |
+| `vpncloud-2.5.0-linux-x86_64` | Linux CLI, x86_64, static musl |
+| `vpncloud-2.5.0-linux-aarch64` | Linux CLI, ARM64, static musl |
+| `vpncloud-2.5.0-freebsd-x86_64` | FreeBSD CLI, x86_64 (FreeBSD 15 `libc.so.7`) |
+| `vpncloud-2.5.0-macos-universal` | macOS CLI, Intel + Apple silicon |
+| `vpncloud-gui-2.5.0-macos-universal` | macOS GUI |
+| `vpncloud-2.5.0-windows-x86_64-setup.exe` | Windows installer (x86_64): CLI, GUI, Wintun |
+| `vpncloud-2.5.0-windows-aarch64-setup.exe` | Windows installer (ARM64): CLI, GUI, Wintun |
+| `vpncloud-2.5.0-windows-x86_64.zip` | Windows portable zip (x86_64) |
+| `vpncloud-2.5.0-windows-aarch64.zip` | Windows portable zip (ARM64) |
+| `vpncloud-2.5.0-windows-x86_64.exe` | Windows CLI only, x86_64 (needs `wintun.dll` for TUN) |
+| `vpncloud-2.5.0-windows-aarch64.exe` | Windows CLI only, ARM64 (needs `wintun.dll` for TUN) |
+| `vpncloud-gui-2.5.0-windows-x86_64.exe` | Windows GUI only, x86_64 |
+| `vpncloud-gui-2.5.0-windows-aarch64.exe` | Windows GUI only, ARM64 |
+| `vpncloud-2.5.0-android-debug.apk` | Android, signed debug, arm64-v8a + armeabi-v7a |
+| `vpncloud-2.5.0-android-release-unsigned.apk` | Android, unsigned release |
+| `libvpncloud-2.5.0.xcframework.tar.gz` | iOS static lib (device + simulator arm64) |
 
 There is no Windows fat/universal PE and no FreeBSD ARM64 build. The NSIS
 setup stub is 32-bit (runs on x64 and ARM64 Windows); the payload matches the
@@ -208,8 +246,8 @@ Static musl binaries from the release run on most distributions (no glibc
 version pin). Example:
 
 ```sh
-chmod +x vpncloud-2.4.3-linux-x86_64
-sudo ./vpncloud-2.4.3-linux-x86_64 --help
+chmod +x vpncloud-2.5.0-linux-x86_64
+sudo ./vpncloud-2.5.0-linux-x86_64 --help
 ```
 
 Or build from source:
@@ -290,7 +328,7 @@ Windows has no in-box TUN/TAP. **TUN** needs [Wintun](https://www.wintun.net/)
 virtual interface requires **Administrator**.
 
 The GitHub release has an NSIS installer and a portable zip per architecture
-(`vpncloud-2.4.3-windows-x86_64-setup.exe` / `.zip`, and the ARM64 pair). Both
+(`vpncloud-2.5.0-windows-x86_64-setup.exe` / `.zip`, and the ARM64 pair). Both
 include `vpncloud.exe`, `vpncloud-gui.exe`, and the official Wintun 0.14.1 DLL
 plus its license. The setup.exe writes `C:\Program Files\VpnCloud`, Start Menu
 shortcuts, an uninstaller, and optionally PATH, a LocalSystem service, and a
@@ -298,7 +336,7 @@ download of OpenVPN's tap-windows6 installer (TAP/L2; SHA-256 verified; not
 shipped in the setup). Rebuild with `./contrib/windows/package.sh` (needs
 `makensis`).
 
-Standalone `vpncloud-2.4.3-windows-*.exe` CLI/GUI builds are still published;
+Standalone `vpncloud-2.5.0-windows-*.exe` CLI/GUI builds are still published;
 put `wintun.dll` next to the CLI for TUN if you are not using the installer.
 
 To build from source:

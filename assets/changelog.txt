@@ -1,3 +1,13 @@
+vpncloud (2.5.0) stable; urgency=medium
+
+ * [added] Windows NSIS installer and portable zip with Wintun 0.14.1. Optional TAP downloads OpenVPN's tap-windows6 installer (not shipped).
+ * [changed] Crypto is pure Rust. ring and AWS-LC are gone, so a default build does not compile C.
+ * [added] GSO and same-flow UDP cross the mesh as one AEAD message.
+ * [added] Multi-hop relay is sealed to the destination. Transit records carry the claim metric and the announced group.
+ * Direct AEAD with a 2.4.x peer uses the same algorithms. A 2.4.x peer does not parse the new transit tail or the sealed relay body.
+
+ -- Lyam Witherow <lyam@witherow.ca>  Wed, 04 Nov 2026 12:00:00 -0700
+
 vpncloud (2.4.3) stable; urgency=medium
 
  * [added] GUI Sent / Received mesh bytes and last handshake time
