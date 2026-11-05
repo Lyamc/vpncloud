@@ -3711,6 +3711,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vpncloud"
 version = "2.5.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "android_logger",
  "byteorder",
@@ -3722,6 +3723,7 @@ dependencies = [
  "ed25519-dalek",
  "fnv",
  "getifaddrs",
+ "hmac",
  "iai",
  "iced",
  "igd-next",

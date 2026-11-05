@@ -7,12 +7,14 @@ mod core;
 mod init;
 #[cfg(feature = "noise")] mod noise;
 mod prim;
+pub mod pq;
 mod rotate;
 
 pub use self::core::{open_raw, seal_raw, EXTRA_LEN, TAG_LEN};
 pub use common::*;
-pub use prim::{fill_random, sha256, sha512, AeadAlgo, AeadKey, Ed25519KeyPair, ED25519_PUBLIC_KEY_LEN};
-use prim::pbkdf2_hmac_sha256;
+pub use prim::{
+    fill_random, pbkdf2_hmac_sha256, sha256, sha512, AeadAlgo, AeadKey, Ed25519KeyPair, ED25519_PUBLIC_KEY_LEN
+};
 #[cfg(feature = "noise")]
 pub use noise::is_noise_frame;
 
