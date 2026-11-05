@@ -95,24 +95,26 @@ OpenVPN (not shipped).
 
 Rates below are iperf3 at the receiver. TCP is bidirectional for 30 seconds.
 UDP is one direction with an unlimited offer (`-b 0`). Ping loss was 0% in
-every row. These are single-host measurements, not a promise for another
-machine.
+every row. These are one-path iperf3 numbers on this host, not the Hetzner
+vpn-bench run, and not a promise for another machine.
 
 **Gigabit switch, this host, 2026-11-04.** One pass. `enp4s0` at
 `192.168.88.1` talked to `enp0s20f0u5` in a network namespace at
 `192.168.88.2`. Neighbor MACs showed the frames crossed the L2 switch.
-VpnCloud's TUN MTU was 1400. WireGuard's MTU was 1420. Numbers are Mbps.
+VpnCloud's TUN MTU was 1430, with GSO capped at 1420. WireGuard's MTU was
+1420. Default encryption stayed on. Numbers are Mbps.
 
 | Path | TCP each way | UDP received | Average ping |
 |---|---:|---:|---:|
-| No VPN | 936 / 933 | 956 | 0.37 ms |
-| VpnCloud (this fork) | 956 / 956 | 83 | 0.50 ms |
-| WireGuard | 856 / 879 | 899 | 0.76 ms |
+| No VPN | 936 / 932 | 956 | 0.38 ms |
+| VpnCloud (this fork) | 877 / 877 | 911 | 0.50 ms |
+| WireGuard | 856 / 879 | 888 | 0.59 ms |
 
-VpnCloud TCP filled the gigabit link (3083 and 572 retransmits on the two
-directions). Its UDP receive was 83 Mbps from an offer of about 9.75 Gbit/s,
-so almost all of that offer was lost. No VPN and WireGuard stayed near line
-rate on UDP.
+VpnCloud's unlimited UDP offer (`-b 0`) was received at 911 Mbps, and none
+of those datagrams were lost. WireGuard on that same path received 888 Mbps.
+A second 30 second UDP pass on the same NICs received 915 Mbps for VpnCloud
+and 808 Mbps for WireGuard. TCP each way was 877 Mbps. The no-VPN TCP rates
+in this session were 936 and 932 Mbps.
 
 **Same host, veth.** This is not a NIC test and it is not comparable to the
 switch row or to vpn-bench. Two 30 second runs, encryption on, inner MTU
