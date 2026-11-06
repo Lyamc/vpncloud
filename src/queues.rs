@@ -54,7 +54,7 @@ fn open_one(name: &str) -> io::Result<(RawFd, String)> {
     if !name.is_empty() {
         put_name(&mut req, name);
     }
-    let rc = unsafe { libc::ioctl(fd, TUNSETIFF, &mut req) };
+    let rc = unsafe { libc::ioctl(fd, TUNSETIFF as _, &mut req) };
     if rc < 0 {
         let err = io::Error::last_os_error();
         unsafe { libc::close(fd) };
@@ -116,7 +116,7 @@ fn recv_tun_fds(fd: RawFd, expect: usize) -> io::Result<(String, Vec<RawFd>)> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cbuf.len();
+    msg.msg_controllen = cbuf.len() as _;
     let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
     if n < 0 {
         return Err(io::Error::last_os_error());

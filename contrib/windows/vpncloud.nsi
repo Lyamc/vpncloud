@@ -6,7 +6,7 @@
 ; OpenVPN's signed installer at install time.
 
 !ifndef VERSION
-  !error "Define VERSION (e.g. -DVERSION=2.5.0)"
+  !error "Define VERSION (e.g. -DVERSION=2.6.0)"
 !endif
 !ifndef STAGE
   !error "Define STAGE (directory containing vpncloud.exe, wintun.dll, ...)"

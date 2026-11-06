@@ -1,3 +1,14 @@
+vpncloud (2.6.0) stable; urgency=medium
+
+ * [added] Opt-in QUIC, multipath, multi-queue TUN, in-process TCP, and switchable tunnel compression. Default UDP frames stay the same.
+ * [added] Opt-in ML-KEM-768 hybrid handshake. Defaults stay AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305.
+ * [added] One-endpoint NAT classification, PCP MAP distinct from NAT-PMP, and predicted symmetric-NAT exchange without the relay.
+ * [added] LAN discovery, cached peer endpoints, an in-tree kernel forward, and forwarding from an already-open TUN fd.
+ * [added] Certificate enrollment, locally checked OAuth/OIDC tokens, scripted login, opt-in admin approval, exact enrollment rules, and ephemeral nodes.
+ * Default encryption, the replay window, and sealed relay are unchanged.
+
+ -- Lyam Witherow <lyam@witherow.ca>  Fri, 06 Nov 2026 12:00:00 -0600
+
 vpncloud (2.5.0) stable; urgency=medium
 
  * [added] Windows NSIS installer and portable zip with Wintun 0.14.1. Optional TAP downloads OpenVPN's tap-windows6 installer (not shipped).

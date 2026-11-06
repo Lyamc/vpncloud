@@ -2,6 +2,17 @@
 
 This project follows [semantic versioning](http://semver.org).
 
+### v2.6.0 (2026-11-06)
+
+- [added] Opt-in library paths for a QUIC link, multipath failover, multi-queue TUN steering, and an in-process TCP handshake. Default UDP peers keep the existing frames.
+- [added] Tunnel compression is off unless switched on. The same payload is smaller on the wire when on, and unchanged when off.
+- [added] Opt-in ML-KEM-768 hybrid handshake. With it off, the default algorithms stay AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305.
+- [added] NAT classification from one internal endpoint, a PCP MAP client distinct from NAT-PMP, and symmetric-NAT exchange on a predicted port without the relay.
+- [added] LAN broadcast or multicast discovery, and peer endpoints reloaded from disk before any socket is opened.
+- [added] In-tree kernel forward, and forwarding from an already-open TUN fd.
+- [added] Certificate enrollment, locally checked OAuth/OIDC tokens, scripted login, opt-in admin approval, exact-match enrollment rules, and ephemeral nodes that are not reloaded as stable members.
+- Default UDP encryption, the replay window, and sealed relay are unchanged. `--algorithm plain` stays opt-in. UDP GRO stays off on listen.
+
 ### v2.5.0 (2026-11-04)
 
 - [added] Windows NSIS installer and portable zip (CLI + GUI + official Wintun 0.14.1). Optional TAP component downloads OpenVPN's tap-windows6 installer at install time (not shipped).
