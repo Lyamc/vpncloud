@@ -1,6 +1,6 @@
 [package]
 name = "vpncloud"
-version = "2.6.0"
+version = "2.7.0-alpha.1"
 authors = ["Dennis Schwerdel <schwerdel@googlemail.com>"]
 license = "GPL-3.0"
 description = "Peer-to-peer VPN"
@@ -36,6 +36,9 @@ signal-hook = "0.4.4"
 rand = "0.10.2"
 
 fnv = "1.0.7"
+serde_json = "1"
+# Pure-Rust LZ4 block codec for opt-in tunnel compression.
+lz4_flex = "0.14"
 aes-gcm = "0.10"
 aes = "=0.8.4"
 hmac = "=0.12.1"
@@ -77,6 +80,30 @@ iced = { version = "0.14", optional = true, default-features = false, features =
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 privdrop = "0.5.6"
+
+# macOS menu bar (tray) application. Kept minimal: AppKit bindings plus the
+# Foundation types needed by the status item, menu and file URLs. No full GUI
+# toolkit is pulled in for the status-bar-only UI.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSButton",
+    "NSImage",
+    "NSMenu",
+    "NSMenuItem",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSWorkspace",
+] }
+objc2-foundation = { version = "0.3", features = [
+    "NSData",
+    "NSObject",
+    "NSString",
+    "NSURL",
+] }
 
 [target.'cfg(windows)'.dependencies]
 service-manager = "0.11"

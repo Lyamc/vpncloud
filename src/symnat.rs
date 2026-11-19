@@ -62,7 +62,7 @@ fn bind_consecutive(count: usize) -> io::Result<Vec<UdpSocket>> {
             return Ok(socks);
         }
         base = base.wrapping_add(count as u16);
-        if base < 1024 || base > 60000 {
+        if !(1024..=60000).contains(&base) {
             base = 20000;
         }
     }
@@ -91,7 +91,7 @@ impl Peer {
     /// Emit `payload` toward `dest` from the next mapped port of this one internal endpoint.
     fn alloc_send(&mut self, dest: SocketAddr, payload: &[u8]) -> io::Result<u16> {
         if self.next >= self.external.len() {
-            return Err(io::Error::new(io::ErrorKind::Other, "mapping pool exhausted"));
+            return Err(io::Error::other("mapping pool exhausted"));
         }
         let idx = self.next;
         let ingress = self.external[idx].local_addr()?;
@@ -100,7 +100,7 @@ impl Peer {
         let mut buf = vec![0u8; payload.len().max(1)];
         let (n, src) = self.external[idx].recv_from(&mut buf)?;
         if src.port() != internal_port || buf[..n] != *payload {
-            return Err(io::Error::new(io::ErrorKind::Other, "send did not originate at the internal endpoint"));
+            return Err(io::Error::other("send did not originate at the internal endpoint"));
         }
         self.external[idx].send_to(payload, dest)?;
         self.next += 1;
@@ -113,7 +113,7 @@ impl Peer {
         let mut buf = [0u8; 16];
         let (n, src) = echo.recv_from(&mut buf)?;
         if &buf[..n] != b"probe" || src.port() != sent {
-            return Err(io::Error::new(io::ErrorKind::Other, "probe mapping mismatch"));
+            return Err(io::Error::other("probe mapping mismatch"));
         }
         Ok(src.port())
     }
@@ -127,7 +127,7 @@ impl Peer {
             .external
             .iter()
             .find(|sock| sock.local_addr().ok().map(|addr| addr.port()) == Some(port))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "predicted port is not mapped on this endpoint"))?;
+            .ok_or_else(|| io::Error::other("predicted port is not mapped on this endpoint"))?;
         let mut buf = [0u8; 2048];
         let (n, from) = sock.recv_from(&mut buf)?;
         Ok((buf[..n].to_vec(), from))
@@ -166,22 +166,22 @@ pub fn predicted_direct(payload: &[u8]) -> io::Result<DirectDatagram> {
     let mapped_a = vec![peer_a.probe(&echo1)?, peer_a.probe(&echo2)?];
     let mapped_b = vec![peer_b.probe(&echo1)?, peer_b.probe(&echo2)?];
     if peer_a.internal_port()? != internal_a || peer_b.internal_port()? != internal_b {
-        return Err(io::Error::new(io::ErrorKind::Other, "internal identity changed"));
+        return Err(io::Error::other("internal identity changed"));
     }
-    let dest_port = predict_next(&mapped_b).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-    let expect_source = predict_next(&mapped_a).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    let dest_port = predict_next(&mapped_b).map_err(io::Error::other)?;
+    let expect_source = predict_next(&mapped_a).map_err(io::Error::other)?;
     let sender_ports = peer_a.bound_ports()?;
     if sender_ports.contains(&dest_port) {
-        return Err(io::Error::new(io::ErrorKind::Other, "predicted port is a socket the sender opened"));
+        return Err(io::Error::other("predicted port is a socket the sender opened"));
     }
     let dest = SocketAddr::from((Ipv4Addr::LOCALHOST, dest_port));
     let source_port = peer_a.send_to_predicted(dest, payload)?;
     if source_port != expect_source {
-        return Err(io::Error::new(io::ErrorKind::Other, "sender mapping left the observed series"));
+        return Err(io::Error::other("sender mapping left the observed series"));
     }
     let (wire, from) = peer_b.recv_predicted(dest_port)?;
     if from.port() != source_port {
-        return Err(io::Error::new(io::ErrorKind::Other, "packet did not arrive from the predicted source"));
+        return Err(io::Error::other("packet did not arrive from the predicted source"));
     }
     Ok(DirectDatagram {
         payload: wire.clone(),

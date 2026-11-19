@@ -5,8 +5,6 @@ use crate::{
     types::Mode
 };
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Password, Select};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{BTreeSet, HashMap},
     fs, io,
@@ -80,7 +78,7 @@ fn configure_crypto(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
     if mode >= MODE_ADVANCED {
         use_password = Select::with_theme(theme)
             .with_prompt("Crypto configuration method")
-            .items(&["Simple (Password)", "Complex (Key pair)"])
+            .items(["Simple (Password)", "Complex (Key pair)"])
             .default(if config.crypto.private_key.is_some() { 1 } else { 0 })
             .interact()?
             == 0
@@ -99,7 +97,7 @@ fn configure_crypto(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
         config.crypto.password = None;
         let (priv_key, pub_key) = match Select::with_theme(theme)
             .with_prompt("Specify key pair")
-            .items(&["Generate new key pair", "Enter private key", "Generate from password"])
+            .items(["Generate new key pair", "Enter private key", "Generate from password"])
             .default(0)
             .interact()?
         {
@@ -166,13 +164,22 @@ fn configure_device(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
     if mode >= MODE_ADVANCED {
         config.device_type = match Select::with_theme(theme)
             .with_prompt("Device type")
-            .items(&["Tun (IP based)", "Tap (Ethernet based)"])
+            .items(["Tun (IP based)", "Tap (Ethernet based)"])
             .default(if config.device_type == device::Type::Tun { 0 } else { 1 })
             .interact()?
         {
             0 => device::Type::Tun,
             1 => device::Type::Tap,
             _ => unreachable!()
+        };
+        #[cfg(windows)]
+        {
+            use crate::win_driver::{ensure, Ui};
+            match ensure(config.device_type, Ui::Console) {
+                Ok(true) => {}
+                Ok(false) => eprintln!("{} driver not installed; you can install it later.", config.device_type),
+                Err(e) => eprintln!("Driver setup failed: {}", e)
+            }
         }
     }
     if mode == MODE_EXPERT {
@@ -190,7 +197,7 @@ fn configure_device(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
             .interact()?;
         config.mode = match Select::with_theme(theme)
             .with_prompt("Operation mode")
-            .items(&["Normal", "Router", "Switch", "Hub"])
+            .items(["Normal", "Router", "Switch", "Hub"])
             .default(match config.mode {
                 Mode::Normal => 0,
                 Mode::Router => 1,
@@ -270,7 +277,7 @@ fn configure_beacon(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
     {
         config.beacon_store = match Select::with_theme(theme)
             .with_prompt("How to store beacons")
-            .items(&["Do not store beacons", "Store to file", "Execute command"])
+            .items(["Do not store beacons", "Store to file", "Execute command"])
             .default(if let Some(v) = &config.beacon_store {
                 if v.starts_with('|') {
                     2
@@ -304,7 +311,7 @@ fn configure_beacon(config: &mut Config, mode: usize, theme: &ColorfulTheme) -> 
         };
         config.beacon_load = match Select::with_theme(theme)
             .with_prompt("How to load beacons")
-            .items(&["Do not load beacons", "Load from file", "Execute command"])
+            .items(["Do not load beacons", "Load from file", "Execute command"])
             .default(if let Some(v) = &config.beacon_load {
                 if v.starts_with('|') {
                     2
@@ -475,11 +482,9 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
         // Try to list existing networks from the system config dir; if missing treat as empty
         let mut names = BTreeSet::new();
         if let Ok(entries) = fs::read_dir(crate::config::system_config_dir()) {
-            for file in entries {
-                if let Ok(entry) = file {
-                    if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                        names.insert(stem.to_string());
-                    }
+            for entry in entries.flatten() {
+                if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                    names.insert(stem.to_string());
                 }
             }
         }
@@ -526,7 +531,7 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
     loop {
         let mode = Select::with_theme(&theme)
             .with_prompt("Configuration mode")
-            .items(&["Simple (minimal options)", "Advanced (some more options)", "Expert (all options)"])
+            .items(["Simple (minimal options)", "Advanced (some more options)", "Expert (all options)"])
             .default(MODE_SIMPLE)
             .interact()?;
 
@@ -600,11 +605,8 @@ pub fn configure(name: Option<String>, config_path: Option<String>) -> Result<()
         // Try to create the file; provide detailed error messages including path on failure
         match write_config_file(&file, &config_file) {
             Ok(()) => {
-                // set safe permissions where possible
-                #[cfg(unix)]
-                if let Err(e) = fs::set_permissions(&file, fs::Permissions::from_mode(0o600)) {
-                    eprintln!("Warning: failed to set permissions on '{}': {}", file.display(), e);
-                }
+                // write_config_file already creates with 0600 (and O_NOFOLLOW
+                // on Unix); no post-write chmod window.
                 println!();
                 println!("Configuration written to '{}'", file.display());
                 println!("Use the following commands to control your VPN:");

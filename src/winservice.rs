@@ -9,6 +9,7 @@ use std::{
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
+    process::Command,
     ptr,
     sync::{
         atomic::{AtomicPtr, Ordering},
@@ -21,10 +22,10 @@ use std::{
 use windows_sys::Win32::{
     Foundation::GetLastError,
     System::Services::{
-        RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW, SERVICE_ACCEPT_SHUTDOWN,
-        SERVICE_ACCEPT_STOP, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_START_PENDING,
-        SERVICE_STATUS, SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW,
-        SERVICE_WIN32_OWN_PROCESS
+        RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW, SERVICE_ACCEPT_PARAMCHANGE,
+        SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_PARAMCHANGE, SERVICE_CONTROL_SHUTDOWN,
+        SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
+        SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS
     }
 };
 
@@ -47,7 +48,7 @@ fn win_err(msg: &'static str) -> Error {
 }
 
 fn set_status(handle: SERVICE_STATUS_HANDLE, state: u32, accept: u32, wait_hint_ms: u32) {
-    let mut status = SERVICE_STATUS {
+    let status = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: state,
         dwControlsAccepted: accept,
@@ -57,7 +58,7 @@ fn set_status(handle: SERVICE_STATUS_HANDLE, state: u32, accept: u32, wait_hint_
         dwWaitHint: wait_hint_ms
     };
     unsafe {
-        SetServiceStatus(handle, &mut status);
+        SetServiceStatus(handle, &status);
     }
 }
 
@@ -71,6 +72,14 @@ unsafe extern "system" fn ctrl_handler(
                 set_status(h, SERVICE_STOP_PENDING, 0, 10_000);
             }
             CtrlC::request_stop();
+            0
+        }
+        SERVICE_CONTROL_PARAMCHANGE => {
+            // `sc control VpnCloud 6` (or `vpncloud service reload`) reaches
+            // here. Use the same reload flag SIGHUP uses on Unix so the worker
+            // re-reads the config policy without a service restart.
+            CtrlC::request_reload();
+            info!("Windows service: config reload requested");
             0
         }
         _ => 0
@@ -95,7 +104,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     config.tray = false;
     config.daemonize = false;
 
-    set_status(handle, SERVICE_RUNNING, SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN, 0);
+    set_status(handle, SERVICE_RUNNING, SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PARAMCHANGE, 0);
     info!("Windows service running");
     let worker = thread::Builder::new().name("vpncloud".into()).spawn(move || run_vpn_worker(config));
     match worker {
@@ -204,6 +213,27 @@ pub fn stop() -> Result<(), Error> {
     svc::stop_windows()?;
     thread::sleep(Duration::from_millis(300));
     info!("Stopped service '{}'", SERVICE_NAME);
+    Ok(())
+}
+
+/// Ask a running service to reload its reloadable policy config (ACL, grants,
+/// split prefixes, peer names, stateful filter, adding peers). Uses the
+/// standard `SERVICE_CONTROL_PARAMCHANGE` code, which the handler translates
+/// into the same reload request SIGHUP uses on Unix. Everything else still
+/// requires a full service stop/start.
+pub fn reload() -> Result<(), Error> {
+    let code = SERVICE_CONTROL_PARAMCHANGE.to_string();
+    let status = Command::new("sc.exe")
+        .args(["control", SERVICE_NAME, &code])
+        .status()
+        .map_err(|e| Error::FileIo("Failed to send reload control to service", e))?;
+    if !status.success() {
+        return Err(Error::FileIo(
+            "Failed to send reload control to service",
+            io::Error::other(format!("sc.exe control {} exited with {}", SERVICE_NAME, status))
+        ));
+    }
+    info!("Requested config reload from service '{}'", SERVICE_NAME);
     Ok(())
 }
 

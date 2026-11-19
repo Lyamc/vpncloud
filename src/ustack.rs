@@ -71,7 +71,12 @@ fn tcp_checksum(src: [u8; 4], dst: [u8; 4], segment: &[u8]) -> u16 {
     fold_sum(&pseudo)
 }
 
-pub fn build_segment(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, seq: u32, ack: u32, flags: u8, data: &[u8]) -> Vec<u8> {
+// A flat TCP/attribute tuple mirrors the wire header fields; a params struct
+// would add indirection to this self-contained test/utility stack.
+#[allow(clippy::too_many_arguments)]
+pub fn build_segment(
+    src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, seq: u32, ack: u32, flags: u8, data: &[u8]
+) -> Vec<u8> {
     let total = 40 + data.len();
     let mut pkt = vec![0u8; total];
     pkt[0] = 0x45;
@@ -155,11 +160,15 @@ pub fn exchange(payload: &[u8]) -> Result<TcpExchange, &'static str> {
     let ack = build_segment(a, b, 40000, 80, client_isn.wrapping_add(1), server_isn.wrapping_add(1), ACK, &[]);
     c2s.push_back(ack);
     let ack_seg = parse_segment(&c2s.pop_front().ok_or("ack")?).ok_or("parse ack")?;
-    if ack_seg.flags & ACK == 0 || ack_seg.ack != server_isn.wrapping_add(1) || ack_seg.seq != client_isn.wrapping_add(1) {
+    if ack_seg.flags & ACK == 0
+        || ack_seg.ack != server_isn.wrapping_add(1)
+        || ack_seg.seq != client_isn.wrapping_add(1)
+    {
         return Err("handshake ack");
     }
 
-    let data = build_segment(a, b, 40000, 80, client_isn.wrapping_add(1), server_isn.wrapping_add(1), ACK | PSH, payload);
+    let data =
+        build_segment(a, b, 40000, 80, client_isn.wrapping_add(1), server_isn.wrapping_add(1), ACK | PSH, payload);
     c2s.push_back(data);
     let data_seg = parse_segment(&c2s.pop_front().ok_or("data")?).ok_or("parse data")?;
     if data_seg.seq != client_isn.wrapping_add(1) {

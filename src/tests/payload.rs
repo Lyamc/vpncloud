@@ -20,10 +20,9 @@ fn switch_forwards_gso_aggregate() {
     sim.simulate_all_messages();
     assert!(sim.is_connected(node1, node2));
 
-    let mut ip = vec![0u8; 48];
+    let mut ip = vec![0u8; 1000];
     ip[0] = 0x45;
-    ip[2] = 0;
-    ip[3] = 48;
+    ip[2..4].copy_from_slice(&(1000u16).to_be_bytes());
     ip[9] = 6;
     ip[12..16].copy_from_slice(&[10, 0, 0, 1]);
     ip[16..20].copy_from_slice(&[10, 0, 0, 2]);
@@ -32,7 +31,7 @@ fn switch_forwards_gso_aggregate() {
         flags: VIRTIO_F_NEEDS_CSUM,
         gso_type: GSO_TCPV4,
         hdr_len: 40,
-        gso_size: 1460,
+        gso_size: 700,
         csum_start: 20,
         csum_offset: 16
     };
@@ -40,6 +39,115 @@ fn switch_forwards_gso_aggregate() {
     sim.simulate_all_messages();
     assert_eq!(Some(meta), sim.pop_gso_meta(node2));
     assert_eq!(Some(ip), sim.pop_payload(node2));
+}
+
+fn ipv4_packet(mut fill: impl FnMut(&mut [u8])) -> Vec<u8> {
+    let mut pkt = vec![0u8; 600];
+    let len = pkt.len() as u16;
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&len.to_be_bytes());
+    pkt[9] = 17;
+    pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+    pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+    fill(&mut pkt[20..]);
+    pkt
+}
+
+#[test]
+fn compression_is_opportunistic_and_negotiated() {
+    let config = Config {
+        device_type: Type::Tun,
+        mode: Mode::Switch,
+        compression: true,
+        crypto: CryptoConfig { algorithms: vec!["plain".to_string()], ..CryptoConfig::default() },
+        ..Config::default()
+    };
+    let mut sim = TunSimulator::new();
+    let node1 = sim.add_node(false, &config);
+    let node2 = sim.add_node(false, &config);
+    sim.connect(node1, node2);
+    sim.simulate_all_messages();
+    assert!(sim.is_connected(node1, node2));
+
+    // Compressible bytes travel with the compressed DATA type and arrive intact.
+    let repeated = ipv4_packet(|body| body.fill(0x5a));
+    sim.put_payload(node1, repeated.clone());
+    let wire = sim.front_message().expect("wire message").2;
+    assert_eq!(wire[0], crate::messages::MESSAGE_TYPE_DATA_COMPRESSED);
+    assert!(wire.len() < repeated.len());
+    sim.simulate_all_messages();
+    assert_eq!(sim.pop_payload(node2), Some(repeated));
+
+    // Pseudo-random bytes are not worth compressing: raw DATA type.
+    let mut x = 0x1234_5678u32;
+    let random = ipv4_packet(|body| {
+        for chunk in body.chunks_exact_mut(4) {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            chunk.copy_from_slice(&x.to_le_bytes());
+        }
+    });
+    sim.put_payload(node1, random.clone());
+    let wire = sim.front_message().expect("wire message").2;
+    assert_eq!(wire[0], crate::messages::MESSAGE_TYPE_DATA);
+    sim.simulate_all_messages();
+    assert_eq!(sim.pop_payload(node2), Some(random));
+}
+
+#[test]
+fn compression_covers_gso_aggregates() {
+    let config = Config {
+        device_type: Type::Tun,
+        mode: Mode::Switch,
+        compression: true,
+        crypto: CryptoConfig { algorithms: vec!["plain".to_string()], ..CryptoConfig::default() },
+        ..Config::default()
+    };
+    let mut sim = TunSimulator::new();
+    let node1 = sim.add_node(false, &config);
+    let node2 = sim.add_node(false, &config);
+    sim.connect(node1, node2);
+    sim.simulate_all_messages();
+    let mut ip = vec![0x33u8; 1000];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&(1000u16).to_be_bytes());
+    ip[9] = 6;
+    ip[12..16].copy_from_slice(&[10, 0, 0, 1]);
+    ip[16..20].copy_from_slice(&[10, 0, 0, 2]);
+    let meta = GsoMeta {
+        flags: VIRTIO_F_NEEDS_CSUM,
+        gso_type: GSO_TCPV4,
+        hdr_len: 40,
+        gso_size: 700,
+        csum_start: 20,
+        csum_offset: 16
+    };
+    sim.put_gso(node1, meta, ip.clone());
+    let wire = sim.front_message().expect("wire message").2;
+    assert_eq!(wire[0], crate::messages::MESSAGE_TYPE_DATA_GSO_COMPRESSED);
+    sim.simulate_all_messages();
+    assert_eq!(Some(meta), sim.pop_gso_meta(node2));
+    assert_eq!(Some(ip), sim.pop_payload(node2));
+}
+
+#[test]
+fn compression_off_keeps_plain_data_type() {
+    let config = Config {
+        device_type: Type::Tun,
+        mode: Mode::Switch,
+        crypto: CryptoConfig { algorithms: vec!["plain".to_string()], ..CryptoConfig::default() },
+        ..Config::default()
+    };
+    let mut sim = TunSimulator::new();
+    let node1 = sim.add_node(false, &config);
+    let node2 = sim.add_node(false, &config);
+    sim.connect(node1, node2);
+    sim.simulate_all_messages();
+    let repeated = ipv4_packet(|body| body.fill(0x5a));
+    sim.put_payload(node1, repeated.clone());
+    let wire = sim.front_message().expect("wire message").2;
+    assert_eq!(wire[0], crate::messages::MESSAGE_TYPE_DATA);
 }
 
 fn udp_datagram(payload: usize, port: u16, fill: u8) -> Vec<u8> {
@@ -277,7 +385,7 @@ fn switch_delivers_crypto_pool() {
     assert!(sim.is_connected(node1, node2));
     assert!(sim.is_connected(node2, node1));
 
-    let payload = vec![2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 2, 3, 4, 5];
+    let payload = vec![2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0x08, 0x00, 3, 4, 5];
 
     sim.put_payload(node1, payload.clone());
     sim.simulate_all_messages();
@@ -297,7 +405,7 @@ fn switch_delivers() {
     assert!(sim.is_connected(node1, node2));
     assert!(sim.is_connected(node2, node1));
 
-    let payload = vec![2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 2, 3, 4, 5];
+    let payload = vec![2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0x08, 0x00, 3, 4, 5];
 
     sim.put_payload(node1, payload.clone());
     sim.simulate_all_messages();
@@ -324,7 +432,7 @@ fn switch_learns() {
     assert!(sim.is_connected(node2, node3));
     assert!(sim.is_connected(node3, node2));
 
-    let payload = vec![2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 2, 3, 4, 5];
+    let payload = vec![2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0x08, 0x00, 3, 4, 5];
 
     // Nothing learnt so far, node1 broadcasts
 
@@ -334,7 +442,7 @@ fn switch_learns() {
     assert_eq!(Some(payload.clone()), sim.pop_payload(node2));
     assert_eq!(Some(payload), sim.pop_payload(node3));
 
-    let payload = vec![1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 5, 4, 3, 2, 1];
+    let payload = vec![1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 0x08, 0x00, 3, 2, 1];
 
     // Node 2 learned the address by receiving it, does not broadcast
 
@@ -364,7 +472,7 @@ fn switch_honours_vlans() {
     assert!(sim.is_connected(node2, node3));
     assert!(sim.is_connected(node3, node2));
 
-    let payload = vec![2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0x81, 0, 0, 0x67, 1, 2, 3, 4, 5];
+    let payload = vec![2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0x81, 0, 0, 0x67, 0x08, 0x00, 3, 4, 5];
 
     // Nothing learnt so far, node1 broadcasts
 
@@ -374,7 +482,7 @@ fn switch_honours_vlans() {
     assert_eq!(Some(payload.clone()), sim.pop_payload(node2));
     assert_eq!(Some(payload), sim.pop_payload(node3));
 
-    let payload = vec![1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 0x81, 0, 0, 0x67, 5, 4, 3, 2, 1];
+    let payload = vec![1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 0x81, 0, 0, 0x67, 0x08, 0x00, 3, 2, 1];
 
     // Node 2 learned the address by receiving it, does not broadcast
 
@@ -384,7 +492,7 @@ fn switch_honours_vlans() {
     assert_eq!(Some(payload), sim.pop_payload(node1));
     assert_eq!(None, sim.pop_payload(node3));
 
-    let payload = vec![1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 0x81, 0, 0, 0x68, 5, 4, 3, 2, 1];
+    let payload = vec![1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 0x81, 0, 0, 0x68, 0x08, 0x00, 3, 2, 1];
 
     // Different VLANs, node 2 does not learn, still broadcasts
 
@@ -425,7 +533,7 @@ fn router_delivers() {
     assert!(sim.is_connected(node1, node2));
     assert!(sim.is_connected(node2, node1));
 
-    let payload = vec![0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
+    let payload = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
 
     sim.put_payload(node1, payload.clone());
     sim.simulate_all_messages();

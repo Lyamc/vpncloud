@@ -5,7 +5,7 @@
 //! The cargo test drives `kernel/vpncloud_forward.c` through the userspace
 //! driver. The same function is what `vpncloud_mod.c` calls at init.
 
-use std::{path::PathBuf, process::Command};
+use std::path::PathBuf;
 
 pub fn forward_driver() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/vpncloud-fwd-user")
@@ -13,7 +13,9 @@ pub fn forward_driver() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[allow(unused_imports)] use super::*;
+    #[allow(unused_imports)]
+    use std::process::Command;
 
     #[cfg(target_os = "linux")]
     #[test]

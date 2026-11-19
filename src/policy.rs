@@ -5,10 +5,16 @@
 //! Relay, claim, filter, and tunnel decisions used by the mesh path.
 //! Lib tests call these functions directly. The cloud calls the same ones.
 
-use std::{collections::HashSet, net::SocketAddr, str::FromStr};
+use std::{
+    collections::{HashSet, VecDeque},
+    net::SocketAddr,
+    str::FromStr
+};
 
-use crate::crypto::fill_random;
-use crate::types::{Address, NodeId, Range};
+use crate::{
+    crypto::fill_random,
+    types::{Address, NodeId, Range}
+};
 
 pub const SEAL_MARK: u8 = 0xE2;
 
@@ -23,6 +29,19 @@ pub struct RelayHop {
 /// Lowest RTT wins. Dead hops and excluded underlay addresses are skipped.
 pub fn select_relay<'a>(hops: &'a [RelayHop], exclude: &[SocketAddr]) -> Option<&'a RelayHop> {
     hops.iter().filter(|h| h.alive && !exclude.contains(&h.addr)).min_by_key(|h| (h.rtt_us, h.addr))
+}
+
+/// Only data frames may be dispatched out of a relay envelope. Control-plane
+/// types (CLOSE, NODE_INFO, …) must never be taken from a relay frame — even
+/// after the end-to-end seal is opened, the inner type is peer-supplied.
+pub fn is_relayable_type(inner_type: u8) -> bool {
+    matches!(
+        inner_type,
+        crate::messages::MESSAGE_TYPE_DATA
+            | crate::messages::MESSAGE_TYPE_DATA_COMPRESSED
+            | crate::messages::MESSAGE_TYPE_DATA_GSO
+            | crate::messages::MESSAGE_TYPE_DATA_GSO_COMPRESSED
+    )
 }
 
 pub fn encode_relay(dest: &NodeId, inner_type: u8, inner: &[u8]) -> Vec<u8> {
@@ -100,7 +119,9 @@ pub fn generate_e2e_keypair() -> ([u8; 32], [u8; 32]) {
 
 /// Seal `plain` to `dest_public`. `None` when the seal cannot be built.
 /// Callers drop the packet. The plaintext is never returned.
-pub fn seal_relay_body(secret: &[u8; 32], my_public: &[u8; 32], dest_public: &[u8; 32], plain: &[u8]) -> Option<Vec<u8>> {
+pub fn seal_relay_body(
+    secret: &[u8; 32], my_public: &[u8; 32], dest_public: &[u8; 32], plain: &[u8]
+) -> Option<Vec<u8>> {
     #[cfg(feature = "noise")]
     {
         let me = x25519_dalek::StaticSecret::from(*secret);
@@ -113,7 +134,7 @@ pub fn seal_relay_body(secret: &[u8; 32], my_public: &[u8; 32], dest_public: &[u
         out.push(SEAL_MARK);
         out.extend_from_slice(my_public);
         out.extend_from_slice(&ct);
-        return Some(out);
+        Some(out)
     }
     #[cfg(not(feature = "noise"))]
     {
@@ -138,7 +159,7 @@ pub fn open_relay_body(secret: &[u8; 32], inner: &[u8]) -> Option<([u8; 32], Vec
         let mut key = [0u8; 16];
         key.copy_from_slice(&shared.as_bytes()[..16]);
         let plain = crate::crypto::open_raw(&key, false, &inner[33..]).ok()?;
-        return Some((their, plain));
+        Some((their, plain))
     }
     #[cfg(not(feature = "noise"))]
     {
@@ -252,14 +273,26 @@ pub struct FlowKey {
     pub dport: u16
 }
 
+/// Upper bound on remembered flows. Without eviction, a peer that can induce
+/// many distinct flows grows this table without limit (memory exhaustion).
+const MAX_REMEMBERED_FLOWS: usize = 65536;
+
 #[derive(Clone, Debug, Default)]
 pub struct FlowTable {
-    seen: HashSet<FlowKey>
+    seen: HashSet<FlowKey>,
+    order: VecDeque<FlowKey>
 }
 
 impl FlowTable {
     pub fn note_outbound(&mut self, flow: FlowKey) {
-        self.seen.insert(flow);
+        if self.seen.insert(flow) {
+            self.order.push_back(flow);
+            if self.order.len() > MAX_REMEMBERED_FLOWS {
+                if let Some(old) = self.order.pop_front() {
+                    self.seen.remove(&old);
+                }
+            }
+        }
     }
 
     pub fn allow_inbound(&self, flow: &FlowKey) -> bool {
@@ -293,7 +326,7 @@ pub fn split_forwards(prefixes: &[Range], dest: Address) -> bool {
 
 pub fn full_tunnel_target(allow: &[NodeId], requested: Option<NodeId>) -> Option<NodeId> {
     let id = requested?;
-    if allow.iter().any(|allowed| *allowed == id) {
+    if allow.contains(&id) {
         Some(id)
     } else {
         None
@@ -420,6 +453,18 @@ mod tests {
     use crate::messages::{MESSAGE_TYPE_DATA, MESSAGE_TYPE_RELAY};
     use std::net::{Ipv4Addr, SocketAddr};
 
+    #[test]
+    fn relay_inner_type_is_restricted_to_data() {
+        assert!(is_relayable_type(MESSAGE_TYPE_DATA));
+        assert!(is_relayable_type(crate::messages::MESSAGE_TYPE_DATA_COMPRESSED));
+        assert!(is_relayable_type(crate::messages::MESSAGE_TYPE_DATA_GSO));
+        assert!(is_relayable_type(crate::messages::MESSAGE_TYPE_DATA_GSO_COMPRESSED));
+        assert!(!is_relayable_type(MESSAGE_TYPE_RELAY));
+        assert!(!is_relayable_type(crate::messages::MESSAGE_TYPE_CLOSE));
+        assert!(!is_relayable_type(crate::messages::MESSAGE_TYPE_NODE_INFO));
+        assert!(!is_relayable_type(crate::messages::MESSAGE_TYPE_KEEPALIVE));
+    }
+
     fn hop(id: u8, port: u16, rtt: u64) -> RelayHop {
         RelayHop {
             node_id: [id; 16],
@@ -512,10 +557,8 @@ mod tests {
         let outsider = Address::from_str("192.168.0.9").unwrap();
         assert!(!source_allowed(true, kept.group_ok, &kept.claims, outsider));
 
-        let bad_group = filter_announcement(&grants, &Announcement {
-            claims: vec![ok_claim],
-            group: Some("finance".into())
-        });
+        let bad_group =
+            filter_announcement(&grants, &Announcement { claims: vec![ok_claim], group: Some("finance".into()) });
         assert!(bad_group.claims.is_empty() || !bad_group.group_ok);
         assert!(!bad_group.group_ok);
         assert!(!source_allowed(true, bad_group.group_ok, &bad_group.claims, src));
@@ -565,6 +608,20 @@ mod tests {
         assert!(flows.allow_inbound(&reply));
         let unsolicited = FlowKey { src: dst, dst: src, proto: 6, sport: 40000, dport: 80 };
         assert!(!flows.allow_inbound(&unsolicited));
+    }
+
+    #[test]
+    fn flow_table_is_bounded() {
+        let mut flows = FlowTable::default();
+        let src = Address::from_str("10.0.0.1").unwrap();
+        let dst = Address::from_str("10.0.0.2").unwrap();
+        for i in 0..MAX_REMEMBERED_FLOWS + 10 {
+            let sport = (i & 0xffff) as u16;
+            let dport = ((i >> 16) as u16).wrapping_add(80);
+            flows.note_outbound(FlowKey { src, dst, proto: 6, sport, dport });
+        }
+        assert_eq!(flows.seen.len(), MAX_REMEMBERED_FLOWS);
+        assert_eq!(flows.order.len(), MAX_REMEMBERED_FLOWS);
     }
 
     #[test]

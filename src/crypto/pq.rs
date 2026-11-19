@@ -64,11 +64,15 @@ pub fn kem_derand_fingerprint(coins_kp: &[u8; 64], coins_enc: &[u8; 32]) -> Resu
     let mut ct = vec![0u8; KEM_CIPHERTEXT];
     let mut ss = [0u8; KEM_SHARED];
     let mut ss2 = [0u8; KEM_SHARED];
-    let rc = unsafe { PQCLEAN_MLKEM768_CLEAN_crypto_kem_keypair_derand(pk.as_mut_ptr(), sk.as_mut_ptr(), coins_kp.as_ptr()) };
+    let rc = unsafe {
+        PQCLEAN_MLKEM768_CLEAN_crypto_kem_keypair_derand(pk.as_mut_ptr(), sk.as_mut_ptr(), coins_kp.as_ptr())
+    };
     if rc != 0 {
         return Err("derand keypair");
     }
-    let rc = unsafe { PQCLEAN_MLKEM768_CLEAN_crypto_kem_enc_derand(ct.as_mut_ptr(), ss.as_mut_ptr(), pk.as_ptr(), coins_enc.as_ptr()) };
+    let rc = unsafe {
+        PQCLEAN_MLKEM768_CLEAN_crypto_kem_enc_derand(ct.as_mut_ptr(), ss.as_mut_ptr(), pk.as_ptr(), coins_enc.as_ptr())
+    };
     if rc != 0 {
         return Err("derand enc");
     }
@@ -177,10 +181,7 @@ mod tests {
         assert!(!off.unencrypted);
         assert!(!off.kem_agreed);
         assert_eq!(off.kem_ciphertext_len, 0);
-        assert_eq!(
-            off.algorithms,
-            vec![AeadAlgo::Aes128Gcm, AeadAlgo::Aes256Gcm, AeadAlgo::ChaCha20Poly1305]
-        );
+        assert_eq!(off.algorithms, vec![AeadAlgo::Aes128Gcm, AeadAlgo::Aes256Gcm, AeadAlgo::ChaCha20Poly1305]);
         assert_eq!(off.plaintext, b"default-payload");
 
         assert!(kem_roundtrip().unwrap());
@@ -203,9 +204,6 @@ mod tests {
         assert_eq!(on.kem_public_len, KEM_PUBLIC);
         assert_eq!(on.kem_ciphertext_len, KEM_CIPHERTEXT);
         assert_eq!(on.plaintext, b"pq-payload");
-        assert_eq!(
-            on.algorithms,
-            vec![AeadAlgo::Aes128Gcm, AeadAlgo::Aes256Gcm, AeadAlgo::ChaCha20Poly1305]
-        );
+        assert_eq!(on.algorithms, vec![AeadAlgo::Aes128Gcm, AeadAlgo::Aes256Gcm, AeadAlgo::ChaCha20Poly1305]);
     }
 }

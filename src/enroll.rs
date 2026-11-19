@@ -146,31 +146,33 @@ pub fn issue_token(secret: &[u8], sub: &str, exp: u64) -> String {
 }
 
 /// Local HS256 check. No identity provider is contacted.
-pub fn accept_token(secret: &[u8], token: &str, now: u64) -> Result<String, ()> {
+pub fn accept_token(secret: &[u8], token: &str, now: u64) -> Result<String, crate::error::NoDetail> {
     let mut parts = token.split('.');
-    let header_b64 = parts.next().ok_or(())?;
-    let payload_b64 = parts.next().ok_or(())?;
-    let sig_b64 = parts.next().ok_or(())?;
+    let header_b64 = parts.next().ok_or(crate::error::NoDetail)?;
+    let payload_b64 = parts.next().ok_or(crate::error::NoDetail)?;
+    let sig_b64 = parts.next().ok_or(crate::error::NoDetail)?;
     if parts.next().is_some() {
-        return Err(());
+        return Err(crate::error::NoDetail);
     }
-    let header = b64url_decode(header_b64).ok_or(())?;
-    let header_text = std::str::from_utf8(&header).map_err(|_| ())?;
-    if !header_text.contains("HS256") {
-        return Err(());
+    let header = b64url_decode(header_b64).ok_or(crate::error::NoDetail)?;
+    let header_text = std::str::from_utf8(&header).map_err(|_| crate::error::NoDetail)?;
+    // Parse the alg field exactly: a substring check could accept a header
+    // that names a different algorithm alongside the literal "HS256".
+    if json_string(header_text, "alg").as_deref() != Some("HS256") {
+        return Err(crate::error::NoDetail);
     }
     let expect = hmac_sha256(secret, format!("{header_b64}.{payload_b64}").as_bytes());
-    let got = b64url_decode(sig_b64).ok_or(())?;
+    let got = b64url_decode(sig_b64).ok_or(crate::error::NoDetail)?;
     if got.as_slice() != expect.as_slice() {
-        return Err(());
+        return Err(crate::error::NoDetail);
     }
-    let payload = b64url_decode(payload_b64).ok_or(())?;
-    let text = std::str::from_utf8(&payload).map_err(|_| ())?;
-    let exp = json_u64(text, "exp").ok_or(())?;
+    let payload = b64url_decode(payload_b64).ok_or(crate::error::NoDetail)?;
+    let text = std::str::from_utf8(&payload).map_err(|_| crate::error::NoDetail)?;
+    let exp = json_u64(text, "exp").ok_or(crate::error::NoDetail)?;
     if now >= exp {
-        return Err(());
+        return Err(crate::error::NoDetail);
     }
-    json_string(text, "sub").ok_or(())
+    json_string(text, "sub").ok_or(crate::error::NoDetail)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,7 +193,9 @@ pub fn scripted_login<R: BufRead>(mut reader: R) -> io::Result<Credential> {
         return Err(io::Error::new(ErrorKind::InvalidInput, "username and password"));
     }
     let mut hash = [0u8; 32];
-    pbkdf2_hmac_sha256(password.as_bytes(), username.as_bytes(), 1000, &mut hash);
+    // 1000 iterations is far below current guidance; this is a credential
+    // verifier, so make offline guessing expensive.
+    pbkdf2_hmac_sha256(password.as_bytes(), username.as_bytes(), 600_000, &mut hash);
     Ok(Credential { username, hash })
 }
 
@@ -285,6 +289,17 @@ mod tests {
         assert!(accept_token(secret, &bad, 1000).is_err());
         let expired = issue_token(secret, "node-7", 50);
         assert!(accept_token(secret, &expired, 50).is_err());
+    }
+
+    #[test]
+    fn token_rejects_wrong_algorithm() {
+        let secret = b"local-oidc-secret";
+        let header = b64url(br#"{"alg":"none","note":"HS256"}"#);
+        let payload = b64url(br#"{"sub":"node-7","exp":5000}"#);
+        let signing = format!("{header}.{payload}");
+        let sig = hmac_sha256(secret, signing.as_bytes());
+        let token = format!("{signing}.{}", b64url(&sig));
+        assert!(accept_token(secret, &token, 1000).is_err());
     }
 
     #[test]

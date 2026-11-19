@@ -5,11 +5,7 @@
 //! Two underlay UDP paths for one overlay peer. Sending moves to the
 //! remaining path after the first socket is removed.
 
-use std::{
-    io,
-    net::UdpSocket,
-    time::Duration
-};
+use std::{io, net::UdpSocket, time::Duration};
 
 #[derive(Debug)]
 pub struct Failover {
@@ -49,7 +45,7 @@ pub fn bond_and_fail_over(first: &[u8], second: &[u8]) -> io::Result<Failover> {
     path_b.set_read_timeout(Some(Duration::from_millis(50)))?;
     if let Ok((n, _)) = path_b.recv_from(&mut buf) {
         if &buf[..n] == b"gone" {
-            return Err(io::Error::new(io::ErrorKind::Other, "removed path delivered"));
+            return Err(io::Error::other("removed path delivered"));
         }
     }
 

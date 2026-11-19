@@ -8,6 +8,13 @@ use super::{
     port_forwarding::PortForwarding,
     util::MsgBuffer
 };
+/// Maximum number of queued inbound WS frames. Prevents memory exhaustion by
+/// an unauthenticated client when the VPN is paused or the datapath is slow.
+const MAX_WS_INBOUND: usize = 4096;
+
+/// Shared queue of decoded frames received from websocket clients.
+type InboundQueue = Arc<Mutex<VecDeque<(SocketAddr, Vec<u8>)>>>;
+
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -25,12 +32,20 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::windows::io::{AsRawSocket, RawSocket};
 
 use tungstenite::{
-    accept, connect,
-    protocol::WebSocket,
+    accept_with_config,
+    client::connect_with_config,
+    protocol::{WebSocket, WebSocketConfig},
     stream::{MaybeTlsStream, NoDelay},
     Message
 };
 use url::Url;
+
+/// One UDP datagram is at most 65535 bytes, which is also the fixed size of
+/// `MsgBuffer`. Cap websocket messages at that so an oversized frame cannot
+/// overflow the receive buffer (tungstenite defaults to 64 MiB).
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default().max_message_size(Some(65535)).max_frame_size(Some(65535))
+}
 
 macro_rules! io_error {
     ($val:expr, $format:expr) => ( {
@@ -65,7 +80,8 @@ fn serve_proxy_connection(stream: TcpStream) -> Result<(), io::Error> {
     let peer = stream.peer_addr()?;
     info!("WS client {} connected", peer);
     stream.set_nodelay(true)?;
-    let mut websocket = io_error!(accept(stream), "Failed to initialize websocket with {}: {}", peer)?;
+    let mut websocket =
+        io_error!(accept_with_config(stream, Some(ws_config())), "Failed to initialize websocket with {}: {}", peer)?;
     let udpsocket = UdpSocket::bind("[::]:0")?;
     let mut msg = Vec::with_capacity(18);
     let mut addr = udpsocket.local_addr()?;
@@ -166,7 +182,8 @@ impl crate::poll::Pollable for ProxyConnection {
 impl Socket for ProxyConnection {
     fn listen(url: &str) -> Result<Self, io::Error> {
         io_error!(Url::parse(url), "Invalid URL {}: {}", url)?;
-        let (mut socket, _) = io_error!(connect(url), "Failed to connect to URL {}: {}", url)?;
+        let (mut socket, _) =
+            io_error!(connect_with_config(url, Some(ws_config()), 3), "Failed to connect to URL {}: {}", url)?;
         socket.get_mut().set_nodelay(true)?;
         let addr = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
         let mut con = ProxyConnection { addr, socket };
@@ -179,7 +196,11 @@ impl Socket for ProxyConnection {
         buffer.clear();
         let data = self.read_message()?;
         let addr = read_addr(Cursor::new(&data))?;
-        buffer.clone_from(&data[18..]);
+        let payload = &data[18..];
+        if payload.len() > buffer.remaining_capacity() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "websocket payload too large"));
+        }
+        buffer.clone_from(payload);
         Ok(addr)
     }
 
@@ -208,10 +229,9 @@ impl Socket for ProxyConnection {
 pub fn native_ws_bind(listen: &str) -> Option<String> {
     let (rest, force) = if let Some(rest) = listen.strip_prefix("ws-listen://") {
         (rest, true)
-    } else if let Some(rest) = listen.strip_prefix("ws://") {
-        (rest, false)
     } else {
-        return None;
+        let rest = listen.strip_prefix("ws://")?;
+        (rest, false)
     };
     let hostport = rest.split('/').next().unwrap_or(rest);
     if force {
@@ -260,14 +280,21 @@ fn wakeup_pair() -> io::Result<(UdpSocket, SocketAddr)> {
 }
 
 fn run_ws_conn<S: Read + Write>(
-    mut ws: WebSocket<S>, peer: SocketAddr, inbound: Arc<Mutex<VecDeque<(SocketAddr, Vec<u8>)>>>,
-    wakeup: UdpSocket, wakeup_addr: SocketAddr, write_rx: mpsc::Receiver<Vec<u8>>,
-    conns: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>
+    mut ws: WebSocket<S>, peer: SocketAddr, inbound: InboundQueue, wakeup: UdpSocket, wakeup_addr: SocketAddr,
+    write_rx: mpsc::Receiver<Vec<u8>>, conns: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>
 ) {
     loop {
         match ws.read() {
             Ok(Message::Binary(data)) => {
-                inbound.lock().unwrap().push_back((mapped_addr(peer), data.to_vec()));
+                let mut queue = inbound.lock().unwrap();
+                // Bound the cross-thread queue: an unauthenticated WS client
+                // must not be able to exhaust memory by flooding frames while
+                // forwarding is paused. Drop the oldest frame on overflow.
+                if queue.len() >= MAX_WS_INBOUND {
+                    queue.pop_front();
+                }
+                queue.push_back((mapped_addr(peer), data.to_vec()));
+                drop(queue);
                 let _ = wakeup.send_to(&[1], wakeup_addr);
             }
             Ok(Message::Ping(p)) => {
@@ -305,7 +332,7 @@ pub struct WsNativeSocket {
     addr: SocketAddr,
     wakeup: UdpSocket,
     wakeup_addr: SocketAddr,
-    inbound: Arc<Mutex<VecDeque<(SocketAddr, Vec<u8>)>>>,
+    inbound: InboundQueue,
     conns: Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>,
     connecting: Arc<Mutex<HashSet<SocketAddr>>>,
     pending_out: Arc<Mutex<HashMap<SocketAddr, Vec<Vec<u8>>>>>
@@ -319,7 +346,8 @@ impl WsNativeSocket {
     fn attach_stream(&self, stream: TcpStream, peer: SocketAddr) -> io::Result<()> {
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-        let ws = io_error!(accept(stream), "Failed to accept websocket from {}: {}", peer)?;
+        let ws =
+            io_error!(accept_with_config(stream, Some(ws_config())), "Failed to accept websocket from {}: {}", peer)?;
         self.attach_ws(ws, peer);
         Ok(())
     }
@@ -361,7 +389,7 @@ impl WsNativeSocket {
         let connecting = self.connecting.clone();
         let pending_out = self.pending_out.clone();
         spawn(move || {
-            match connect(&url) {
+            match connect_with_config(&url, Some(ws_config()), 3) {
                 Ok((mut ws, _)) => {
                     let _ = ws.get_mut().set_nodelay(true);
                     if let MaybeTlsStream::Plain(stream) = ws.get_mut() {
@@ -411,8 +439,9 @@ impl crate::poll::Pollable for WsNativeSocket {
 
 impl Socket for WsNativeSocket {
     fn listen(url: &str) -> Result<Self, io::Error> {
-        let bind_str = native_ws_bind(url)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("Not a native websocket listen URL: {}", url)))?;
+        let bind_str = native_ws_bind(url).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("Not a native websocket listen URL: {}", url))
+        })?;
         let bind_addr = parse_listen(&bind_str, 8080);
         let listener = bind_tcp(bind_addr)?;
         let local = listener.local_addr()?;
@@ -421,15 +450,7 @@ impl Socket for WsNativeSocket {
         let conns = Arc::new(Mutex::new(HashMap::new()));
         let connecting = Arc::new(Mutex::new(HashSet::new()));
         let pending_out = Arc::new(Mutex::new(HashMap::new()));
-        let socket = WsNativeSocket {
-            addr: local,
-            wakeup,
-            wakeup_addr,
-            inbound,
-            conns,
-            connecting,
-            pending_out
-        };
+        let socket = WsNativeSocket { addr: local, wakeup, wakeup_addr, inbound, conns, connecting, pending_out };
         let this = socket.clone_handles();
         spawn(move || {
             info!("Listening for websocket peers on ws://{}", local);
@@ -462,6 +483,9 @@ impl Socket for WsNativeSocket {
                 self.poke();
             } else {
                 drop(inbound);
+            }
+            if data.len() > buffer.remaining_capacity() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "websocket payload too large"));
             }
             buffer.clear();
             buffer.set_length(data.len());

@@ -57,7 +57,7 @@
 use super::{
     core::{CryptoCore, EXTRA_LEN},
     fill_random, sha256, AeadAlgo, AeadKey, Algorithms, EcdhPrivateKey, EcdhPublicKey, Ed25519KeyPair,
-    Ed25519PublicKey, Payload, ED25519_PUBLIC_KEY_LEN
+    Ed25519PublicKey, Payload, ECDH_PUBLIC_KEY_LEN, ED25519_PUBLIC_KEY_LEN
 };
 use crate::{error::Error, types::NodeId, util::MsgBuffer};
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
@@ -181,6 +181,9 @@ impl InitMsg {
                     salted_node_id_hash = Some(id)
                 }
                 Self::PART_ECDH_PUBLIC_KEY => {
+                    if field_len != ECDH_PUBLIC_KEY_LEN {
+                        return Err(Error::CryptoInit("Invalid size for ECDH public key"));
+                    }
                     let mut pub_key_data = smallvec![0; field_len];
                     r.read_exact(&mut pub_key_data).map_err(|_| Error::Parse("Init message too short"))?;
                     ecdh_public_key = Some(EcdhPublicKey::new(pub_key_data));
@@ -323,6 +326,7 @@ impl InitMsg {
                 w.write_u16::<NetworkEndian>(len as u16)?;
                 if algorithms.allow_unencrypted {
                     w.write_u8(0)?;
+                    #[allow(deprecated)]
                     w.write_f32::<NetworkEndian>(f32::INFINITY)?;
                 }
                 for (algo, speed) in &algorithms.algorithm_speeds {
@@ -365,6 +369,11 @@ pub struct InitState<P: Payload> {
     payload: P,
     key_pair: Arc<Ed25519KeyPair>,
     trusted_keys: Arc<[Ed25519PublicKey]>,
+    /// Per-node trust bindings and mode flag.
+    node_bindings: Arc<[(NodeId, Ed25519PublicKey)]>,
+    per_node_keys: bool,
+    /// The verified peer identity from the handshake (node id + signing key).
+    verified_peer: Option<(NodeId, Ed25519PublicKey)>,
     ecdh_private_key: Option<EcdhPrivateKey>,
     next_stage: u8,
     close_time: usize,
@@ -379,7 +388,7 @@ pub struct InitState<P: Payload> {
 impl<P: Payload> InitState<P> {
     pub fn new(
         node_id: NodeId, payload: P, key_pair: Arc<Ed25519KeyPair>, trusted_keys: Arc<[Ed25519PublicKey]>,
-        algorithms: Algorithms
+        algorithms: Algorithms, node_bindings: Arc<[(NodeId, Ed25519PublicKey)]>, per_node_keys: bool
     ) -> Self {
         let mut hash = [0; SALTED_NODE_ID_HASH_LEN];
         fill_random(&mut hash[0..4]);
@@ -392,6 +401,9 @@ impl<P: Payload> InitState<P> {
             payload,
             key_pair,
             trusted_keys,
+            node_bindings,
+            per_node_keys,
+            verified_peer: None,
             next_stage: STAGE_PING,
             last_message: None,
             crypto: None,
@@ -438,9 +450,39 @@ impl<P: Payload> InitState<P> {
         }
     }
 
-    fn derive_master_key(&self, algo: AeadAlgo, privk: EcdhPrivateKey, pubk: &EcdhPublicKey) -> AeadKey {
-        let shared = privk.agree(pubk.bytes()).unwrap();
-        AeadKey::new(algo, &shared[..algo.key_len()]).unwrap()
+    fn derive_master_key(&self, algo: AeadAlgo, privk: EcdhPrivateKey, pubk: &EcdhPublicKey) -> Result<AeadKey, Error> {
+        let my_eph_pub = privk.public_key();
+        let peer_eph_pub: [u8; 32] =
+            pubk.bytes().try_into().map_err(|_| Error::CryptoInit("Invalid ECDH public key"))?;
+        let mut shared = privk.agree(pubk.bytes()).map_err(|_| Error::CryptoInit("Invalid ECDH public key"))?;
+        let mut key_material: Vec<u8> = if self.per_node_keys {
+            // Bind the session key to both authenticated identities and both
+            // ephemeral ECDH keys, in canonical (sorted) order so both sides
+            // derive the same value. This prevents unknown-key-share attacks.
+            let (peer_id, peer_key) = self.verified_peer.ok_or(Error::CryptoInit("peer identity not verified"))?;
+            let mut ids = [self.node_id.to_vec(), peer_id.to_vec()];
+            ids.sort();
+            let mut statics = [self.key_pair.public_key().to_vec(), peer_key.to_vec()];
+            statics.sort();
+            let mut ephs = [my_eph_pub.to_vec(), peer_eph_pub.to_vec()];
+            ephs.sort();
+            let mut transcript = Vec::new();
+            transcript.extend_from_slice(b"vpncloud-per-node-v1");
+            transcript.extend_from_slice(&ids[0]);
+            transcript.extend_from_slice(&ids[1]);
+            transcript.extend_from_slice(&statics[0]);
+            transcript.extend_from_slice(&statics[1]);
+            transcript.extend_from_slice(&ephs[0]);
+            transcript.extend_from_slice(&ephs[1]);
+            sha256(&transcript).to_vec()
+        } else {
+            shared[..].to_vec()
+        };
+        let key = AeadKey::new(algo, &key_material[..algo.key_len()])
+            .map_err(|_| Error::CryptoInit("Failed to derive master key"));
+        super::prim::zeroize_bytes(&mut shared);
+        super::prim::zeroize_bytes(&mut key_material);
+        key
     }
 
     fn create_ecdh_keypair(&self) -> (EcdhPrivateKey, EcdhPublicKey) {
@@ -473,7 +515,10 @@ impl<P: Payload> InitState<P> {
         h2[0..4].clone_from_slice(&hash[0..4]);
         h2[4..].clone_from_slice(&node_id);
         let d = sha256(&h2);
-        hash.as_slice() == d.as_slice()
+        // The salted hash stores only the first 16 bytes of the digest after
+        // the 4-byte salt (20 bytes total); comparing against all 32 bytes of
+        // SHA-256 can never succeed.
+        d[..16] == hash[4..]
     }
 
     fn send_message(&mut self, stage: u8, ecdh_public_key: Option<EcdhPublicKey>, out: &mut MsgBuffer) {
@@ -548,10 +593,25 @@ impl<P: Payload> InitState<P> {
     }
 
     pub fn handle_init(&mut self, out: &mut MsgBuffer) -> Result<InitResult<P>, Error> {
-        let (msg, _peer_key) = InitMsg::read_from(out.buffer(), &self.trusted_keys)?;
+        let (msg, peer_key) = InitMsg::read_from(out.buffer(), &self.trusted_keys)?;
         out.clear();
         let stage = msg.stage();
         let salted_node_id_hash = *msg.salted_node_id_hash();
+        if self.per_node_keys {
+            // Bind the authenticated signing key to exactly one configured
+            // node id, and verify that the sender's salted node-id hash matches
+            // it. A key listed for a different node is rejected.
+            let bound = self
+                .node_bindings
+                .iter()
+                .find(|(_, key)| *key == peer_key)
+                .map(|(id, key)| (*id, *key))
+                .ok_or(Error::CryptoInit("peer key is not bound to a node id"))?;
+            if !self.check_salted_node_id_hash(&salted_node_id_hash, bound.0) {
+                return Err(Error::CryptoInitFatal("peer node id does not match its trusted key"));
+            }
+            self.verified_peer = Some(bound);
+        }
         debug!("Received init with stage={}, expected stage={}", stage, self.next_stage);
         if self.salted_node_id_hash == salted_node_id_hash
             || self.check_salted_node_id_hash(&salted_node_id_hash, self.node_id)
@@ -589,7 +649,7 @@ impl<P: Payload> InitState<P> {
                 let algorithm = self.select_algorithm(&algorithms)?;
                 self.selected_algorithm = algorithm.map(|a| a.0);
                 if let Some((algorithm, _speed)) = algorithm {
-                    let master_key = self.derive_master_key(algorithm, my_ecdh_private_key, &ecdh_public_key);
+                    let master_key = self.derive_master_key(algorithm, my_ecdh_private_key, &ecdh_public_key)?;
                     self.crypto = Some(CryptoCore::new(master_key, self.salted_node_id_hash > salted_node_id_hash));
                 }
 
@@ -605,7 +665,7 @@ impl<P: Payload> InitState<P> {
                 let algorithm = self.select_algorithm(&algorithms)?;
                 self.selected_algorithm = algorithm.map(|a| a.0);
                 if let Some((algorithm, _speed)) = algorithm {
-                    let master_key = self.derive_master_key(algorithm, ecdh_private_key, &ecdh_public_key);
+                    let master_key = self.derive_master_key(algorithm, ecdh_private_key, &ecdh_public_key)?;
                     self.crypto = Some(CryptoCore::new(master_key, self.salted_node_id_hash > salted_node_id_hash));
                 }
 
@@ -674,8 +734,17 @@ mod tests {
             ],
             allow_unencrypted: false
         };
-        let sender = InitState::new(node1, vec![1], key_pair.clone(), trusted_nodes.clone(), algorithms.clone());
-        let receiver = InitState::new(node2, vec![2], key_pair, trusted_nodes, algorithms);
+        let sender = InitState::new(
+            node1,
+            vec![1],
+            key_pair.clone(),
+            trusted_nodes.clone(),
+            algorithms.clone(),
+            Arc::from(Vec::new()),
+            false
+        );
+        let receiver =
+            InitState::new(node2, vec![2], key_pair, trusted_nodes, algorithms, Arc::from(Vec::new()), false);
         (sender, receiver)
     }
 
@@ -792,6 +861,14 @@ mod tests {
     }
 
     #[test]
+    fn invalid_ecdh_key_length_is_rejected() {
+        let (sender, _) = create_pair();
+        let privk = EcdhPrivateKey::generate();
+        let bad = EcdhPublicKey::new(smallvec![0u8; ECDH_PUBLIC_KEY_LEN - 1]);
+        assert!(sender.derive_master_key(AeadAlgo::Aes128Gcm, privk, &bad).is_err());
+    }
+
+    #[test]
     fn manipulated_message() {
         let (mut sender, mut receiver) = create_pair();
         let mut out = MsgBuffer::new(8);
@@ -799,6 +876,20 @@ mod tests {
         assert_eq!(sender.stage(), STAGE_PONG);
         out.message_mut()[10] ^= 0x01;
         assert!(receiver.handle_init(&mut out).is_err());
+    }
+
+    #[test]
+    fn salted_node_id_hash_detects_own_node_with_different_salt() {
+        let (sender, _) = create_pair();
+        let salt = [9u8; 4];
+        let mut raw = [0u8; SALTED_NODE_ID_HASH_LEN];
+        raw[..4].copy_from_slice(&salt);
+        raw[4..].copy_from_slice(&sender.node_id);
+        let digest = sha256(&raw);
+        let mut salted = raw;
+        salted[4..].copy_from_slice(&digest[..16]);
+        assert!(sender.check_salted_node_id_hash(&salted, sender.node_id));
+        assert!(!sender.check_salted_node_id_hash(&salted, [1u8; NODE_ID_BYTES]));
     }
 
     #[test]
@@ -810,9 +901,7 @@ mod tests {
         assert!(sender.handle_init(&mut out).is_err());
     }
 
-    fn test_algorithm_negotiation(
-        algos1: Algorithms, algos2: Algorithms, success: bool, selected: Option<AeadAlgo>
-    ) {
+    fn test_algorithm_negotiation(algos1: Algorithms, algos2: Algorithms, success: bool, selected: Option<AeadAlgo>) {
         let (mut sender, mut receiver) = create_pair();
         sender.algorithms = algos1;
         receiver.algorithms = algos2;
@@ -834,11 +923,19 @@ mod tests {
         // Equal algorithms
         test_algorithm_negotiation(
             Algorithms {
-                algorithm_speeds: smallvec![(AeadAlgo::Aes128Gcm, 600.0), (AeadAlgo::Aes256Gcm, 500.0), (AeadAlgo::ChaCha20Poly1305, 400.0)],
+                algorithm_speeds: smallvec![
+                    (AeadAlgo::Aes128Gcm, 600.0),
+                    (AeadAlgo::Aes256Gcm, 500.0),
+                    (AeadAlgo::ChaCha20Poly1305, 400.0)
+                ],
                 allow_unencrypted: false
             },
             Algorithms {
-                algorithm_speeds: smallvec![(AeadAlgo::Aes128Gcm, 600.0), (AeadAlgo::Aes256Gcm, 500.0), (AeadAlgo::ChaCha20Poly1305, 400.0)],
+                algorithm_speeds: smallvec![
+                    (AeadAlgo::Aes128Gcm, 600.0),
+                    (AeadAlgo::Aes256Gcm, 500.0),
+                    (AeadAlgo::ChaCha20Poly1305, 400.0)
+                ],
                 allow_unencrypted: false
             },
             true,
@@ -862,11 +959,19 @@ mod tests {
         // Select fastest pair
         test_algorithm_negotiation(
             Algorithms {
-                algorithm_speeds: smallvec![(AeadAlgo::Aes128Gcm, 600.0), (AeadAlgo::Aes256Gcm, 500.0), (AeadAlgo::ChaCha20Poly1305, 400.0)],
+                algorithm_speeds: smallvec![
+                    (AeadAlgo::Aes128Gcm, 600.0),
+                    (AeadAlgo::Aes256Gcm, 500.0),
+                    (AeadAlgo::ChaCha20Poly1305, 400.0)
+                ],
                 allow_unencrypted: false
             },
             Algorithms {
-                algorithm_speeds: smallvec![(AeadAlgo::Aes128Gcm, 40.0), (AeadAlgo::Aes256Gcm, 50.0), (AeadAlgo::ChaCha20Poly1305, 60.0)],
+                algorithm_speeds: smallvec![
+                    (AeadAlgo::Aes128Gcm, 40.0),
+                    (AeadAlgo::Aes256Gcm, 50.0),
+                    (AeadAlgo::ChaCha20Poly1305, 60.0)
+                ],
                 allow_unencrypted: false
             },
             true,
@@ -876,11 +981,19 @@ mod tests {
         // Select unencrypted if supported by both
         test_algorithm_negotiation(
             Algorithms {
-                algorithm_speeds: smallvec![(AeadAlgo::Aes128Gcm, 600.0), (AeadAlgo::Aes256Gcm, 500.0), (AeadAlgo::ChaCha20Poly1305, 400.0)],
+                algorithm_speeds: smallvec![
+                    (AeadAlgo::Aes128Gcm, 600.0),
+                    (AeadAlgo::Aes256Gcm, 500.0),
+                    (AeadAlgo::ChaCha20Poly1305, 400.0)
+                ],
                 allow_unencrypted: true
             },
             Algorithms {
-                algorithm_speeds: smallvec![(AeadAlgo::Aes128Gcm, 600.0), (AeadAlgo::Aes256Gcm, 500.0), (AeadAlgo::ChaCha20Poly1305, 400.0)],
+                algorithm_speeds: smallvec![
+                    (AeadAlgo::Aes128Gcm, 600.0),
+                    (AeadAlgo::Aes256Gcm, 500.0),
+                    (AeadAlgo::ChaCha20Poly1305, 400.0)
+                ],
                 allow_unencrypted: true
             },
             true,
@@ -890,11 +1003,19 @@ mod tests {
         // Do not select unencrypted if only supported by one
         test_algorithm_negotiation(
             Algorithms {
-                algorithm_speeds: smallvec![(AeadAlgo::Aes128Gcm, 600.0), (AeadAlgo::Aes256Gcm, 500.0), (AeadAlgo::ChaCha20Poly1305, 400.0)],
+                algorithm_speeds: smallvec![
+                    (AeadAlgo::Aes128Gcm, 600.0),
+                    (AeadAlgo::Aes256Gcm, 500.0),
+                    (AeadAlgo::ChaCha20Poly1305, 400.0)
+                ],
                 allow_unencrypted: true
             },
             Algorithms {
-                algorithm_speeds: smallvec![(AeadAlgo::Aes128Gcm, 600.0), (AeadAlgo::Aes256Gcm, 500.0), (AeadAlgo::ChaCha20Poly1305, 400.0)],
+                algorithm_speeds: smallvec![
+                    (AeadAlgo::Aes128Gcm, 600.0),
+                    (AeadAlgo::Aes256Gcm, 500.0),
+                    (AeadAlgo::ChaCha20Poly1305, 400.0)
+                ],
                 allow_unencrypted: false
             },
             true,

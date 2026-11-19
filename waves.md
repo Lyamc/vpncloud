@@ -1,5 +1,8 @@
 # Feature-matrix waves
 
+> Historical feature-gap plan; all waves A–D are complete. Current work is
+> tracked in `CHANGELOG.md` under Unreleased.
+
 Gaps vs [vpnbench.clan.lol/feature-matrix](https://vpnbench.clan.lol/feature-matrix).
 That matrix scores **upstream** VpnCloud (Linux 2.2/2.3) at 47/108. This fork already
 closed Noise, macOS, Windows, FreeBSD, Android TUN, and iOS TUN — those cells are

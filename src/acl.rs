@@ -16,7 +16,10 @@ struct Rule {
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Acl {
-    rules: Vec<Rule>
+    rules: Vec<Rule>,
+    /// Default when no rule matches. Allow-only lists are whitelists (default
+    /// deny); deny-only lists keep the legacy "block these, allow the rest".
+    default_allow: bool
 }
 
 impl Acl {
@@ -37,14 +40,19 @@ impl Acl {
             let (range, proto, ports) = parse_spec(rest)?;
             rules.push(Rule { allow, range, proto, ports });
         }
-        Ok(Self { rules })
+        // An allow-only list expresses a whitelist: anything not explicitly
+        // allowed must be denied. Deny-only lists keep the old allow-by-default
+        // behavior, and mixed lists default to deny (the safe choice).
+        let default_allow = !rules.is_empty() && rules.iter().all(|r| !r.allow);
+        Ok(Self { rules, default_allow })
     }
 
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
 
-    /// Last matching rule wins. CIDR matches overlay source; optional proto/port match L4 dest.
+    /// Last matching rule wins; if nothing matches, `default_allow` applies.
+    /// CIDR matches overlay source; optional proto/port match L4 dest.
     pub fn allows(&self, addr: Address, proto: Option<u8>, dport: Option<u16>) -> bool {
         if self.rules.is_empty() {
             return true;
@@ -67,11 +75,14 @@ impl Acl {
             }
             hit = Some(rule.allow);
         }
-        hit.unwrap_or(true)
+        hit.unwrap_or(self.default_allow)
     }
 }
 
-fn parse_spec(rest: &str) -> Result<(Range, Option<u8>, Option<(u16, u16)>), &'static str> {
+/// Parsed ACL spec: range, optional protocol, optional port range.
+type AclSpec = (Range, Option<u8>, Option<(u16, u16)>);
+
+fn parse_spec(rest: &str) -> Result<AclSpec, &'static str> {
     if let Ok(range) = Range::from_str(rest) {
         return Ok((range, None, None));
     }
@@ -136,6 +147,20 @@ mod tests {
         assert!(!acl.allows(src, Some(6), Some(23)));
         assert!(!acl.allows(src, Some(17), Some(22)));
         assert!(!acl.allows(Address::from_str("8.8.8.8").unwrap(), Some(6), Some(22)));
+    }
+
+    #[test]
+    fn allow_only_list_is_a_whitelist() {
+        let acl = Acl::parse(&["allow:10.0.0.0/8".into()]).unwrap();
+        assert!(acl.allows(Address::from_str("10.1.2.3").unwrap(), None, None));
+        assert!(!acl.allows(Address::from_str("8.8.8.8").unwrap(), None, None));
+    }
+
+    #[test]
+    fn deny_only_list_keeps_allow_by_default() {
+        let acl = Acl::parse(&["deny:10.0.0.0/8".into()]).unwrap();
+        assert!(!acl.allows(Address::from_str("10.1.2.3").unwrap(), None, None));
+        assert!(acl.allows(Address::from_str("8.8.8.8").unwrap(), None, None));
     }
 
     #[test]

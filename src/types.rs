@@ -20,6 +20,22 @@ pub const NODE_ID_BYTES: usize = 16;
 
 pub type NodeId = [u8; NODE_ID_BYTES];
 
+/// What a node values most on its current network. A profile sets defaults for
+/// MTU/jitter/pacing; individual knobs can still be overridden explicitly.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkProfile {
+    /// Minimise delay: cap MTU at 1500, no artificial jitter buffer.
+    Latency,
+    /// Trade a fixed delay for predictable spacing (jitter buffer).
+    Consistency,
+    /// Maximise throughput: allow jumbo underlay frames, no jitter buffer.
+    Throughput,
+    /// Balanced defaults (current behaviour).
+    #[default]
+    Balanced
+}
+
 #[derive(Eq, Clone, Copy)]
 pub struct Address {
     pub data: [u8; 16],
@@ -220,7 +236,7 @@ impl fmt::Debug for Range {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     #[serde(rename = "normal")]
     Normal,

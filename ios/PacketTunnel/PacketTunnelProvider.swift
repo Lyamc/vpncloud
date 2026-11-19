@@ -51,7 +51,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 yaml.withCString { ptr in
                     let rc = vpncloud_start(ptr, tunFd)
                     if rc != 0 {
-                        let msg = vpncloud_last_error().map { String(cString: $0) } ?? "vpncloud_start failed"
+                        let errorPtr = vpncloud_last_error()
+                        let msg = errorPtr.map { String(cString: $0) } ?? "vpncloud_start failed"
+                        vpncloud_free_error(errorPtr)
                         os_log("vpncloud_start: %{public}@", log: log, type: .error, msg)
                     }
                 }

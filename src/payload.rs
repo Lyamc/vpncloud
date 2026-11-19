@@ -13,6 +13,13 @@ pub trait Protocol: Sized {
     fn parse(_: &[u8]) -> Result<(Address, Address), Error>;
 }
 
+/// EtherTypes we accept on a TAP interface: IPv4, IPv6, ARP and RARP.
+/// Anything else is treated as a device-type mismatch rather than routed with
+/// bogus addresses.
+fn is_known_ethertype(ethertype: u16) -> bool {
+    matches!(ethertype, 0x0800 | 0x86dd | 0x0806 | 0x8035)
+}
+
 /// An ethernet frame dissector
 ///
 /// This dissector is able to extract the source and destination addresses of ethernet frames.
@@ -31,14 +38,28 @@ impl Protocol for Frame {
         if data.len() < 14 {
             return Err(Error::Parse("Frame is too short"));
         }
+        // Validate the EtherType. A raw IP packet mistaken for Ethernet has
+        // arbitrary bytes here; rejecting unknown types turns that mismatch
+        // into a loud error instead of silently learning garbage MACs.
+        let mut ethertype = u16::from_be_bytes([data[12], data[13]]);
+        let mut type_off = 12;
+        if ethertype == 0x8100 {
+            if data.len() < 18 {
+                return Err(Error::Parse("Vlan frame is too short"));
+            }
+            ethertype = u16::from_be_bytes([data[16], data[17]]);
+            type_off = 16;
+        }
+        if !is_known_ethertype(ethertype) {
+            return Err(Error::Parse(
+                "Unknown ethernet type (check that every node uses the same device type: tun vs tap)"
+            ));
+        }
         let mut src = [0; 16];
         let mut dst = [0; 16];
         dst[..6].copy_from_slice(&data[0..6]);
         src[..6].copy_from_slice(&data[6..12]);
-        if data[12] == 0x81 && data[13] == 0x00 {
-            if data.len() < 16 {
-                return Err(Error::Parse("Vlan frame is too short"));
-            }
+        if type_off == 16 {
             src.copy_within(..6, 2);
             dst.copy_within(..6, 2);
             src[..2].copy_from_slice(&data[14..16]);
@@ -59,7 +80,7 @@ impl Protocol for Frame {
 
 #[test]
 fn decode_frame_without_vlan() {
-    let data = [6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 7, 8];
+    let data = [6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6, 0x08, 0x00, 3, 4, 5, 6, 7, 8];
     let (src, dst) = Frame::parse(&data).unwrap();
     assert_eq!(src, Address { data: [1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], len: 6 });
     assert_eq!(dst, Address { data: [6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], len: 6 });
@@ -67,7 +88,7 @@ fn decode_frame_without_vlan() {
 
 #[test]
 fn decode_frame_with_vlan() {
-    let data = [6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6, 0x81, 0, 4, 210, 1, 2, 3, 4, 5, 6, 7, 8];
+    let data = [6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6, 0x81, 0, 4, 210, 0x08, 0x00, 3, 4, 5, 6, 7, 8];
     let (src, dst) = Frame::parse(&data).unwrap();
     assert_eq!(src, Address { data: [4, 210, 1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0, 0, 0, 0], len: 8 });
     assert_eq!(dst, Address { data: [4, 210, 6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0], len: 8 });
@@ -75,11 +96,13 @@ fn decode_frame_with_vlan() {
 
 #[test]
 fn decode_invalid_frame() {
-    assert!(Frame::parse(&[6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 7, 8]).is_ok());
+    assert!(Frame::parse(&[6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6, 0x08, 0x00, 3, 4, 5, 6, 7, 8]).is_ok());
     // truncated frame
     assert!(Frame::parse(&[]).is_err());
     // truncated vlan frame
     assert!(Frame::parse(&[6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6, 0x81, 0x00]).is_err());
+    // a raw IP packet mistaken for Ethernet has no valid EtherType
+    assert!(Frame::parse(&[0x45, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2]).is_err());
 }
 
 /// An IP packet dissector
@@ -105,6 +128,14 @@ impl Protocol for Packet {
                 if data.len() < 20 {
                     return Err(Error::Parse("Truncated IPv4 header"));
                 }
+                let ihl = (data[0] & 0x0f) as usize * 4;
+                if ihl < 20 {
+                    return Err(Error::Parse("Invalid IPv4 header length"));
+                }
+                let total_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+                if total_len > 0 && (total_len < ihl || data.len() < total_len) {
+                    return Err(Error::Parse("Invalid IPv4 total length"));
+                }
                 let src = Address::read_from_fixed(&data[12..], 4)?;
                 let dst = Address::read_from_fixed(&data[16..], 4)?;
                 Ok((src, dst))
@@ -112,6 +143,10 @@ impl Protocol for Packet {
             6 => {
                 if data.len() < 40 {
                     return Err(Error::Parse("Truncated IPv6 header"));
+                }
+                let payload_len = u16::from_be_bytes([data[4], data[5]]) as usize;
+                if payload_len > 0 && data.len() < 40 + payload_len {
+                    return Err(Error::Parse("Invalid IPv6 payload length"));
                 }
                 let src = Address::read_from_fixed(&data[8..], 16)?;
                 let dst = Address::read_from_fixed(&data[24..], 16)?;
@@ -128,7 +163,7 @@ impl Protocol for Packet {
 
 #[test]
 fn decode_ipv4_packet() {
-    let data = [0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 168, 1, 1, 192, 168, 1, 2];
+    let data = [0x45, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 192, 168, 1, 1, 192, 168, 1, 2];
     let (src, dst) = Packet::parse(&data).unwrap();
     assert_eq!(src, Address { data: [192, 168, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], len: 4 });
     assert_eq!(dst, Address { data: [192, 168, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], len: 4 });
@@ -147,7 +182,7 @@ fn decode_ipv6_packet() {
 
 #[test]
 fn decode_invalid_packet() {
-    assert!(Packet::parse(&[0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 192, 168, 1, 1, 192, 168, 1, 2]).is_ok());
+    assert!(Packet::parse(&[0x45, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 192, 168, 1, 1, 192, 168, 1, 2]).is_ok());
     assert!(Packet::parse(&[
         0x60, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 0, 9, 8, 7, 6, 5, 4, 3, 2, 1, 6, 5,
         4, 3, 2, 1
@@ -580,13 +615,12 @@ fn internet_checksum(data: &[u8]) -> u16 {
 fn accum_words(data: &[u8]) -> u64 {
     let mut sum0 = 0u64;
     let mut sum1 = 0u64;
-    let mut chunks = data.chunks_exact(4);
-    for c in chunks.by_ref() {
+    let (chunks, rest) = data.as_chunks::<4>();
+    for c in chunks {
         sum0 += u16::from_be_bytes([c[0], c[1]]) as u64;
         sum1 += u16::from_be_bytes([c[2], c[3]]) as u64;
     }
     let mut sum = sum0 + sum1;
-    let rest = chunks.remainder();
     if rest.len() >= 2 {
         sum += u16::from_be_bytes([rest[0], rest[1]]) as u64;
     }
@@ -659,13 +693,7 @@ pub fn udp_segment(pkt: &[u8]) -> Option<(usize, usize)> {
 
 fn udp_same_flow(a: &[u8], b: &[u8]) -> bool {
     match a[0] >> 4 {
-        4 => {
-            a[1] == b[1]
-                && a[6] >> 5 == b[6] >> 5
-                && a[8] == b[8]
-                && a[12..20] == b[12..20]
-                && a[20..24] == b[20..24]
-        }
+        4 => a[1] == b[1] && a[6] >> 5 == b[6] >> 5 && a[8] == b[8] && a[12..20] == b[12..20] && a[20..24] == b[20..24],
         6 => a[0] == b[0] && a[1] >> 4 == b[1] >> 4 && a[7] == b[7] && a[8..44] == b[8..44],
         _ => false
     }
@@ -765,8 +793,8 @@ pub fn seal_udp_gso(pkt: &mut [u8], hdr: usize, gso_size: usize) -> Option<GsoMe
 
 fn pseudo_sum(src: &[u8], dst: &[u8], udp_len: u16) -> u16 {
     let mut sum = 0u32;
-    for chunk in src.chunks_exact(2).chain(dst.chunks_exact(2)) {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    for chunk in src.as_chunks::<2>().0.iter().chain(dst.as_chunks::<2>().0.iter()) {
+        sum += u16::from_be_bytes(*chunk) as u32;
     }
     sum += 17;
     sum += udp_len as u32;

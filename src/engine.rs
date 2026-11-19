@@ -68,7 +68,7 @@ fn run_script(script: &str, ifname: &str) {
 
     let mut cmd = process::Command::new(cmd_name);
     cmd.arg(cmd_arg).arg(script).env("IFNAME", ifname);
-    debug!("Running script: {:?}", cmd);
+    debug!("Running interface script for {}", ifname);
     match cmd.status() {
         Ok(status) => {
             if !status.success() {
@@ -118,13 +118,15 @@ fn underlay_limit(config: &Config) -> (usize, bool) {
     let mut peer_is_ipv6 = Vec::new();
     for mut dst in peer_sockets(&config.peers) {
         let v6 = match dst.ip() {
-            IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
-                Some(v4) => {
-                    dst = SocketAddr::new(IpAddr::V4(v4), dst.port());
-                    false
+            IpAddr::V6(ip) => {
+                match ip.to_ipv4_mapped() {
+                    Some(v4) => {
+                        dst = SocketAddr::new(IpAddr::V4(v4), dst.port());
+                        false
+                    }
+                    None => true
                 }
-                None => true
-            },
+            }
             IpAddr::V4(_) => false
         };
         peer_is_ipv6.push(v6);
@@ -142,6 +144,7 @@ fn underlay_limit(config: &Config) -> (usize, bool) {
     (l2, ipv6)
 }
 
+#[allow(dead_code)] // Linux route-based MTU probing
 fn route_target(dst: SocketAddr) -> IpAddr {
     match dst.ip() {
         IpAddr::V6(ip) => ip.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(ip)),
@@ -150,6 +153,7 @@ fn route_target(dst: SocketAddr) -> IpAddr {
 }
 
 /// Device token from `ip -o route get`. `None` when the line has no `dev`.
+#[allow(dead_code)] // Linux route-based MTU probing
 fn dev_from_route_get(text: &str) -> Option<&str> {
     let mut parts = text.split_whitespace();
     while let Some(tok) = parts.next() {
@@ -162,6 +166,7 @@ fn dev_from_route_get(text: &str) -> Option<&str> {
 
 /// Sysfs `speed` is megabits per second. `-1` and `0` mean the device has no
 /// reported rate (veth, some virtual links) and must not be paced.
+#[allow(dead_code)] // Linux underlay link-speed detection
 fn speed_text_to_bps(text: &str) -> u64 {
     match text.trim().parse::<i64>() {
         Ok(mbps) if mbps > 0 => (mbps as u64).saturating_mul(1_000_000),
@@ -174,7 +179,7 @@ fn egress_bitrate(config: &Config) -> u64 {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = config;
-        return 0;
+        0
     }
     #[cfg(target_os = "linux")]
     {
@@ -243,6 +248,9 @@ fn setup_device(config: &Config) -> (TunTapDevice, usize, bool) {
             info!("Configuring device with ip {}", ip);
             try_fail!(device.configure_ip(addr, netmask, prefix), "Failed to configure device: {}");
         }
+        if !config.local_addresses.is_empty() {
+            device.configure_local_addresses(&config.local_addresses);
+        }
         if let Some(script) = &config.ifup {
             run_script(script, device.ifname());
         }
@@ -296,16 +304,39 @@ fn install_tunnel_shaper(ifname: &str, link_bps: u64, ipv6: bool) -> bool {
     // target) lets a full UDP socket block before cobalt discards the flood.
     // `raw` would ignore overhead.
     let cake = [
-        "qdisc", "replace", "dev", ifname, "root", "cake", "bandwidth", rate_arg.as_str(), "overhead",
-        overhead_arg.as_str(), "rtt", "50ms", "besteffort"
+        "qdisc",
+        "replace",
+        "dev",
+        ifname,
+        "root",
+        "cake",
+        "bandwidth",
+        rate_arg.as_str(),
+        "overhead",
+        overhead_arg.as_str(),
+        "rtt",
+        "50ms",
+        "besteffort"
     ];
     if tc_ok(&cake) {
         log_shaper(ifname, &bucket, link_bps, "cake");
         return true;
     }
     let tbf = [
-        "qdisc", "replace", "dev", ifname, "root", "tbf", "rate", rate_arg.as_str(), "burst", "64kb", "latency",
-        "200ms", "overhead", overhead_arg.as_str()
+        "qdisc",
+        "replace",
+        "dev",
+        ifname,
+        "root",
+        "tbf",
+        "rate",
+        rate_arg.as_str(),
+        "burst",
+        "64kb",
+        "latency",
+        "200ms",
+        "overhead",
+        overhead_arg.as_str()
     ];
     if tc_ok(&tbf) {
         log_shaper(ifname, &bucket, link_bps, "token bucket");
@@ -343,22 +374,68 @@ fn install_split_shaper(ifname: &str, link_bps: u64, ipv6: bool, bucket: &crate:
     // quantum = class_rate / r2q. 800000 puts the UDP class under one packet and
     // HTB clamps it. 10000 keeps the 10gbit and the shaped UDP quanta in range.
     let htb = ["qdisc", "replace", "dev", ifname, "root", "handle", "1:", "htb", "default", "10", "r2q", "10000"];
-    let parent = ["class", "replace", "dev", ifname, "parent", "1:", "classid", "1:1", "htb", "rate", "10gbit", "ceil", "10gbit"];
+    let parent = [
+        "class", "replace", "dev", ifname, "parent", "1:", "classid", "1:1", "htb", "rate", "10gbit", "ceil", "10gbit"
+    ];
     let tcp_class = [
-        "class", "replace", "dev", ifname, "parent", "1:1", "classid", "1:10", "htb", "rate", "10gbit", "ceil", "10gbit",
-        "burst", "1mb", "prio", "1"
+        "class", "replace", "dev", ifname, "parent", "1:1", "classid", "1:10", "htb", "rate", "10gbit", "ceil",
+        "10gbit", "burst", "1mb", "prio", "1"
     ];
     let udp_class = [
-        "class", "replace", "dev", ifname, "parent", "1:1", "classid", "1:20", "htb", "rate", udp_arg.as_str(), "ceil",
-        udp_arg.as_str(), "burst", "64kb", "prio", "1"
+        "class",
+        "replace",
+        "dev",
+        ifname,
+        "parent",
+        "1:1",
+        "classid",
+        "1:20",
+        "htb",
+        "rate",
+        udp_arg.as_str(),
+        "ceil",
+        udp_arg.as_str(),
+        "burst",
+        "64kb",
+        "prio",
+        "1"
     ];
     let cake = [
-        "qdisc", "replace", "dev", ifname, "parent", "1:10", "handle", "10:", "cake", "bandwidth", rate_arg.as_str(),
-        "overhead", overhead_arg.as_str(), "rtt", "10ms", "besteffort"
+        "qdisc",
+        "replace",
+        "dev",
+        ifname,
+        "parent",
+        "1:10",
+        "handle",
+        "10:",
+        "cake",
+        "bandwidth",
+        rate_arg.as_str(),
+        "overhead",
+        overhead_arg.as_str(),
+        "rtt",
+        "10ms",
+        "besteffort"
     ];
     let fq = [
-        "qdisc", "replace", "dev", ifname, "parent", "1:20", "handle", "20:", "fq", "limit", "20000", "flow_limit",
-        "20000", "quantum", "1514", "initial_quantum", "15140"
+        "qdisc",
+        "replace",
+        "dev",
+        ifname,
+        "parent",
+        "1:20",
+        "handle",
+        "20:",
+        "fq",
+        "limit",
+        "20000",
+        "flow_limit",
+        "20000",
+        "quantum",
+        "1514",
+        "initial_quantum",
+        "15140"
     ];
     let udp4 = [
         "filter", "replace", "dev", ifname, "parent", "1:", "protocol", "ip", "prio", "1", "u32", "match", "ip",
@@ -481,6 +558,11 @@ pub fn run_vpn(mut config: Config) {
             }
         }
         crate::tray::run(config);
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    if config.tray {
+        crate::tray_macos::run(config);
         return;
     }
     #[cfg(target_os = "android")]

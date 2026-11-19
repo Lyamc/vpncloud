@@ -2,16 +2,16 @@
 use super::noise::{self, NoiseInit, NoiseTransport};
 use super::{
     core::{test_speed, CryptoCore},
+    fill_random,
     init::{self, InitResult, InitState, CLOSING},
-    rotate::RotationState
-};
-use super::{
-    fill_random, pbkdf2_hmac_sha256, AeadAlgo, AeadKey, Ed25519KeyPair, ED25519_PUBLIC_KEY_LEN
+    pbkdf2_hmac_sha256,
+    rotate::RotationState,
+    AeadAlgo, AeadKey, Ed25519KeyPair, ED25519_PUBLIC_KEY_LEN
 };
 use crate::{
     error::Error,
     types::NodeId,
-    util::{from_base62, to_base62, MsgBuffer}
+    util::{from_base62_fixed, to_base62, MsgBuffer}
 };
 use smallvec::{smallvec, SmallVec};
 use std::{fmt::Debug, io::Read, sync::Arc, time::Duration};
@@ -69,6 +69,9 @@ pub struct Crypto {
     node_id: NodeId,
     key_pair: Arc<Ed25519KeyPair>,
     trusted_keys: Arc<[Ed25519PublicKey]>,
+    /// Per-node trust bindings (node id -> Ed25519 public key) for per-node-keys mode.
+    node_bindings: Arc<[(NodeId, Ed25519PublicKey)]>,
+    per_node_keys: bool,
     algorithms: Algorithms,
     use_noise: bool,
     #[cfg(feature = "noise")]
@@ -118,13 +121,7 @@ impl Crypto {
 
     fn identity_seed(config: &Config) -> Result<[u8; 32], Error> {
         if let Some(priv_key) = &config.private_key {
-            let privkey = from_base62(priv_key).map_err(|_| Error::InvalidConfig("Failed to parse private key"))?;
-            if privkey.len() != 32 {
-                return Err(Error::InvalidConfig("Failed to parse private key"));
-            }
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&privkey);
-            Ok(seed)
+            from_base62_fixed::<32>(priv_key).map_err(|_| Error::InvalidConfig("Failed to parse private key"))
         } else if let Some(password) = &config.password {
             Ok(Self::password_seed(password, config.salt.as_deref(), config.kdf.as_deref())?)
         } else {
@@ -186,6 +183,13 @@ impl Crypto {
         if use_noise {
             info!("Using {} (X25519 / ChaCha20-Poly1305 / SHA-256)", noise::PATTERN);
             info!("Noise static public key: {}", to_base62(&dh_public));
+            if !config.trusted_keys.is_empty() {
+                warn!(
+                    "Noise verifies remote X25519 static keys; ensure trusted-keys contains peers' \
+                     Noise static public keys (printed at their startup), not Ed25519 identity keys. \
+                     The handshake fails closed on a mismatch."
+                );
+            }
             if !allowed_algos.is_empty() {
                 info!("Noise handshake selected; AES/ChaCha algorithm list is unused for this node");
             }
@@ -213,6 +217,8 @@ impl Crypto {
             node_id,
             key_pair: Arc::new(key_pair),
             trusted_keys: trusted_keys.into_boxed_slice().into(),
+            node_bindings: Arc::from(Vec::new()),
+            per_node_keys: false,
             algorithms: algos,
             use_noise,
             #[cfg(feature = "noise")]
@@ -222,6 +228,38 @@ impl Crypto {
             #[cfg(feature = "noise")]
             trusted_dh
         })
+    }
+
+    /// Enable per-node-key mode with explicit node-id -> public-key bindings.
+    /// The handshake will bind the signing key to a node id and derive the
+    /// session key from a transcript of both identities.
+    pub fn enable_per_node_keys(&mut self, entries: &[String]) -> Result<(), Error> {
+        let mut bindings = Vec::new();
+        for entry in entries {
+            let Some((id, key)) = entry.split_once('=') else {
+                return Err(Error::InvalidConfig("invalid trusted-node-key entry"));
+            };
+            let id_bytes = crate::util::from_hex(id).map_err(|_| Error::InvalidConfig("invalid node id"))?;
+            let id: NodeId = id_bytes.try_into().map_err(|_| Error::InvalidConfig("invalid node id length"))?;
+            let key: Ed25519PublicKey =
+                from_base62_fixed::<32>(key).map_err(|_| Error::InvalidConfig("invalid node key"))?;
+            bindings.push((id, key));
+        }
+        if bindings.is_empty() {
+            return Err(Error::InvalidConfig("per-node-keys needs at least one trusted-node-key"));
+        }
+        // The classic INIT reader locates the peer's signing key by a salted
+        // hash from the message, so the bound keys must also be in trusted_keys.
+        let mut trusted = self.trusted_keys.to_vec();
+        for (_, key) in &bindings {
+            if !trusted.contains(key) {
+                trusted.push(*key);
+            }
+        }
+        self.trusted_keys = Arc::from(trusted);
+        self.node_bindings = Arc::from(bindings);
+        self.per_node_keys = true;
+        Ok(())
     }
 
     pub fn generate_keypair(password: Option<&str>) -> (String, String) {
@@ -244,15 +282,17 @@ impl Crypto {
     }
 
     fn parse_keypair(privkey: &str, pubkey: &str) -> Result<Ed25519KeyPair, Error> {
-        let privkey = from_base62(privkey).map_err(|_| Error::InvalidConfig("Failed to parse private key"))?;
-        let pubkey = from_base62(pubkey).map_err(|_| Error::InvalidConfig("Failed to parse public key"))?;
+        let privkey =
+            from_base62_fixed::<32>(privkey).map_err(|_| Error::InvalidConfig("Failed to parse private key"))?;
+        let pubkey = from_base62_fixed::<32>(pubkey).map_err(|_| Error::InvalidConfig("Failed to parse public key"))?;
         let keypair = Ed25519KeyPair::from_seed_and_public(&privkey, &pubkey)
             .map_err(|_| Error::InvalidConfig("Keys rejected by crypto library"))?;
         Ok(keypair)
     }
 
     fn parse_private_key(privkey: &str) -> Result<Ed25519KeyPair, Error> {
-        let privkey = from_base62(privkey).map_err(|_| Error::InvalidConfig("Failed to parse private key"))?;
+        let privkey =
+            from_base62_fixed::<32>(privkey).map_err(|_| Error::InvalidConfig("Failed to parse private key"))?;
         let keypair =
             Ed25519KeyPair::from_seed(&privkey).map_err(|_| Error::InvalidConfig("Key rejected by crypto library"))?;
         Ok(keypair)
@@ -274,13 +314,8 @@ impl Crypto {
     }
 
     fn parse_public_key(pubkey: &str) -> Result<Ed25519PublicKey, Error> {
-        let pubkey = from_base62(pubkey).map_err(|_| Error::InvalidConfig("Failed to parse public key"))?;
-        if pubkey.len() != ED25519_PUBLIC_KEY_LEN {
-            return Err(Error::InvalidConfig("Failed to parse public key"));
-        }
-        let mut result = [0; ED25519_PUBLIC_KEY_LEN];
-        result.clone_from_slice(&pubkey);
-        Ok(result)
+        from_base62_fixed::<ED25519_PUBLIC_KEY_LEN>(pubkey)
+            .map_err(|_| Error::InvalidConfig("Failed to parse public key"))
     }
 
     pub fn public_key_from_private_key(privkey: &str) -> Result<String, Error> {
@@ -296,6 +331,8 @@ impl Crypto {
             self.trusted_keys.clone(),
             self.algorithms.clone(),
             self.use_noise,
+            self.node_bindings.clone(),
+            self.per_node_keys,
             #[cfg(feature = "noise")]
             self.dh_private,
             #[cfg(feature = "noise")]
@@ -332,10 +369,14 @@ pub struct PeerCrypto<P: Payload> {
 }
 
 impl<P: Payload> PeerCrypto<P> {
+    // Grouping these into a params struct would obscure the cfg-gated Noise
+    // arguments and this constructor is called from exactly one place.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_id: NodeId, init_payload: P, key_pair: Arc<Ed25519KeyPair>, trusted_keys: Arc<[Ed25519PublicKey]>,
-        algorithms: Algorithms, use_noise: bool, #[cfg(feature = "noise")] dh_private: [u8; 32],
-        #[cfg(feature = "noise")] dh_public: [u8; 32], #[cfg(feature = "noise")] trusted_dh: Arc<[[u8; 32]]>
+        algorithms: Algorithms, use_noise: bool, node_bindings: Arc<[(NodeId, Ed25519PublicKey)]>, per_node_keys: bool,
+        #[cfg(feature = "noise")] dh_private: [u8; 32], #[cfg(feature = "noise")] dh_public: [u8; 32],
+        #[cfg(feature = "noise")] trusted_dh: Arc<[[u8; 32]]>
     ) -> Self {
         #[cfg(feature = "noise")]
         if use_noise {
@@ -355,7 +396,15 @@ impl<P: Payload> PeerCrypto<P> {
         let _ = use_noise;
         Self {
             node_id,
-            init: Some(InitState::new(node_id, init_payload, key_pair, trusted_keys, algorithms)),
+            init: Some(InitState::new(
+                node_id,
+                init_payload,
+                key_pair,
+                trusted_keys,
+                algorithms,
+                node_bindings,
+                per_node_keys
+            )),
             #[cfg(feature = "noise")]
             noise: None,
             rotation: None,

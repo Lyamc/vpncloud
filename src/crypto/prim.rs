@@ -3,8 +3,11 @@
 //! Wire formats stay AES-GCM, ChaCha20-Poly1305, Ed25519, X25519,
 //! SHA-256/SHA-512, and PBKDF2-HMAC-SHA256. Nothing here compiles C.
 
-use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::{Aes128Gcm, Aes256Gcm};
+use crate::error::NoDetail;
+use aes_gcm::{
+    aead::{AeadInPlace, KeyInit},
+    Aes128Gcm, Aes256Gcm
+};
 use chacha20poly1305::ChaCha20Poly1305;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::Digest;
@@ -12,6 +15,8 @@ use smallvec::SmallVec;
 use x25519_dalek::{PublicKey as DalekPublic, StaticSecret};
 
 pub const ED25519_PUBLIC_KEY_LEN: usize = 32;
+/// X25519 public keys carried in init and rotation messages are always 32 bytes.
+pub const ECDH_PUBLIC_KEY_LEN: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AeadAlgo {
@@ -48,8 +53,10 @@ impl AeadAlgo {
 }
 
 enum Inner {
-    Aes128(Aes128Gcm),
-    Aes256(Aes256Gcm),
+    /// AEAD states differ greatly in size; box the larger ones so the enum
+    /// stays compact and `CryptoCore` does not bloat the datapath cache lines.
+    Aes128(Box<Aes128Gcm>),
+    Aes256(Box<Aes256Gcm>),
     ChaCha(ChaCha20Poly1305)
 }
 
@@ -58,14 +65,14 @@ pub struct AeadKey {
 }
 
 impl AeadKey {
-    pub fn new(algo: AeadAlgo, key: &[u8]) -> Result<Self, ()> {
+    pub fn new(algo: AeadAlgo, key: &[u8]) -> Result<Self, NoDetail> {
         if key.len() != algo.key_len() {
-            return Err(());
+            return Err(NoDetail);
         }
         let inner = match algo {
-            AeadAlgo::Aes128Gcm => Inner::Aes128(Aes128Gcm::new_from_slice(key).map_err(|_| ())?),
-            AeadAlgo::Aes256Gcm => Inner::Aes256(Aes256Gcm::new_from_slice(key).map_err(|_| ())?),
-            AeadAlgo::ChaCha20Poly1305 => Inner::ChaCha(ChaCha20Poly1305::new_from_slice(key).map_err(|_| ())?)
+            AeadAlgo::Aes128Gcm => Inner::Aes128(Box::new(Aes128Gcm::new_from_slice(key).map_err(|_| NoDetail)?)),
+            AeadAlgo::Aes256Gcm => Inner::Aes256(Box::new(Aes256Gcm::new_from_slice(key).map_err(|_| NoDetail)?)),
+            AeadAlgo::ChaCha20Poly1305 => Inner::ChaCha(ChaCha20Poly1305::new_from_slice(key).map_err(|_| NoDetail)?)
         };
         Ok(Self { inner })
     }
@@ -79,19 +86,19 @@ impl AeadKey {
     }
 
     /// Encrypt `buf` in place with an empty AAD. Returns the 16-byte tag.
-    pub fn seal(&self, nonce: &[u8; 12], buf: &mut [u8]) -> Result<[u8; 16], ()> {
+    pub fn seal(&self, nonce: &[u8; 12], buf: &mut [u8]) -> Result<[u8; 16], NoDetail> {
         let tag = match &self.inner {
             Inner::Aes128(key) => {
                 let n = aes_gcm::Nonce::from_slice(nonce);
-                key.encrypt_in_place_detached(n, &[], buf).map_err(|_| ())?
+                key.encrypt_in_place_detached(n, &[], buf).map_err(|_| NoDetail)?
             }
             Inner::Aes256(key) => {
                 let n = aes_gcm::Nonce::from_slice(nonce);
-                key.encrypt_in_place_detached(n, &[], buf).map_err(|_| ())?
+                key.encrypt_in_place_detached(n, &[], buf).map_err(|_| NoDetail)?
             }
             Inner::ChaCha(key) => {
                 let n = chacha20poly1305::Nonce::from_slice(nonce);
-                key.encrypt_in_place_detached(n, &[], buf).map_err(|_| ())?
+                key.encrypt_in_place_detached(n, &[], buf).map_err(|_| NoDetail)?
             }
         };
         let mut out = [0u8; 16];
@@ -100,9 +107,9 @@ impl AeadKey {
     }
 
     /// `buf` is ciphertext followed by a 16-byte tag. Plaintext stays at the front.
-    pub fn open(&self, nonce: &[u8; 12], buf: &mut [u8]) -> Result<(), ()> {
+    pub fn open(&self, nonce: &[u8; 12], buf: &mut [u8]) -> Result<(), NoDetail> {
         if buf.len() < 16 {
-            return Err(());
+            return Err(NoDetail);
         }
         let split = buf.len() - 16;
         let mut tag = [0u8; 16];
@@ -112,17 +119,17 @@ impl AeadKey {
             Inner::Aes128(key) => {
                 let n = aes_gcm::Nonce::from_slice(nonce);
                 let t = aes_gcm::Tag::from_slice(&tag);
-                key.decrypt_in_place_detached(n, &[], plain, t).map_err(|_| ())
+                key.decrypt_in_place_detached(n, &[], plain, t).map_err(|_| NoDetail)
             }
             Inner::Aes256(key) => {
                 let n = aes_gcm::Nonce::from_slice(nonce);
                 let t = aes_gcm::Tag::from_slice(&tag);
-                key.decrypt_in_place_detached(n, &[], plain, t).map_err(|_| ())
+                key.decrypt_in_place_detached(n, &[], plain, t).map_err(|_| NoDetail)
             }
             Inner::ChaCha(key) => {
                 let n = chacha20poly1305::Nonce::from_slice(nonce);
                 let t = chacha20poly1305::Tag::from_slice(&tag);
-                key.decrypt_in_place_detached(n, &[], plain, t).map_err(|_| ())
+                key.decrypt_in_place_detached(n, &[], plain, t).map_err(|_| NoDetail)
             }
         }
     }
@@ -150,15 +157,15 @@ pub struct Ed25519KeyPair {
 }
 
 impl Ed25519KeyPair {
-    pub fn from_seed(seed: &[u8]) -> Result<Self, ()> {
-        let seed: [u8; 32] = seed.try_into().map_err(|_| ())?;
+    pub fn from_seed(seed: &[u8]) -> Result<Self, NoDetail> {
+        let seed: [u8; 32] = seed.try_into().map_err(|_| NoDetail)?;
         Ok(Self::from_seed_bytes(seed))
     }
 
-    pub fn from_seed_and_public(seed: &[u8], public_key: &[u8]) -> Result<Self, ()> {
+    pub fn from_seed_and_public(seed: &[u8], public_key: &[u8]) -> Result<Self, NoDetail> {
         let pair = Self::from_seed(seed)?;
         if public_key != pair.public_key.as_slice() {
-            return Err(());
+            return Err(NoDetail);
         }
         Ok(pair)
     }
@@ -169,8 +176,8 @@ impl Ed25519KeyPair {
         pkcs8_from_seed(&seed)
     }
 
-    pub fn from_pkcs8(pkcs8: &[u8]) -> Result<Self, ()> {
-        let seed = pkcs8_seed(pkcs8).ok_or(())?;
+    pub fn from_pkcs8(pkcs8: &[u8]) -> Result<Self, NoDetail> {
+        let seed = pkcs8_seed(pkcs8).ok_or(NoDetail)?;
         Ok(Self::from_seed_bytes(seed))
     }
 
@@ -182,11 +189,11 @@ impl Ed25519KeyPair {
         &self.public_key
     }
 
-    pub fn verify(public_key: &[u8], msg: &[u8], signature: &[u8]) -> Result<(), ()> {
-        let pk: [u8; 32] = public_key.try_into().map_err(|_| ())?;
-        let vk = VerifyingKey::from_bytes(&pk).map_err(|_| ())?;
-        let sig = Signature::from_slice(signature).map_err(|_| ())?;
-        vk.verify(msg, &sig).map_err(|_| ())
+    pub fn verify(public_key: &[u8], msg: &[u8], signature: &[u8]) -> Result<(), NoDetail> {
+        let pk: [u8; 32] = public_key.try_into().map_err(|_| NoDetail)?;
+        let vk = VerifyingKey::from_bytes(&pk).map_err(|_| NoDetail)?;
+        let sig = Signature::from_slice(signature).map_err(|_| NoDetail)?;
+        vk.verify(msg, &sig).map_err(|_| NoDetail)
     }
 
     fn from_seed_bytes(seed: [u8; 32]) -> Self {
@@ -216,9 +223,22 @@ fn pkcs8_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
     Some(seed)
 }
 
+/// Overwrite a byte buffer so the compiler cannot elide the write.
+pub(crate) fn zeroize_bytes(buf: &mut [u8]) {
+    for byte in buf {
+        unsafe { std::ptr::write_volatile(byte, 0u8) };
+    }
+}
+
 /// Ephemeral X25519 scalar. Consumed by [`EcdhSecret::agree`].
 pub struct EcdhSecret {
     secret: [u8; 32]
+}
+
+impl Drop for EcdhSecret {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.secret);
+    }
 }
 
 impl EcdhSecret {
@@ -234,8 +254,8 @@ impl EcdhSecret {
     }
 
     /// Raw 32-byte shared secret. A peer key that is not 32 bytes is rejected.
-    pub fn agree(self, peer: &[u8]) -> Result<[u8; 32], ()> {
-        let peer: [u8; 32] = peer.try_into().map_err(|_| ())?;
+    pub fn agree(self, peer: &[u8]) -> Result<[u8; 32], NoDetail> {
+        let peer: [u8; 32] = peer.try_into().map_err(|_| NoDetail)?;
         let shared = StaticSecret::from(self.secret).diffie_hellman(&DalekPublic::from(peer));
         Ok(*shared.as_bytes())
     }

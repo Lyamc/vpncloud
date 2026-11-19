@@ -4,12 +4,7 @@
 
 //! Peer endpoints saved to disk and reloaded before any socket is opened.
 
-use std::{
-    fs,
-    io,
-    net::SocketAddr,
-    path::Path
-};
+use std::{fs, io, net::SocketAddr, path::Path};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootState {

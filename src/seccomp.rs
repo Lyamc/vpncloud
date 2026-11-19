@@ -19,6 +19,8 @@ pub fn apply() {
 }
 
 #[cfg(target_os = "linux")]
+// The BPF filter is extended across several cfg-gated blocks.
+#[allow(clippy::vec_init_then_push)]
 fn apply_linux() -> Result<(), String> {
     unsafe {
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
@@ -32,7 +34,17 @@ fn apply_linux() -> Result<(), String> {
     filter.push(bpf(bpf_class::JMP | bpf_class::JEQ | bpf_class::K, 1, 0, arch));
     filter.push(bpf(bpf_class::RET | bpf_class::K, 0, 0, seccomp_ret::KILL_PROCESS));
     filter.push(bpf(bpf_class::LD | bpf_class::W | bpf_class::ABS, 0, 0, 0)); // nr offset
-    for &nr in blocked_syscalls() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // x32 ABI reuses AUDIT_ARCH_X86_64 but adds X32_SYSCALL_BIT to the
+        // syscall number. Without this check, `execve` via x32 (0x4000003b)
+        // skips the numeric blacklist below and escapes the sandbox.
+        const X32_BIT: u32 = 0x4000_0000;
+        filter.push(bpf(bpf_class::ALU | bpf_class::AND | bpf_class::K, 0, 0, X32_BIT));
+        filter.push(bpf(bpf_class::JMP | bpf_class::JEQ | bpf_class::K, 0, 1, X32_BIT));
+        filter.push(bpf(bpf_class::RET | bpf_class::K, 0, 0, seccomp_ret::KILL_PROCESS));
+    }
+    for &nr in &blocked_syscalls() {
         filter.push(bpf(bpf_class::JMP | bpf_class::JEQ | bpf_class::K, 0, 1, nr as u32));
         filter.push(bpf(bpf_class::RET | bpf_class::K, 0, 0, seccomp_ret::KILL_PROCESS));
     }
@@ -65,8 +77,8 @@ fn audit_arch() -> Result<u32, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn blocked_syscalls() -> &'static [i64] {
-    &[
+fn blocked_syscalls() -> Vec<i64> {
+    let mut list = vec![
         libc::SYS_execve,
         libc::SYS_execveat,
         libc::SYS_ptrace,
@@ -93,14 +105,28 @@ fn blocked_syscalls() -> &'static [i64] {
         libc::SYS_setns,
         libc::SYS_add_key,
         libc::SYS_request_key,
-        libc::SYS_keyctl
-    ]
+        libc::SYS_keyctl,
+        libc::SYS_open_by_handle_at,
+        libc::SYS_fanotify_init,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+    ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        list.push(libc::SYS_clone3);
+        list.push(libc::SYS_io_uring_setup);
+        list.push(libc::SYS_io_uring_enter);
+        list.push(libc::SYS_io_uring_register);
+    }
+    list
 }
 
 #[cfg(target_os = "linux")]
 mod bpf_class {
     pub const LD: u16 = 0x00;
+    pub const ALU: u16 = 0x04;
     pub const JMP: u16 = 0x05;
+    pub const AND: u16 = 0x50;
     pub const RET: u16 = 0x06;
     pub const W: u16 = 0x00;
     pub const ABS: u16 = 0x20;

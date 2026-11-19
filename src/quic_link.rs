@@ -23,7 +23,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::crypto::fill_random;
 
 const INITIAL_SALT: [u8; 20] = [
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a
+    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f,
+    0x0a
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,7 +167,9 @@ fn xor_pn(iv: &mut [u8; 12], pn: u32) {
     }
 }
 
-fn seal_packet(key: &[u8; 16], iv: &[u8; 12], hp: &[u8; 16], header: &[u8], pn_offset: usize, plain: &[u8], long: bool) -> Vec<u8> {
+fn seal_packet(
+    key: &[u8; 16], iv: &[u8; 12], hp: &[u8; 16], header: &[u8], pn_offset: usize, plain: &[u8], long: bool
+) -> Vec<u8> {
     use aes_gcm::aead::KeyInit;
     let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).expect("quic key");
     let nonce = aes_gcm::Nonce::from_slice(iv);
@@ -366,7 +369,8 @@ pub fn deliver_sealed(frame: &[u8]) -> io::Result<Vec<u8>> {
     let initial = build_initial(&server_cid, &client_cid, 0, &crypto_frame(client_pk.as_bytes()), &secrets.client);
     client.send_to(&initial, server_addr)?;
     let got = recv(&server)?;
-    let opened = open_initial(&got, &secrets.client).ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "client initial"))?;
+    let opened =
+        open_initial(&got, &secrets.client).ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "client initial"))?;
     let their_pk = parse_crypto(&opened).ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "client crypto"))?;
     if their_pk.as_slice() != client_pk.as_bytes() {
         return Err(io::Error::new(ErrorKind::InvalidData, "client public"));
@@ -375,7 +379,8 @@ pub fn deliver_sealed(frame: &[u8]) -> io::Result<Vec<u8>> {
     let reply = build_initial(&client_cid, &server_cid, 0, &crypto_frame(server_pk.as_bytes()), &secrets.server);
     server.send_to(&reply, client.local_addr()?)?;
     let got = recv(&client)?;
-    let opened = open_initial(&got, &secrets.server).ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "server initial"))?;
+    let opened =
+        open_initial(&got, &secrets.server).ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "server initial"))?;
     let their_pk = parse_crypto(&opened).ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "server crypto"))?;
     if their_pk.as_slice() != server_pk.as_bytes() {
         return Err(io::Error::new(ErrorKind::InvalidData, "server public"));
@@ -407,8 +412,14 @@ mod tests {
         println!("row: QUIC support");
         let dcid = unhex("8394c8f03e515708");
         let secrets = initial_secrets(&dcid);
-        assert_eq!(secrets.initial_secret.as_slice(), unhex("7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44"));
-        assert_eq!(secrets.client.secret.as_slice(), unhex("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"));
+        assert_eq!(
+            secrets.initial_secret.as_slice(),
+            unhex("7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44")
+        );
+        assert_eq!(
+            secrets.client.secret.as_slice(),
+            unhex("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea")
+        );
         assert_eq!(secrets.client.key.as_slice(), unhex("1f369613dd76d5467730efcbe3b1a22d"));
         assert_eq!(secrets.client.iv.as_slice(), unhex("fa044b2f42a3fd3b46fb255c"));
         assert_eq!(secrets.client.hp.as_slice(), unhex("9f50449e04a0e810283a1e9933adedd2"));

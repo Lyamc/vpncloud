@@ -1,0 +1,39 @@
+[package]
+name = "vpncloud-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+vpncloud = { path = ".." }
+
+[workspace]
+
+[[bin]]
+name = "node_info"
+path = "fuzz_targets/node_info.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "payload_parse"
+path = "fuzz_targets/payload_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gso_meta"
+path = "fuzz_targets/gso_meta.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "config_signature"
+path = "fuzz_targets/config_signature.rs"
+test = false
+doc = false

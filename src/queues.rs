@@ -72,7 +72,7 @@ fn bring_up(name: &str) -> io::Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(io::Error::new(ErrorKind::Other, "ip link set up failed"))
+        Err(io::Error::other("ip link set up failed"))
     }
 }
 
@@ -84,7 +84,7 @@ fn open_direct(count: usize) -> io::Result<Vec<TunQueue>> {
         let (fd, got) = open_one(&name)?;
         if got != name {
             unsafe { libc::close(fd) };
-            return Err(io::Error::new(ErrorKind::Other, "queue attached to a different device"));
+            return Err(io::Error::other("queue attached to a different device"));
         }
         queues.push(TunQueue { fd, name: got });
     }
@@ -103,7 +103,7 @@ fn compile_helper() -> io::Result<PathBuf> {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernel/tun_helper.c");
     let status = Command::new("clang").args(["-O2", "-o"]).arg(&bin).arg(&src).status()?;
     if !status.success() {
-        return Err(io::Error::new(ErrorKind::Other, "tun helper compile failed"));
+        return Err(io::Error::other("tun helper compile failed"));
     }
     Ok(bin)
 }
@@ -121,15 +121,35 @@ fn recv_tun_fds(fd: RawFd, expect: usize) -> io::Result<(String, Vec<RawFd>)> {
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
+    // Kernel-reported control length must fit our buffer; truncation means
+    // ancillary data was discarded and must not be trusted.
+    let control = msg.msg_controllen as usize;
+    if control > cbuf.len() || (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
+        return Err(io::Error::new(ErrorKind::InvalidData, "invalid ancillary data from tun helper"));
+    }
+    let ctrl_start = cbuf.as_ptr() as usize;
+    let ctrl_end = ctrl_start + control;
+    let header_size = mem::size_of::<libc::cmsghdr>();
+    let min_len = unsafe { libc::CMSG_LEN(0) } as usize;
     let mut fds = Vec::new();
     let mut hdr = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     while !hdr.is_null() {
+        let hdr_addr = hdr as usize;
+        // Each cmsg header and its payload must lie entirely within the
+        // received control buffer. Never subtract an unvalidated cmsg_len.
+        if hdr_addr < ctrl_start || hdr_addr + header_size > ctrl_end {
+            return Err(io::Error::new(ErrorKind::InvalidData, "cmsg header out of bounds"));
+        }
+        let cmsg_len = unsafe { (*hdr).cmsg_len as usize };
+        if cmsg_len < min_len || cmsg_len > ctrl_end - hdr_addr {
+            return Err(io::Error::new(ErrorKind::InvalidData, "invalid cmsg length"));
+        }
         let level = unsafe { (*hdr).cmsg_level };
         let kind = unsafe { (*hdr).cmsg_type };
         if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
-            let data = unsafe { libc::CMSG_DATA(hdr) } as *const RawFd;
-            let bytes = unsafe { (*hdr).cmsg_len as usize - libc::CMSG_LEN(0) as usize };
+            let bytes = cmsg_len - min_len;
             let count = bytes / mem::size_of::<RawFd>();
+            let data = unsafe { libc::CMSG_DATA(hdr) } as *const RawFd;
             for i in 0..count {
                 fds.push(unsafe { *data.add(i) });
             }
@@ -140,7 +160,7 @@ fn recv_tun_fds(fd: RawFd, expect: usize) -> io::Result<(String, Vec<RawFd>)> {
         for fd in fds {
             unsafe { libc::close(fd) };
         }
-        return Err(io::Error::new(ErrorKind::Other, "tun helper returned the wrong fd count"));
+        return Err(io::Error::other("tun helper returned the wrong fd count"));
     }
     let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
     let text = String::from_utf8_lossy(&name[..end]).into_owned();
@@ -153,18 +173,34 @@ fn open_via_root(count: usize) -> io::Result<Vec<TunQueue>> {
         time::{Duration, Instant}
     };
     let bin = compile_helper()?;
-    let path = std::env::temp_dir().join(format!("vpncloud-tun-{}-{}.sock", std::process::id(), count));
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)?;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    // Private, unpredictable directory: the socket lives inside it so other
+    // local users cannot connect and inject fake SCM_RIGHTS messages.
+    let dir = std::env::temp_dir().join(format!("vpncloud-tun-{}-{:016x}", std::process::id(), rand::random::<u64>()));
+    std::fs::create_dir(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let path = dir.join("tun.sock");
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
     listener.set_nonblocking(true)?;
-    let mut child = Command::new("sudo")
-        .args(["-n", bin.to_str().ok_or_else(|| io::Error::new(ErrorKind::Other, "helper path"))?])
+    let mut child = match Command::new("sudo")
+        .args(["-n", bin.to_str().ok_or_else(|| io::Error::other("helper path"))?])
         .arg(&path)
         .arg(count.to_string())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()?;
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
     let start = Instant::now();
     let stream = loop {
         match listener.accept() {
@@ -176,22 +212,28 @@ fn open_via_root(count: usize) -> io::Result<Vec<TunQueue>> {
                         use std::io::Read;
                         let _ = stderr.read_to_string(&mut err_text);
                     }
-                    let _ = std::fs::remove_file(&path);
-                    return Err(io::Error::new(ErrorKind::PermissionDenied, format!("tun helper exited {status}: {err_text}")));
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err(io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        format!("tun helper exited {status}: {err_text}")
+                    ));
                 }
                 if start.elapsed() > Duration::from_secs(5) {
                     let _ = child.kill();
-                    let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::remove_dir_all(&dir);
                     return Err(io::Error::new(ErrorKind::TimedOut, "tun helper"));
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(err) => return Err(err)
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(err);
+            }
         }
     };
     let (name, fds) = recv_tun_fds(stream.as_raw_fd(), count)?;
     let _ = child.wait();
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(fds.into_iter().map(|fd| TunQueue { fd, name: name.clone() }).collect())
 }
 
@@ -205,7 +247,9 @@ pub fn open_queues(count: usize) -> io::Result<Vec<TunQueue>> {
     }
     match open_direct(count) {
         Ok(queues) => Ok(queues),
-        Err(err) if err.raw_os_error() == Some(libc::EPERM) || err.kind() == ErrorKind::PermissionDenied => open_via_root(count),
+        Err(err) if err.raw_os_error() == Some(libc::EPERM) || err.kind() == ErrorKind::PermissionDenied => {
+            open_via_root(count)
+        }
         Err(err) => Err(err)
     }
 }

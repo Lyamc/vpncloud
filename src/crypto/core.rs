@@ -239,7 +239,9 @@ impl CryptoCore {
     }
 
     pub fn decrypt(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
-        assert!(buffer.len() >= EXTRA_LEN + TAG_LEN);
+        if buffer.len() < EXTRA_LEN + TAG_LEN {
+            return Err(Error::Crypto("Encrypted message too short"));
+        }
         let (extra, data_and_tag) = buffer.message_mut().split_at_mut(EXTRA_LEN);
         let key_id;
         let mut nonce;
@@ -341,6 +343,16 @@ mod tests {
         assert_eq!(nonce.as_bytes(), &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         nonce.increment();
         assert_eq!(nonce.as_bytes(), &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    }
+
+    #[test]
+    fn test_short_ciphertext_is_rejected_without_panic() {
+        let (_, mut receiver) = create_dummy_pair(AeadAlgo::Aes128Gcm);
+        for len in 0..EXTRA_LEN + TAG_LEN {
+            let mut buffer = MsgBuffer::new(0);
+            buffer.clone_from(&vec![0u8; len]);
+            assert!(receiver.decrypt(&mut buffer).is_err(), "len {} must be rejected", len);
+        }
     }
 
     fn test_encrypt_decrypt(algo: AeadAlgo) {
@@ -524,7 +536,10 @@ mod tests {
     #[test]
     fn test_core_size() {
         let size = mem::size_of::<CryptoCore>();
-        assert_eq!(size, 4304);
+        // Boxing the largest AEAD variant dropped this from ~4.2 KiB to
+        // ~3.2 KiB. An upper bound stays valid across target layouts while
+        // still catching accidental growth in this hot-path struct.
+        assert!(size <= 4096, "CryptoCore grew to {size} bytes");
     }
 
     #[test]

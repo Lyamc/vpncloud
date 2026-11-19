@@ -28,6 +28,12 @@ vpncloud - Peer-to-peer VPN
   */dev/net/tun*). Unrooted devices must use *tun* via VpnService.
   On iOS, only *tun* is available (Packet Tunnel Provider); *tap* is not
   supported.
+  On Windows, *tun* needs the Wintun driver (*wintun.dll* beside the exe) and
+  *tap* needs OpenVPN's tap-windows6 (*tap0901*). When the selected driver is
+  missing, an interactive session is asked whether to download and install it;
+  the artifacts are pinned to a SHA-256 checksum. The same prompt appears in
+  *vpncloud config* and in the desktop GUI. Non-interactive runs are never
+  prompted.
 
 *-d <name>*, *--device <name>*::
   Name of the virtual device. On Linux, any *%d* will be filled with a free
@@ -213,14 +219,80 @@ vpncloud - Peer-to-peer VPN
   Please see *STATSD SUPPORT* for more info.
 
 *--tray*::
-  Windows only. Show a system tray icon with *Enable*, *Disable*, *Open
-  config folder*, and *Exit*. Double-click toggles Enable/Disable.
-  Disable pauses forwarding without tearing down the TUN/TAP device.
-  Combine with *--daemon* to hide the console window.
-  Chosen at *vpncloud install* (prompt, or *--tray* / *--no-tray*).
+  Windows and macOS. Show a system tray / menu bar icon with a configuration
+  context menu: *Enable / Disable VPN*, *Restart VPN*, *Open config folder*,
+  *Edit configuration*, *Settings…*, and *Quit*. Disable pauses forwarding
+  without tearing down the TUN/TAP device. On Windows, combine with *--daemon*
+  to hide the console window; double-click toggles Enable/Disable.
+  On macOS the tray app installed with *vpncloud install* runs as a user
+  LaunchAgent and controls the privileged LaunchDaemon (see *INSTALLATION*).
 
 *--no-tray*::
-  Windows only. Do not show a system tray icon.
+  Windows and macOS. Do not show a system tray / menu bar icon.
+
+*--per-node-keys*::
+  Use unique per-node identity keys instead of a shared password. Each node
+  needs its own *private-key* and explicit *trusted-node-key* bindings
+  (*node-id-hex=base62-public-key*). The handshake binds the signing key to the
+  claimed node id and derives the session key from both identities. All peers
+  must use this mode; config validation rejects password-only setups.
+
+*--local-address <ip>*::
+  An additional overlay IP for this node (repeatable). Each is assigned to the
+  interface where supported and announced as a /32 host claim. On a TAP bridge
+  node, each address receives a distinct synthetic MAC and local ARP reply.
+  Same as *local-addresses* in the config file.
+
+*--install-routes*::
+  Install kernel routes for announced overlay claims, pointing at the local
+  interface. Needs privileges and is off by default. Default routes (`/0`) are
+  never installed. Claims and auto-claim are SIGHUP-reloadable.
+
+*--l2-l3-bridge*::
+  On a *tap* node, accept IP-only (TUN) peers and translate between their raw
+  IP packets and local Ethernet frames. ARP is answered locally from the route
+  table; L2-only frames are never sent to TUN peers. TUN clients need no flag.
+  Peers still need IP claims/auto-claims to route to each other. Ignored on TUN
+  nodes.
+
+*--profile <latency|consistency|throughput|balanced>*::
+  Network quality priority. *latency* caps the underlay at 1500 and adds no
+  delay; *consistency* adds a receive jitter buffer (default 20 ms) for
+  predictable spacing; *throughput* allows jumbo underlay MTUs (up to 9000).
+  *balanced* is the default. See *jitter-ms* and *max-underlay-mtu* to override.
+
+*--jitter-ms <milliseconds>*:: Receive jitter buffer. Defaults to 20 for the
+  consistency profile, 0 otherwise. Frames are held this long before being
+  written to the TUN, smoothing out arrival jitter at the cost of delay.
+
+*--max-underlay-mtu <bytes>*:: Cap the probed underlay MTU (1500 for
+  latency/consistency, 9000 for throughput/balanced). Set lower to avoid
+  jumbo frames when they add latency without helping throughput.
+
+*--node-id <hex>*:: Stable 16-byte node id. If unset it is derived from
+  *node-key* (so it survives restarts) or generated randomly. Stable ids let
+  peers recognise a roaming node that reconnects from a new address.
+
+*--no-mobility*:: Do not migrate a peer to a new source address when its node
+  id is recognised. Mobility is on by default.
+
+*--flood-relay* / *--no-flood-relay*::
+  In TAP/Switch/Hub broadcast modes, send one copy of a broadcast to the
+  lowest-RTT peer and let it redistribute to the rest, instead of sending one
+  copy per peer. Useful when a node has poor upload. Off by default.
+  *--flood-relay-via <node-id>*::: Pin the redistribution peer by hex node id
+  instead of using lowest RTT.
+
+*--compression*::
+  Opportunistically LZ4-compress DATA payloads before encryption. Off by
+  default. Only used for direct DATA / DATA_GSO frames sent to a peer that
+  advertised support in its NodeInfo; the receiving peer decompresses before
+  handing the frame to the TUN/TAP device. Frames that do not shrink are sent
+  uncompressed, so already-compressed traffic (PNG, gzip, TLS, …) is left
+  alone. See *COMPRESSION* for the security caveat.
+
+*--no-compression*::
+  Never compress tunnel payloads, overriding a config-file setting.
 
 *--daemon*::
   Spawn a background process instead of running the process in the foreground.
@@ -272,8 +344,20 @@ vpncloud - Peer-to-peer VPN
 
 *--require-signed-config*::
   Refuse to start unless the config file carries a valid Ed25519 *signature*
-  line. A present signature is always verified against trusted / public keys
-  even without this flag. See *sign-config*.
+  line. Verification keys must be supplied out of band with *--verify-key* or
+  *--verify-key-file*; keys inside the config (*trusted-keys*, *public-key*) are
+  never used as the trust anchor. Fails closed if no out-of-band key is given.
+  A present signature is still checked best-effort against config-derived keys
+  without this flag, but that is not a security guarantee. See *sign-config*.
+
+*--verify-key <key>*::
+  Ed25519 public key (base62, optional *:YYYY-MM-DD* expiry) used only to verify
+  the config signature. Repeatable. Never merged into peer *trusted-keys*.
+
+*--verify-key-file <path>*::
+  File with one base62 verification key per line (*#* comments allowed). Use a
+  root-owned file as the real trust anchor. The GUI reads keys from the
+  *VPNCLOUD_VERIFY_KEY* environment variable instead.
 
 *--seccomp* / *--no-seccomp*::
   Linux: after bind, TUN, and privilege drop, install *no_new_privs* plus a
@@ -303,6 +387,21 @@ The following subcommands can be given to run some special action instead of
 running a VpnCloud instance. Any parameters must be given after the subcommand
 name (except for -v -q and -h). Only the listed parameters are accepted for the
 subcommands.
+
+*check-config*::
+  Validate a config file without opening TUN or requiring root. Reports errors
+  and warns about risky settings. Use *--verify-signature* together with the
+  top-level *--verify-key* / *--verify-key-file* flags to also check a signature.
+
+  *--config <file>*, *-c <file>*::: Config file to validate.
+  *--verify-signature*::: Verify the config signature against out-of-band keys.
+
+*status*::
+  Print a snapshot read from the JSON status file of a running node.
+
+  *--status-file <path>*::: Read this file directly.
+  *--config <file>*, *-c <file>*::: Read the *status-file* setting from this config.
+  *--json*::: Print the raw JSON instead of a human-readable summary.
 
 *genkey*::
   Generate and print a random key pair and exit. The key pair is printed as 
@@ -358,6 +457,12 @@ subcommands.
     Stop and delete the service.
   *service start* / *service stop*:::
     Same as *sc start VpnCloud* / *sc stop VpnCloud*.
+  *service reload*:::
+    Ask a running service to re-read its reloadable policy config (ACL,
+    grants, split prefixes, peer names, stateful filter, exit-node, adding
+    peers) without a restart. Uses the standard *SERVICE_CONTROL_PARAMCHANGE*
+    control code. Device, crypto, listen and most other settings still need a
+    full stop/start.
 
   *vpncloud install --service* (installer feature) also registers the service
   and copies a user config into ProgramData.
@@ -369,7 +474,10 @@ subcommands.
   */etc/systemd/system* and */lib/systemd/system*). Enable a network with
   *systemctl enable --now vpncloud@<name>*.
   macOS: LaunchDaemon *ca.witherow.vpncloud* running
-  */usr/bin/vpncloud --config /etc/vpncloud/vpncloud.yaml*.
+  */usr/local/bin/vpncloud --config /usr/local/etc/vpncloud/vpncloud.yaml*
+  plus a per-user LaunchAgent *ca.witherow.vpncloud.tray* that shows the menu
+  bar icon with the configuration context menu. Start the daemon with
+  *sudo launchctl start system/ca.witherow.vpncloud* or from the tray.
   FreeBSD: rc.d script */usr/local/etc/rc.d/vpncloud*, binary
   */usr/local/bin/vpncloud*, config */usr/local/etc/vpncloud/vpncloud.yaml*.
   Enable with *sysrc vpncloud_enable=YES* and *service vpncloud start*.
@@ -560,12 +668,24 @@ peer address lists in TOML are arrays of arrays:
 *group*:: The name of a group to run the background process under. Same as *--group*
 *pid_file*:: The path of the pid file to create. Same as *--pid-file*
 *stats_file*:: The path of the statistics file. Same as *--stats-file*
+*status_file*:: Path of a JSON status snapshot refreshed every second, read by *status*. Same as *--status-file*.
 *statsd*:: A key-value map with statsd settings
   *server*::: Server to report statistics to. Same as *--statsd-server*
   *prefix*::: Prefix to use when reporting to statsd. Same as *--statsd-prefix*
 *hook*:: A hook script to be called for every event type. See *HOOK SCRIPTS* for info.
 *hooks*:: A map of event type to script for scripts that only fire for one event type. See *HOOK SCRIPTS* for info.
-*tray*:: Windows: show a system tray icon. Same as *--tray*.
+*tray*:: Windows/macOS: show a system tray / menu bar icon. Same as *--tray*.
+*compression*:: Opportunistically LZ4-compress DATA payloads before encryption. Same as *--compression*. See *COMPRESSION*.
+*flood-relay*:: Redistribute broadcasts through the best-connected peer. Same as *--flood-relay*.
+*per-node-keys*:: Use unique per-node identity keys. Same as *--per-node-keys*.
+*l2-l3-bridge*:: On a *tap* node, accept IP-only (TUN) peers. Same as *--l2-l3-bridge*.
+*local-addresses*:: Additional overlay IPs announced as host claims. Same as *--local-address*.
+*install-routes*:: Install kernel routes for announced claims. Same as *--install-routes*.
+*profile*:: Network quality priority. Same as *--profile*.
+*jitter-ms*:: Receive jitter buffer. Same as *--jitter-ms*.
+*max-underlay-mtu*:: Cap the underlay MTU. Same as *--max-underlay-mtu*.
+*node-id*:: Stable node id (hex). Same as *--node-id*.
+*mobility*:: Migrate peers to new addresses. Same as *--no-mobility* (inverse).
 *stun*:: STUN reflexive-address discovery. Same as *--stun*
 *stun-servers*:: List of STUN *host:port*. Same as *--stun-server*
 *lan-only*:: Same as *--lan-only*
@@ -573,7 +693,9 @@ peer address lists in TOML are arrays of arrays:
 *acl*:: List of *allow:CIDR* / *deny:CIDR*. Same as *--acl*
 *tcp-fallback*:: Same as *--tcp-fallback*
 *crypto-threads*:: Same as *--crypto-threads*
-*require-signed-config*:: Same as *--require-signed-config*
+*require-signed-config*:: Same as *--require-signed-config*. Setting it in the
+  config file is not a trust decision: an out-of-band *--verify-key* /
+  *--verify-key-file* is still required for verification to succeed.
 *seccomp*:: Same as *--seccomp*
 *socket-buffer*:: Same as *--socket-buffer*
 *signature*:: Ed25519 signature of the config body. Written by *sign-config*.
@@ -774,6 +896,31 @@ When using a native websocket listen address, allow TCP (not UDP) on that
 port in the host firewall.
 
 
+== COMPRESSION
+
+Compression is *off by default* and is a per-node opt-in (`--compression` or
+`compression: true` in the config). It uses the pure-Rust LZ4 block codec and
+runs on DATA payloads *before* AEAD encryption, after the virtual device read.
+The receiver decompresses after decryption and before writing to the device.
+
+It is opportunistic: the compressed bytes are used only when they are strictly
+smaller than the original. Already-compressed traffic (PNG, JPEG, gzip, zstd,
+TLS) therefore stays unchanged without any content sniffing, and the extra CPU
+is bounded by the compression attempt itself.
+
+Only direct DATA and DATA_GSO frames are compressed. Relayed payloads are
+end-to-end sealed first, so their bytes are incompressible and are always sent
+as-is. Capability is advertised in NodeInfo; older peers that do not understand
+the capability never receive compressed frames, so mixed-version meshes stay
+compatible.
+
+*Security caveat.* Compressing attacker-influenced plaintext before encryption
+can reveal information through ciphertext lengths (CRIME/BREACH-style length
+oracles). Enable compression only when peers are trusted and no adversary can
+choose tunnel plaintext while observing packet sizes. This is the main reason
+the default is off.
+
+
 == HOOK SCRIPTS
 
 VpnCloud supports calling hook scripts on certain events. The scripts can either be
@@ -882,9 +1029,9 @@ websocket proxy (see *WEBSOCKET PROXY*).
 
 == DESKTOP GUI
 
-An optional Iced window (*vpncloud-gui*) edits the YAML config and
+An optional Iced window (*vpncloud-gui*) manages the settings and
 starts/stops the node on Linux, macOS, and Windows. It is a separate
-binary (software renderer only) so the CLI is not linked with a GUI
+binary (software renderer only, ~5.8 MB) so the CLI is not linked with a GUI
 toolkit.
 
 ----
@@ -892,6 +1039,18 @@ cargo build --release --features gui --bin vpncloud-gui
 vpncloud-gui
 vpncloud-gui /path/to/mynet.yaml
 ----
+
+The window is a settings manager. It loads and saves (YAML or TOML based on
+the path extension) connection basics, *private-key* / trusted keys /
+*algorithms*, the per-node-key and signed-config flags, device name/path,
+routing *mode*, claims, grants, split prefixes, exit node, ACL, beacon/STUN
+and discovery options, network profile, jitter and MTU, and advanced settings
+(status/metrics files, *seccomp*, *crypto-threads*, init rate limit). Fields
+are grouped into labelled sections in a single scrollable view. Saving
+preserves config keys that the window does not expose. *Connect* runs a node
+in this process and shows live peer and traffic stats; *Save* only writes the
+file. Editing a signed config invalidates its signature, so re-sign with
+*sign-config* before connecting.
 
 Optional AES-GCM via AWS-LC (needs cmake; *ring* remains the default, and
 Noise still uses *ring*):
@@ -901,7 +1060,9 @@ cargo build --release --features aws-lc
 ----
 
 Connect still needs the same privileges as the CLI (root/Administrator,
-TUN/TAP). Disable/pause uses the same pause flag as the Windows tray.
+TUN/TAP). Disable/pause uses the same pause flag as the tray application.
+On macOS, the menu bar tray's *Edit configuration* / *Settings…* items open
+the config file and this GUI (when installed beside the CLI).
 
 
 == ANDROID

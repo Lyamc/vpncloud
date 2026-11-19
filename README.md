@@ -8,6 +8,9 @@ encryption, NAT traversal, and a simple config file. Nodes form a fully meshed,
 self-healing network. Traffic is encrypted end-to-end (Curve25519, AES-256 /
 ChaCha20) and forwarded over a virtual TUN (IP) or TAP (Ethernet) interface.
 
+**Documentation:** [Troubleshooting](docs/TROUBLESHOOTING.md) ·
+[Security model](docs/SECURITY.md)
+
 This repository is [Lyamc/vpncloud](https://github.com/Lyamc/vpncloud), a fork
 of [dswd/vpncloud](https://github.com/dswd/vpncloud). The fork adds **macOS**,
 **Windows**, **FreeBSD**, **Android**, and **iOS (TUN only)** support plus
@@ -141,7 +144,9 @@ with `sudo` from a terminal (`sudo vpncloud --type tun --ip 10.0.0.2/24
 -c HOST:3210 -p PASS`). Dual-stack UDP listen works (`--listen 3210` binds
 IPv4 and IPv6). `--daemon` from a one-shot GUI/osascript helper can die when
 that helper exits; persist with `vpncloud install` (LaunchDaemon
-`ca.witherow.vpncloud`), then `sudo launchctl start ca.witherow.vpncloud`.
+`ca.witherow.vpncloud` plus a menu bar tray application), then
+`sudo launchctl start system/ca.witherow.vpncloud` or use the tray's
+**Enable / Disable VPN** menu item.
 
 **FreeBSD.** TUN uses `tun(4)`, TAP uses `tap(4)` (both via tun-rs). Default
 `vpncloud%d` names are ignored; the kernel assigns `tunN` / `tapN`. Dual-stack
@@ -166,6 +171,8 @@ As a **system service** (Administrator, LocalSystem, auto-start at boot):
 vpncloud service install --config C:\ProgramData\VpnCloud\vpncloud.yaml --start
 vpncloud service start
 vpncloud service stop
+rem reload ACL/grants/split/peers without a restart:
+vpncloud service reload
 vpncloud service uninstall
 ```
 
@@ -247,12 +254,23 @@ That copies the binary, example config, man page, and the systemd units
 (same templates as `assets/`). Enable a network with
 `sudo systemctl enable --now vpncloud@mynet`.
 
-Desktop GUI (Iced, software renderer — not pulled into the CLI):
+Desktop GUI (Iced, software renderer — not pulled into the CLI, ~5.8 MB):
 
 ```sh
 cargo build --release --features gui --bin vpncloud-gui
 sudo ./target/release/vpncloud-gui                 # optional path: vpncloud-gui ./mynet.yaml
 ```
+
+The window is a full settings manager: it loads and saves connection basics,
+per-node keys and trust bindings, device name/path, routing mode, claims,
+grants, split prefixes, exit node, ACL, discovery/transport options, network
+profile, jitter/MTU, and advanced knobs (status/metrics files, seccomp, crypto
+threads). Settings are grouped into sections in one scrollable view. Saving
+preserves config fields the GUI does not expose (hooks, stats file, signature,
+etc.). `Connect` runs a node in-process for a quick check and reads live
+peer/traffic stats; `Load`/`Save` only touch the config file. If a config is
+signed, editing it invalidates the signature — re-sign it with `sign-config`
+before connecting.
 
 Debian/RPM packaging helpers live in `maskfile.md` (requires
 [mask](https://github.com/jacobdeichert/mask)). Systemd units are in
@@ -268,15 +286,28 @@ cargo build --release --features installer
 sudo ./target/release/vpncloud install
 ```
 
-Copies `/usr/bin/vpncloud`, writes `/etc/vpncloud/`, and registers LaunchDaemon
-`ca.witherow.vpncloud` (`/usr/bin/vpncloud --config /etc/vpncloud/vpncloud.yaml`).
-Edit that config, then:
+Copies `/usr/local/bin/vpncloud`, writes `/usr/local/etc/vpncloud/` (the
+`/usr/bin` and `/etc` trees are sealed by SIP on modern macOS), and registers
+the LaunchDaemon `ca.witherow.vpncloud`
+(`/usr/local/bin/vpncloud --config /usr/local/etc/vpncloud/vpncloud.yaml`).
+It also installs a per-user LaunchAgent `ca.witherow.vpncloud.tray` that shows a
+**menu bar icon with a configuration context menu** (Enable / Disable VPN,
+Restart VPN, Open config folder, Edit configuration, Quit). The agent starts at
+login and controls the privileged daemon, which runs as root because TUN
+requires it.
+
+Edit `/usr/local/etc/vpncloud/vpncloud.yaml` (add `password:` or a private key),
+then use the menu bar **Enable / Disable VPN** item, or start from the shell:
 
 ```sh
-sudo launchctl start ca.witherow.vpncloud
+sudo launchctl start system/ca.witherow.vpncloud
 ```
 
-Uninstall: `sudo ./target/release/vpncloud install --uninstall`.
+The standalone menu bar app is also available without installing the service:
+`./target/release/vpncloud --tray --config vpncloud.yaml` (needs root for TUN).
+
+Uninstall: `sudo ./target/release/vpncloud install --uninstall` (also removes
+the menu bar LaunchAgent).
 
 #### FreeBSD
 
@@ -345,6 +376,12 @@ copy path\to\wintun\bin\amd64\wintun.dll target\release\
 ```
 
 Without `wintun.dll`, TUN fails at startup with `LoadLibraryExW failed`.
+When you start VpnCloud or pick a device type in `vpncloud config` or the GUI,
+Windows detects a missing driver and **asks whether to download it for you**.
+Answering yes downloads the exact pinned artifact above, verifies its SHA-256,
+then installs it: Wintun's DLL is placed beside `vpncloud.exe`, and tap-windows6
+runs OpenVPN's signed installer (with a UAC prompt if needed). Declining leaves
+the files untouched; non-interactive runs never prompt.
 
 4. Optional TAP: tick **TAP driver** in the NSIS setup (downloads OpenVPN
    `tap-windows-9.24.7-I601-Win10.exe`, verifies SHA-256, runs their wizard)
@@ -403,6 +440,190 @@ vpncloud --listen ws-listen://0.0.0.0:8081 -c ws://listener.example.com:8080 --i
 `ws://hostname:port` as `--listen` is still the **proxy client**. Unspecified
 hosts (`0.0.0.0`, `[::]`, `*`) and the `ws-listen://` scheme bind a native
 server.
+
+
+### Compression
+
+Tunnel compression is **off by default**. Opt in on trusted meshes with
+`--compression` (or `compression: true` in the config). DATA / DATA_GSO frames
+are LZ4-compressed *before* encryption and only when the result is smaller, so
+already-compressed traffic (PNG, gzip, TLS, etc.) is left alone. Peers advertise
+support in NodeInfo; older peers never receive compressed frames.
+
+Only direct traffic is compressed — relayed payloads are end-to-end sealed and
+incompressible. **Security caveat:** compressing attacker-chosen plaintext
+before encryption can leak information via ciphertext lengths
+(CRIME/BREACH-style). Leave it off where an adversary can inject tunnel
+payloads and observe packet sizes.
+
+
+### Operations
+
+Validate a config before starting (no TUN or root needed):
+
+```sh
+vpncloud check-config --config net.net
+```
+
+It reports parse/semantic errors and warns about risky settings (plain crypto,
+compression, no peers). Add `--verify-signature` together with `--verify-key`
+to check a signed config.
+
+For a running node, set `status-file: /path/to/status.json` in the config (or
+`--status-file`) and read it back:
+
+```sh
+vpncloud status --config net.net          # human-readable
+vpncloud status --config net.net --json   # raw JSON for monitoring
+```
+
+The file is refreshed once per second with device name, uptime, traffic
+counters, last handshake, and per-peer RTT. Logs now append across restarts
+and rotate once past 10 MiB (`<log-file>.old`).
+
+`vpncloud doctor --config net.net` runs preflight checks (TUN access, config
+permissions, listen port, clock, peer DNS) without starting the VPN.
+`vpncloud config --print --config net.net` prints the effective config with
+secrets redacted. `vpncloud network list|start|stop|status <name>` manages
+per-network service instances.
+
+For monitoring, `--metrics-addr 127.0.0.1:9090` serves read-only Prometheus
+metrics at `/metrics`, and `--log-json` emits structured JSON log lines.
+Send `SIGHUP` to reload ACLs, grants, split prefixes, exit-node, and peers
+without restarting the TUN device (`vpncloud service reload` on the Windows
+service). A reload is verified against the same out-of-band config-signature
+keys as the initial load, so `--require-signed-config` cannot be bypassed by
+editing the file and signaling the process. Changes to the device, crypto keys,
+listen port, and most other settings still require a full restart.
+
+See [Troubleshooting](docs/TROUBLESHOOTING.md),
+[Security model](docs/SECURITY.md), and the generated
+[CLI reference](docs/CLI.md).
+
+### Per-node keys (no shared password)
+
+By default a mesh share one password or keypair, so every authenticated peer
+is equally trusted. With `--per-node-keys` (or `per-node-keys: true`) you can
+drop the shared password entirely:
+
+- each node has its **own** `private-key` (generate one with `vpncloud genkey`);
+- each node lists the peers it trusts as `trusted-node-key: <node-id-hex>=<base62-public-key>`;
+- `node-id` is derived from the private key unless set explicitly.
+
+The handshake then binds the signing key to a specific node id, rejects a key
+claimed by a different node, and derives the session key from a transcript of
+both identities and both ephemeral keys (unknown-key-share defence). Config
+validation fails if you try to use this mode with only a password.
+
+```sh
+vpncloud genkey   # run once per node; put the private key in that node's config
+vpncloud --per-node-keys --config mynode.net
+```
+
+Both ends must enable the mode. It is backward-compatible with shared-key
+peers only in the sense that a per-node-key node will refuse to talk to a
+shared-key peer — configure all nodes consistently.
+
+### Multiple overlay addresses and site-to-site subnets
+
+A node can announce and use more than one overlay IP with `--local-address
+10.9.0.10 --local-address 10.9.0.11` (or `local-addresses:` in the config).
+Each address is announced as a `/32` host claim, so peers route to it through
+this node. On TAP bridge nodes each IP gets its own synthetic MAC and a local
+ARP reply, so a single node can present several Ethernet identities. Linux and
+Android assign the extra addresses to the interface automatically; elsewhere use
+`ifup` to add them.
+
+For site-to-site routing (e.g. `192.168.0.0/16` on site A and `172.16.0.0/16`
+on site B), announce each subnet with `--claim` and make sure the OS on each
+site routes those prefixes into the VpnCloud interface — VpnCloud advertises
+routes but does not install kernel routes. If clients on one site must appear
+as the peer's overlay IP, use OS-level NAT (nftables/iptables) on that peer;
+VpnCloud does not rewrite source addresses.
+
+`vpncloud status` now also prints estimated RTTs to remote nodes and a
+**suggested relay** derived from quality gossip between peers (bounded and
+median-aggregated so one peer cannot skew it). Relay choice is sticky under
+small RTT changes. `--install-routes` installs kernel routes for announced
+claims (requires privileges; default routes are never installed automatically).
+
+For loop safety, relay and flood frames carry a hop count that is decremented at
+each forwarding node; peers that do not advertise this capability keep the
+legacy dedup-only format. External Ethernet bridges still need STP — VpnCloud
+does not participate in spanning tree.
+
+### Mixed TAP/TUN networks
+
+Normally all nodes must use the same `--type` (TUN = IP packets, TAP = Ethernet
+frames). Nodes now advertise the payload formats they can receive in their
+`NodeInfo`; a mismatch is rejected with a clear warning instead of being
+misparsed. Legacy peers that omit the capability are inferred from their
+announced claims (IP vs MAC address lengths).
+
+A TAP node started with `--l2-l3-bridge` can also serve **TUN-only clients**
+(e.g. Android VpnService, iOS Packet Tunnel, Wintun):
+
+- DATA payloads are translated per peer: Ethernet headers are stripped for
+  IP-only peers and synthesized for the local TAP interface.
+- ARP is answered locally from the route table, so L2 broadcast need not cross
+  the mesh. Non-IP Ethernet frames (ARP etc.) are never sent to TUN peers.
+- Peers still need a route to each other: configure `claims` (or let TUN nodes
+  auto-claim their IP). `flood-relay` falls back to per-peer delivery when the
+  mesh has mixed formats.
+
+Use `--type tap --l2-l3-bridge` on one or more nodes; TUN clients need no
+special flag. All nodes must still share the same crypto settings.
+
+### Network profiles and mobile peers
+
+Set `--profile latency`, `--profile consistency`, or `--profile throughput`
+(or `profile:` in the config) to match what your current network is good at:
+
+| Profile | MTU cap | Jitter buffer | Use when |
+|---|---|---|---|
+| `latency` | 1500 | none | a clean, low-latency link — minimise delay |
+| `consistency` | 1500 | 20 ms (tune with `jitter-ms`) | jittery but otherwise good — predictable spacing |
+| `throughput` | 9000 (jumbo) | none | very high latency or poor quality — maximise goodput |
+
+`balanced` (the default) keeps the previous behaviour. Individual `mtu`,
+`jitter-ms`, and `max-underlay-mtu` settings override the profile.
+
+For phones and other roaming devices, vpncloud tracks a stable node id (set
+`node-id`, or derive one from `node-key`) and **migrates the peer immediately**
+when it reconnects from a new IP/port — e.g. switching WiFi to 4G. The stale
+address is dropped at once instead of blackholing traffic until the old peer
+timeout. MTU is tracked per peer, so when a constrained peer leaves (or moves
+to a fatter link) the tunnel MTU recovers automatically. Use `--no-mobility`
+to disable this.
+
+### Broadcasts with a slow-upload peer
+
+In TAP/Switch/Hub modes a broadcast is normally sent as a separate copy to
+every peer. If one node has poor upload, enable `flood-relay: true` (or
+`--flood-relay`): the sender emits **one** copy to its lowest-RTT peer, and that
+peer redistributes to the rest. The header carries an origin and sequence so
+nodes ignore duplicates. This trades a little latency on the broadcast path
+for a large reduction in the weak node's upload; leave it off when every link
+is fast. Set `flood-relay-via: <node-id-hex>` to pin the redistribution peer
+instead of relying on lowest RTT (a weak-upload peer can still have low latency).
+
+### Signed configs
+
+`vpncloud sign-config --config net.net --private-key KEY` appends an Ed25519
+signature line. To *enforce* signed configs, supply the verification key
+**out of band** — the keys inside the config are peer-trust keys and are never
+used as the verification trust anchor:
+
+```sh
+vpncloud --config net.net --require-signed-config \
+  --verify-key '<base62-public-key>' -p PASS --ip 10.0.0.1/24
+```
+
+`--verify-key` is repeatable; `--verify-key-file PATH` reads one base62 key per
+line (a root-owned file is the real trust anchor). The GUI accepts keys via
+`VPNCLOUD_VERIFY_KEY` (comma/semicolon separated). With `--require-signed-config`
+and no out-of-band key, startup fails closed. The signature must be a single
+column-zero line at the end of the file; `sign-config` produces that format.
 
 
 ### Semantic versioning

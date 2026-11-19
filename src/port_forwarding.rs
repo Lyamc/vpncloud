@@ -69,7 +69,9 @@ mod internal {
             }
         }
 
-        fn get_any_forwarding(gateway: &Gateway, addr: SocketAddrV4, port: u16) -> Result<(u16, u32), ()> {
+        fn get_any_forwarding(
+            gateway: &Gateway, addr: SocketAddrV4, port: u16
+        ) -> Result<(u16, u32), crate::error::NoDetail> {
             if let Ok(a) = Self::get_forwarding(gateway, addr, port) {
                 return Ok(a);
             }
@@ -87,10 +89,12 @@ mod internal {
                 }
             }
             warn!("Failed to activate port forwarding");
-            Err(())
+            Err(crate::error::NoDetail)
         }
 
-        fn get_forwarding(gateway: &Gateway, addr: SocketAddrV4, port: u16) -> Result<(u16, u32), ()> {
+        fn get_forwarding(
+            gateway: &Gateway, addr: SocketAddrV4, port: u16
+        ) -> Result<(u16, u32), crate::error::NoDetail> {
             debug!("Trying external port {}", port);
             if port == 0 {
                 match gateway.add_any_port(PortMappingProtocol::UDP, SocketAddr::V4(addr), LEASE_TIME, DESCRIPTION) {
@@ -100,13 +104,13 @@ mod internal {
                             Ok(port) => Ok((port, 0)),
                             Err(err) => {
                                 debug!("Port-forwarding: failed to activate port forwarding: {}", err);
-                                Err(())
+                                Err(crate::error::NoDetail)
                             }
                         }
                     }
                     Err(err) => {
                         debug!("Port-forwarding: failed to activate port forwarding: {}", err);
-                        Err(())
+                        Err(crate::error::NoDetail)
                     }
                 }
             } else {
@@ -117,13 +121,13 @@ mod internal {
                             Ok(()) => Ok((port, 0)),
                             Err(err) => {
                                 debug!("Port-forwarding: failed to activate port forwarding: {}", err);
-                                Err(())
+                                Err(crate::error::NoDetail)
                             }
                         }
                     }
                     Err(err) => {
                         debug!("Port-forwarding: failed to activate port forwarding: {}", err);
-                        Err(())
+                        Err(crate::error::NoDetail)
                     }
                 }
             }

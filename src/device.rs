@@ -2,21 +2,17 @@
 // Copyright (C) 2015-2021 Dennis Schwerdel
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     cmp,
     collections::VecDeque,
     fmt,
     io::{self},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    str::FromStr,
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}
+    str::FromStr
 };
 
-#[cfg(target_os = "android")]
-use std::process::Command;
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-use std::cell::{Cell, RefCell};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 
@@ -28,9 +24,15 @@ use tun_rs::SyncDevice;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tun_rs::{DeviceBuilder, Layer};
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-use tun_rs::{ExpandBuffer, GROTable, VIRTIO_NET_HDR_LEN};
+use tun_rs::{GROTable, VIRTIO_NET_HDR_LEN};
 
 use crate::{error::Error, gso::GsoMeta};
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+pub(crate) use crate::tun_linux::{
+    hold_udp_inject_gap, note_gro_batch, tun_sendmmsg, tun_tx_ready, tune_gso_hdr, widen_tx_queue, MsgVirtio,
+    UDP_INJECT_CHUNK, UDP_INJECT_GAP_NS, UDP_INJECT_PACKET_NS
+};
 
 /// What [`Device::read_offload`] produced.
 pub enum OffloadRead {
@@ -91,6 +93,7 @@ enum HostOs {
     Other
 }
 
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
 fn current_host_os() -> HostOs {
     #[cfg(target_os = "macos")]
     {
@@ -122,11 +125,12 @@ fn current_host_os() -> HostOs {
 /// Linux accepts `vpncloud%d` (kernel fills in the number). macOS TUN devices are always
 /// `utunN`; TAP uses `feth` pairs. FreeBSD/other BSD TUN/TAP units are `tunN` / `tapN`;
 /// Linux-style names are ignored there so the OS can clone a free unit.
-#[cfg_attr(target_os = "ios", allow(dead_code))]
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
 fn platform_device_name(ifname: &str, type_: Type) -> Option<String> {
     platform_device_name_for(current_host_os(), ifname, type_)
 }
 
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
 fn platform_device_name_for(host: HostOs, ifname: &str, type_: Type) -> Option<String> {
     if ifname.is_empty() {
         return None;
@@ -158,7 +162,11 @@ fn platform_device_name_for(host: HostOs, ifname: &str, type_: Type) -> Option<S
             let _ = type_;
             // wintun / tap-windows6 adapter names cannot contain `%d`.
             let name = ifname.replace("%d", "0");
-            if name.is_empty() { None } else { Some(name) }
+            if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }
         }
         HostOs::Other => {
             let _ = type_;
@@ -176,6 +184,15 @@ pub trait Device: io::Read + io::Write {
     fn get_type(&self) -> Type;
     fn ifname(&self) -> &str;
     fn address(&self) -> Result<Ipv4Addr, Error>;
+    /// MAC address of a TAP interface, used by the L2/L3 bridge to build
+    /// Ethernet headers for IP-only peers.
+    fn mac_address(&self) -> [u8; 6] {
+        [0x02, 0, 0, 0, 0, 1]
+    }
+
+    /// Best-effort assignment of additional overlay IPs on the local interface.
+    /// The mesh routes and ARPs for them regardless of OS support.
+    fn configure_local_addresses(&mut self, _addresses: &[String]) {}
 
     /// MsgBuffer-aware helpers used on the hot path by GenericCloud.
     /// These operate directly on `MsgBuffer` (avoiding extra allocations / copies).
@@ -183,6 +200,8 @@ pub trait Device: io::Read + io::Write {
     fn read_msg(&mut self, buffer: &mut crate::util::MsgBuffer) -> Result<(), Error>;
 
     /// Fill `bufs` with packets until WouldBlock or `bufs` is full.
+    // Parallel scratch arrays are indexed together on the hot read path.
+    #[allow(clippy::needless_range_loop)]
     fn read_batch(&mut self, bufs: &mut [crate::util::MsgBuffer]) -> Result<usize, Error> {
         let mut n = 0;
         for b in bufs.iter_mut() {
@@ -466,7 +485,7 @@ pub fn android_tap_needs_root() -> io::Error {
 /// True if this process can open `/dev/net/tun` (uid 0, or chmod via `su`).
 #[cfg(target_os = "android")]
 pub fn android_has_tuntap_access() -> bool {
-    android_tun::has_access()
+    crate::android_tun::has_access()
 }
 
 #[cfg(not(target_os = "android"))]
@@ -474,128 +493,6 @@ pub fn android_has_tuntap_access() -> bool {
     false
 }
 
-#[cfg(target_os = "android")]
-mod android_tun {
-    use super::*;
-    use std::{
-        ffi::CString,
-        io::{Error, ErrorKind},
-        mem,
-        os::unix::io::RawFd
-    };
-
-    const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
-    const IFF_TUN: libc::c_short = 0x0001;
-    const IFF_TAP: libc::c_short = 0x0002;
-    const IFF_NO_PI: libc::c_short = 0x1000;
-    const IFNAMSIZ: usize = 16;
-
-    pub fn has_access() -> bool {
-        if unsafe { libc::geteuid() } == 0 {
-            return true;
-        }
-        if open_dev().is_ok() {
-            return true;
-        }
-        let _ = Command::new("su").args(["-c", "chmod 666 /dev/net/tun"]).status();
-        open_dev().is_ok()
-    }
-
-    fn open_dev() -> io::Result<std::fs::File> {
-        std::fs::OpenOptions::new().read(true).write(true).open("/dev/net/tun")
-    }
-
-    pub fn create(ifname: &str, tap: bool, device_path: Option<&str>) -> io::Result<(SyncDevice, String)> {
-        if tap && !has_access() {
-            return Err(android_tap_needs_root());
-        }
-        if !tap && !has_access() {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                "cannot open /dev/net/tun; pass a VpnService TUN fd with --tun-fd, or run as root"
-            ));
-        }
-        let path = device_path.unwrap_or("/dev/net/tun");
-        let c_path = CString::new(path).map_err(|_| Error::new(ErrorKind::InvalidInput, "device path"))?;
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        if fd < 0 {
-            let err = Error::last_os_error();
-            if tap {
-                return Err(Error::new(err.kind(), format!("{} ({})", ANDROID_TAP_HELP, err)));
-            }
-            return Err(err);
-        }
-        let mut req: libc::ifreq = unsafe { mem::zeroed() };
-        let flags = (if tap { IFF_TAP } else { IFF_TUN }) | IFF_NO_PI;
-        req.ifr_ifru.ifru_flags = flags;
-        let want = if ifname.is_empty() || ifname.contains('%') { String::new() } else { ifname.to_string() };
-        if !want.is_empty() {
-            let bytes = want.as_bytes();
-            let n = bytes.len().min(IFNAMSIZ - 1);
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const libc::c_char, req.ifr_name.as_mut_ptr(), n);
-            }
-        }
-        let rc = unsafe { libc::ioctl(fd, TUNSETIFF as _, &mut req as *mut _) };
-        if rc < 0 {
-            let err = Error::last_os_error();
-            unsafe { libc::close(fd) };
-            if tap {
-                return Err(Error::new(err.kind(), format!("TAP ioctl failed: {} ({})", err, ANDROID_TAP_HELP)));
-            }
-            return Err(err);
-        }
-        let actual = unsafe { std::ffi::CStr::from_ptr(req.ifr_name.as_ptr()) }.to_string_lossy().into_owned();
-        if tap {
-            let mut mac = rand::random::<[u8; 6]>();
-            mac[0] = (mac[0] & 0xfe) | 0x02;
-            let _ = set_mac(&actual, mac);
-        }
-        let device = unsafe { SyncDevice::from_fd(fd as RawFd) }?;
-        device.set_nonblocking(true)?;
-        Ok((device, actual))
-    }
-
-    fn set_mac(ifname: &str, mac: [u8; 6]) -> io::Result<()> {
-        // SIOCSIFHWADDR
-        const SIOCSIFHWADDR: libc::c_ulong = 0x8924;
-        const ARPHRD_ETHER: libc::c_ushort = 1;
-        let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-        if sock < 0 {
-            return Err(Error::last_os_error());
-        }
-        let mut req: libc::ifreq = unsafe { mem::zeroed() };
-        let bytes = ifname.as_bytes();
-        let n = bytes.len().min(IFNAMSIZ - 1);
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const libc::c_char, req.ifr_name.as_mut_ptr(), n);
-            req.ifr_ifru.ifru_hwaddr.sa_family = ARPHRD_ETHER;
-            std::ptr::copy_nonoverlapping(mac.as_ptr(), req.ifr_ifru.ifru_hwaddr.sa_data.as_mut_ptr() as *mut u8, 6);
-        }
-        let rc = unsafe { libc::ioctl(sock, SIOCSIFHWADDR as _, &mut req as *mut _) };
-        unsafe { libc::close(sock) };
-        if rc < 0 {
-            Err(Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    pub fn run_ip(args: &[&str]) -> io::Result<()> {
-        let joined = args.join(" ");
-        let try_ip = Command::new("ip").args(args).status();
-        match try_ip {
-            Ok(s) if s.success() => return Ok(()),
-            _ => {}
-        }
-        let status = Command::new("su").args(["-c", &format!("ip {}", joined)]).status();
-        match status {
-            Ok(s) if s.success() => Ok(()),
-            Ok(s) => Err(Error::new(ErrorKind::Other, format!("ip {} failed: {:?}", joined, s.code()))),
-            Err(e) => Err(e)
-        }
-    }
-}
 
 impl TunTapDevice {
     /// Adopt a TUN file descriptor from Android `VpnService` or iOS Packet Tunnel.
@@ -655,11 +552,11 @@ impl TunTapDevice {
     pub fn new(ifname: &str, type_: Type, _device_path: Option<&str>) -> io::Result<Self> {
         #[cfg(target_os = "android")]
         {
-            if type_ == Type::Tap && !android_tun::has_access() {
+            if type_ == Type::Tap && !crate::android_tun::has_access() {
                 return Err(android_tap_needs_root());
             }
-            let (device, actual) = android_tun::create(ifname, type_ == Type::Tap, _device_path)?;
-            return Ok(Self {
+            let (device, actual) = crate::android_tun::create(ifname, type_ == Type::Tap, _device_path)?;
+            Ok(Self {
                 device: std::sync::Arc::new(device),
                 ifname: actual,
                 type_,
@@ -681,7 +578,7 @@ impl TunTapDevice {
                 split_pos: 0,
                 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 prefetch: None
-            });
+            })
         }
         #[cfg(target_os = "ios")]
         {
@@ -689,10 +586,10 @@ impl TunTapDevice {
             if type_ == Type::Tap {
                 return Err(io::Error::new(io::ErrorKind::Unsupported, IOS_TAP_HELP));
             }
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "On iOS, TUN must come from a Packet Tunnel Provider (--tun-fd). Direct utun creation is not allowed."
-            ));
+            ))
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
@@ -735,7 +632,13 @@ impl TunTapDevice {
             let device = builder.build_sync().map_err(|e| {
                 if e.kind() == io::ErrorKind::PermissionDenied {
                     #[cfg(windows)]
-                    let hint = "try running as Administrator; TUN needs wintun.dll, TAP needs tap-windows6";
+                    let hint = if type_ == Type::Tun {
+                        "TUN needs wintun.dll next to vpncloud.exe and Administrator; \
+                         re-run 'vpncloud install' to download it automatically"
+                    } else {
+                        "TAP needs the tap-windows6 driver and Administrator; \
+                         re-run 'vpncloud install' to download it automatically"
+                    };
                     #[cfg(not(windows))]
                     let hint = "try running as root/sudo";
                     io::Error::new(e.kind(), format!("Permission denied creating {} device ({}): {}", type_, hint, e))
@@ -841,7 +744,7 @@ impl TunTapDevice {
         }
         #[cfg(target_os = "android")]
         {
-            android_tun::run_ip(&["link", "set", "dev", &self.ifname, "mtu", &value.to_string()])
+            crate::android_tun::run_ip(&["link", "set", "dev", &self.ifname, "mtu", &value.to_string()])
         }
         #[cfg(target_os = "ios")]
         {
@@ -850,9 +753,7 @@ impl TunTapDevice {
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
-            self.device
-                .set_mtu(value as u16)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to set mtu: {}", e)))
+            self.device.set_mtu(value as u16).map_err(|e| io::Error::other(format!("Failed to set mtu: {}", e)))
         }
     }
 
@@ -863,17 +764,17 @@ impl TunTapDevice {
     pub fn configure_ip(&mut self, addr: IpAddr, netmask: Option<Ipv4Addr>, prefix_len: Option<u8>) -> io::Result<()> {
         #[cfg(target_os = "android")]
         {
-            android_tun::run_ip(&["link", "set", "dev", &self.ifname, "up"])?;
+            crate::android_tun::run_ip(&["link", "set", "dev", &self.ifname, "up"])?;
             match addr {
                 IpAddr::V4(ip) => {
                     let prefix = prefix_len.unwrap_or_else(|| {
                         netmask.map(|m| m.octets().iter().fold(0u8, |a, b| a + b.count_ones() as u8)).unwrap_or(24)
                     });
-                    android_tun::run_ip(&["addr", "add", &format!("{}/{}", ip, prefix), "dev", &self.ifname])
+                    crate::android_tun::run_ip(&["addr", "add", &format!("{}/{}", ip, prefix), "dev", &self.ifname])
                 }
                 IpAddr::V6(ip) => {
                     let prefix = prefix_len.unwrap_or(64);
-                    android_tun::run_ip(&["addr", "add", &format!("{}/{}", ip, prefix), "dev", &self.ifname])
+                    crate::android_tun::run_ip(&["addr", "add", &format!("{}/{}", ip, prefix), "dev", &self.ifname])
                 }
             }
         }
@@ -884,22 +785,20 @@ impl TunTapDevice {
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
-            self.device
-                .enabled(true)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Enable failed: {}", e)))?;
+            self.device.enabled(true).map_err(|e| io::Error::other(format!("Enable failed: {}", e)))?;
             match addr {
                 IpAddr::V4(ip) => {
                     let netmask =
                         netmask.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "IPv4 netmask required"))?;
                     self.device
                         .set_network_address(ip, netmask, None)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Set address failed: {}", e)))?;
+                        .map_err(|e| io::Error::other(format!("Set address failed: {}", e)))?;
                 }
                 IpAddr::V6(ip) => {
                     let prefix = prefix_len.unwrap_or(64);
                     self.device
                         .add_address_v6(ip, prefix)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Set IPv6 address failed: {}", e)))?;
+                        .map_err(|e| io::Error::other(format!("Set IPv6 address failed: {}", e)))?;
                 }
             }
             Ok(())
@@ -1047,10 +946,12 @@ impl TunTapDevice {
             }
         }
         match sent {
-            Ok(0) => Err(Error::DeviceIo(
-                "IO error when sending to device",
-                io::Error::new(io::ErrorKind::WouldBlock, "tun tx queue full")
-            )),
+            Ok(0) => {
+                Err(Error::DeviceIo(
+                    "IO error when sending to device",
+                    io::Error::new(io::ErrorKind::WouldBlock, "tun tx queue full")
+                ))
+            }
             Ok(n) => Ok(n),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted => {
                 Err(Error::DeviceIo("IO error when sending to device", e))
@@ -1062,9 +963,7 @@ impl TunTapDevice {
                         Ok(()) => {
                             wrote += 1;
                         }
-                        Err(Error::DeviceIo(_, ref err))
-                            if wrote > 0 && err.kind() == io::ErrorKind::WouldBlock =>
-                        {
+                        Err(Error::DeviceIo(_, ref err)) if wrote > 0 && err.kind() == io::ErrorKind::WouldBlock => {
                             return Ok(wrote);
                         }
                         Err(err) => return Err(err)
@@ -1138,6 +1037,46 @@ impl Device for TunTapDevice {
         &self.ifname
     }
 
+    fn configure_local_addresses(&mut self, addresses: &[String]) {
+        #[cfg(target_os = "linux")]
+        {
+            for s in addresses {
+                if let Ok(ip) = s.parse::<std::net::Ipv4Addr>() {
+                    if let Err(e) = self.device.add_address_v4(ip, 32) {
+                        log::warn!("Failed to add local overlay address {}: {}", ip, e);
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "android")]
+        {
+            for s in addresses {
+                if let Ok(ip) = s.parse::<std::net::Ipv4Addr>() {
+                    let _ = crate::android_tun::run_ip(&["addr", "add", &format!("{}/32", ip), "dev", &self.ifname]);
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            if !addresses.is_empty() {
+                log::warn!("Additional local overlay addresses need manual configuration via ifup on this platform");
+            }
+        }
+    }
+
+    fn mac_address(&self) -> [u8; 6] {
+        // Android VpnService and iOS Packet Tunnel are TUN-only; tun-rs has
+        // no MAC accessor for their devices.
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            self.device.mac_address().unwrap_or([0x02, 0, 0, 0, 0, 1])
+        }
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        {
+            [0x02, 0, 0, 0, 0, 1]
+        }
+    }
+
     fn max_gso_payload(&self) -> usize {
         self.max_gso
     }
@@ -1204,10 +1143,10 @@ impl Device for TunTapDevice {
                 }
                 return Ok(());
             }
-            return Err(Error::DeviceIo(
+            Err(Error::DeviceIo(
                 "IO error when reading from device",
                 io::Error::new(io::ErrorKind::WouldBlock, "no TAP/TUN packet queued")
-            ));
+            ))
         }
         #[cfg(not(windows))]
         let buf = buffer.buffer();
@@ -1238,6 +1177,8 @@ impl Device for TunTapDevice {
     }
 
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    // Parallel scratch arrays are indexed together on the hot read path.
+    #[allow(clippy::needless_range_loop)]
     fn read_batch(&mut self, bufs: &mut [crate::util::MsgBuffer]) -> Result<usize, Error> {
         if !self.tun_offload || bufs.is_empty() {
             let mut n = 0;
@@ -1319,7 +1260,7 @@ impl Device for TunTapDevice {
     fn tun_prefetch_pending(&self) -> bool {
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
-            return self.prefetch.as_ref().is_some_and(|prefetch| prefetch.pending());
+            self.prefetch.as_ref().is_some_and(|prefetch| prefetch.pending())
         }
         #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         false
@@ -1461,275 +1402,6 @@ impl Device for TunTapDevice {
 
 /// Fill `hdr_len` from the transport header. The kernel sometimes reports the
 /// first segment's full length here, which makes `gso_split` emit one giant packet.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn tune_gso_hdr(meta: &mut GsoMeta, pkt: &[u8]) {
-    let kind = meta.gso_type & !0x80;
-    if kind == crate::gso::GSO_UDP_L4 {
-        meta.hdr_len = meta.csum_start.saturating_add(8);
-        return;
-    }
-    let cs = meta.csum_start as usize;
-    if pkt.len() <= cs + 12 {
-        return;
-    }
-    let tcp_hlen = ((pkt[cs + 12] as u16) >> 4) * 4;
-    if (20..=60).contains(&tcp_hlen) {
-        meta.hdr_len = meta.csum_start.saturating_add(tcp_hlen);
-    }
-}
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn tun_tx_ready(fd: RawFd) -> bool {
-    let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
-    unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
-}
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-struct TunSendScratch {
-    iov: Vec<libc::iovec>,
-    hdrs: Vec<libc::mmsghdr>
-}
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-thread_local! {
-    static TUN_SEND: RefCell<TunSendScratch> =
-        RefCell::new(TunSendScratch { iov: Vec::new(), hdrs: Vec::new() });
-}
-
-/// Driver queue in front of the TUN reader. The kernel default of 500 packets
-/// is about 6 ms, and a stall longer than that is dropped after the qdisc has
-/// counted the datagrams as sent. 2048 still dropped on the order of a
-/// thousand datagrams in one 30s run. 16384 absorbs that stall.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-pub(crate) const TUN_TXQUEUELEN: u32 = 16_384;
-
-/// Raise the TUN transmit ring. Failure leaves the kernel default in place.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-pub(crate) fn widen_tx_queue(ifname: &str) {
-    let qlen = TUN_TXQUEUELEN.to_string();
-    match std::process::Command::new("ip").args(["link", "set", "dev", ifname, "txqueuelen", &qlen]).status() {
-        Ok(status) if status.success() => info!("Set txqueuelen {qlen} on {ifname}"),
-        Ok(status) => info!("Could not set txqueuelen on {ifname} ({status})"),
-        Err(err) => info!("Could not set txqueuelen on {ifname}: {err}")
-    }
-}
-
-/// Datagrams per TUN inject. Eight inner packets are about 11 KiB. A
-/// sixteen-packet chunk still left 0.03–0.1% of a 30s run on the floor.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-pub(crate) const UDP_INJECT_CHUNK: usize = 8;
-
-/// Airtime of one inner UDP packet at the shaped underlay rate (~995 Mbit/s
-/// of a 1500-byte frame). Short batches are this long per datagram. A fixed
-/// chunk gap never ran: most injects are shorter than a chunk, and an empty
-/// queue used to cancel the wait.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-pub(crate) const UDP_INJECT_PACKET_NS: u64 = 12_000;
-
-/// Upper bound on one inject wait. One chunk of packets.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-pub(crate) const UDP_INJECT_GAP_NS: u64 = UDP_INJECT_PACKET_NS * UDP_INJECT_CHUNK as u64;
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn sleep_ns(ns: u64) {
-    let ts = libc::timespec { tv_sec: 0, tv_nsec: ns as libc::c_long };
-    while unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) } == -1
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
-    {}
-}
-
-/// Burn the rest of an inject gap. A readable underlay socket must not cut
-/// this short: the caller reads at most one chunk, then holds the remainder.
-///
-/// A relative `nanosleep` wakes up to the thread's timer slack (50 µs) late
-/// and that extra wait filled the underlay socket. Spinning the whole gap
-/// kept the deadline but held a core, so iperf's socket overflowed. Sleep
-/// until just before the deadline, then spin the rest: the sleep yields, and
-/// the spin absorbs the few microseconds `clock_nanosleep` runs long.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-pub(crate) fn hold_udp_inject_gap(ns: u64) {
-    if ns == 0 {
-        return;
-    }
-    let ns = ns.min(UDP_INJECT_GAP_NS);
-    let Some(start) = crate::net::mono_now() else {
-        sleep_ns(ns);
-        return;
-    };
-    let end = start.saturating_add(ns);
-    // Measured overshoot of an absolute sleep here is about 2 µs. Leave
-    // 20 µs so a late wake still finishes on the deadline.
-    const SPIN_TAIL_NS: u64 = 20_000;
-    let sleep_at = end.saturating_sub(SPIN_TAIL_NS);
-    if crate::net::mono_now().unwrap_or(end) < sleep_at {
-        precise_timer_slack();
-        let ts = libc::timespec {
-            tv_sec: (sleep_at / 1_000_000_000) as libc::time_t,
-            tv_nsec: (sleep_at % 1_000_000_000) as libc::c_long
-        };
-        loop {
-            let rc =
-                unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut()) };
-            if rc != libc::EINTR {
-                break;
-            }
-        }
-    }
-    while crate::net::mono_now().unwrap_or(end) < end {
-        std::hint::spin_loop();
-    }
-}
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn precise_timer_slack() {
-    thread_local! {
-        static SET: Cell<bool> = const { Cell::new(false) };
-    }
-    SET.with(|set| {
-        if set.get() {
-            return;
-        }
-        set.set(true);
-        unsafe {
-            libc::prctl(libc::PR_SET_TIMERSLACK, 1, 0, 0, 0);
-        }
-    });
-}
-
-/// A TUN fd is a character device. `sendmmsg` returns `ENOTSOCK` every time,
-/// so remember that and skip the syscall. The caller writes one datagram each.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-static TUN_SENDMMSG: AtomicBool = AtomicBool::new(true);
-
-/// One TUN message per datagram. The virtio header, when present, is already
-/// in the buffer. `sendmmsg` stops at the first packet the queue will not take.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn tun_sendmmsg(fd: RawFd, bufs: &mut [crate::util::MsgBuffer]) -> io::Result<usize> {
-    if !TUN_SENDMMSG.load(Ordering::Relaxed) {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "tun is not a socket"));
-    }
-    TUN_SEND.with(|cell| {
-        let scratch = &mut *cell.borrow_mut();
-        let n = bufs.len();
-        scratch.iov.resize(n, libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 });
-        scratch.hdrs.resize_with(n, || unsafe { std::mem::zeroed() });
-        let iov = scratch.iov.as_mut_ptr();
-        let hdrs = scratch.hdrs.as_mut_ptr();
-        for i in 0..n {
-            let msg = bufs[i].message();
-            unsafe {
-                *iov.add(i) = libc::iovec { iov_base: msg.as_ptr() as *mut _, iov_len: msg.len() };
-                let mut msg_hdr: libc::msghdr = std::mem::zeroed();
-                msg_hdr.msg_iov = iov.add(i);
-                msg_hdr.msg_iovlen = 1;
-                let mut packed: libc::mmsghdr = std::mem::zeroed();
-                packed.msg_hdr = msg_hdr;
-                *hdrs.add(i) = packed;
-            }
-        }
-        let got = unsafe { libc::sendmmsg(fd, hdrs, n as u32, libc::MSG_DONTWAIT as _) };
-        if got < 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOTSOCK) {
-                TUN_SENDMMSG.store(false, Ordering::Relaxed);
-            }
-            Err(err)
-        } else {
-            Ok(got as usize)
-        }
-    })
-}
-
-/// Count virtio GSO trains. `gso_type` is set only when segments were merged.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn note_gro_batch(bufs: &[crate::util::MsgBuffer]) {
-    static FLUSHES: AtomicU64 = AtomicU64::new(0);
-    static MERGED: AtomicU64 = AtomicU64::new(0);
-    static SUM_SEGS: AtomicU64 = AtomicU64::new(0);
-    static MAX_SEGS: AtomicUsize = AtomicUsize::new(0);
-    let flush = FLUSHES.fetch_add(1, Ordering::Relaxed) + 1;
-    // Walking every virtio header on every train showed up on the TCP path.
-    // Sample one train in 4000; the log line is the only consumer.
-    if flush % 4000 != 0 {
-        return;
-    }
-    let mut merged_here = 0u64;
-    let mut segs_here = 0u64;
-    let mut max_here = 0usize;
-    for b in bufs {
-        let msg = b.message();
-        if msg.len() < VIRTIO_NET_HDR_LEN || msg[1] == 0 {
-            continue;
-        }
-        let hdr_len = u16::from_le_bytes([msg[2], msg[3]]) as usize;
-        let gso_size = u16::from_le_bytes([msg[4], msg[5]]) as usize;
-        if gso_size == 0 {
-            continue;
-        }
-        let payload = msg.len().saturating_sub(VIRTIO_NET_HDR_LEN).saturating_sub(hdr_len);
-        let segs = payload / gso_size + usize::from(payload % gso_size != 0);
-        if segs >= 2 {
-            merged_here += 1;
-            segs_here += segs as u64;
-            max_here = max_here.max(segs);
-        }
-    }
-    let merged = MERGED.fetch_add(merged_here, Ordering::Relaxed) + merged_here;
-    let segs_sum = SUM_SEGS.fetch_add(segs_here, Ordering::Relaxed) + segs_here;
-    let mut max_segs = MAX_SEGS.load(Ordering::Relaxed);
-    while max_here > max_segs {
-        match MAX_SEGS.compare_exchange_weak(max_segs, max_here, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => {
-                max_segs = max_here;
-                break;
-            }
-            Err(cur) => max_segs = cur
-        }
-    }
-    if flush % 4000 == 0 {
-        info!("TUN gso flushes={flush} merged={merged} segs={segs_sum} max_segs={max_segs}");
-    }
-}
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-struct MsgVirtio<'a>(&'a mut crate::util::MsgBuffer);
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-impl AsRef<[u8]> for MsgVirtio<'_> {
-    fn as_ref(&self) -> &[u8] {
-        self.0.message()
-    }
-}
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-impl AsMut<[u8]> for MsgVirtio<'_> {
-    fn as_mut(&mut self) -> &mut [u8] {
-        self.0.message_mut()
-    }
-}
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-impl ExpandBuffer for MsgVirtio<'_> {
-    fn buf_capacity(&self) -> usize {
-        self.0.remaining_capacity()
-    }
-
-    fn buf_resize(&mut self, new_len: usize, value: u8) {
-        let old = self.0.len();
-        self.0.set_length(new_len.min(self.0.remaining_capacity()));
-        if self.0.len() > old {
-            self.0.message_mut()[old..].fill(value);
-        }
-    }
-
-    fn buf_extend_from_slice(&mut self, src: &[u8]) {
-        let old = self.0.len();
-        let add = src.len().min(self.0.remaining_capacity().saturating_sub(old));
-        self.0.set_length(old + add);
-        self.0.message_mut()[old..].copy_from_slice(&src[..add]);
-    }
-}
-
 impl io::Read for TunTapDevice {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // Delegate to underlying tun device recv impl
@@ -1780,6 +1452,9 @@ impl crate::poll::Pollable for TunTapDevice {
 impl crate::poll::Pollable for MockDevice {}
 
 // MockDevice remains the same but implements the MsgBuffer read/write used by the cloud.
+/// A plain packet with an optional virtio partial-checksum descriptor.
+type PlainPacket = (Option<(u16, u16)>, Vec<u8>);
+
 pub struct MockDevice {
     inbound: VecDeque<Vec<u8>>,
     outbound: VecDeque<Vec<u8>>,
@@ -1787,7 +1462,7 @@ pub struct MockDevice {
     gso_out: VecDeque<GsoMeta>,
     /// Plain packets produced by [`MockDevice::read_offload`], with an optional
     /// virtio partial checksum `(csum_start, csum_offset)`.
-    plain_in: VecDeque<(Option<(u16, u16)>, Vec<u8>)>,
+    plain_in: VecDeque<PlainPacket>,
     /// Set when this call already returned a packet, so the next empty read is
     /// [`OffloadRead::Blocked`] rather than falling through into `read_batch`.
     offload_yielded: bool,
@@ -2179,7 +1854,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no qlen in {text}"))
             .parse::<u32>()
             .unwrap_or_else(|e| panic!("qlen in {text}: {e}"));
-        assert_eq!(qlen, super::TUN_TXQUEUELEN, "{text}");
+        assert_eq!(qlen, crate::tun_linux::TUN_TXQUEUELEN, "{text}");
     }
 
     /// Two in-order TCP segments must become one TUN write. Separate writes
@@ -2492,9 +2167,8 @@ mod tests {
         assert!(up.success(), "link up");
         let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", "0");
         let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{name}/rp_filter"), "0");
-        let payloads: Vec<Vec<u8>> = (0..5)
-            .map(|i| format!("prefetch-datagram-{i:02}-{}", "0123456789abcdef".repeat(3)).into_bytes())
-            .collect();
+        let payloads: Vec<Vec<u8>> =
+            (0..5).map(|i| format!("prefetch-datagram-{i:02}-{}", "0123456789abcdef".repeat(3)).into_bytes()).collect();
         let sock = std::net::UdpSocket::bind("10.250.0.1:9").expect("bind");
         for payload in &payloads {
             let sent = sock.send_to(payload, "10.250.0.2:9").expect("send_to");

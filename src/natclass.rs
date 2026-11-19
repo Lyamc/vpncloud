@@ -70,13 +70,13 @@ pub fn observe_one_endpoint(symmetric: bool) -> io::Result<EndpointObservation> 
         let mut buf = [0u8; 16];
         let (n, src) = ext.recv_from(&mut buf)?;
         if src.port() != internal_port || buf[..n] != token {
-            return Err(io::Error::new(io::ErrorKind::Other, "traffic did not come from the one internal endpoint"));
+            return Err(io::Error::other("traffic did not come from the one internal endpoint"));
         }
         ext.send_to(&buf[..n], dests[i].local_addr()?)?;
         let (_, seen) = dests[i].recv_from(&mut buf)?;
         mapped_ports.push(seen.port());
     }
-    let kind = classify(&mapped_ports).map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    let kind = classify(&mapped_ports).map_err(io::Error::other)?;
     Ok(EndpointObservation { internal_port, mapped_ports, kind })
 }
 

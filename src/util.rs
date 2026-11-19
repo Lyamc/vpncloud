@@ -2,13 +2,15 @@
 // Copyright (C) 2015-2021  Dennis Schwerdel
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
+#[cfg(unix)] use std::thread;
 use std::{
     fmt,
     net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
+    path::PathBuf,
     process::{self, Command},
     sync::{
         atomic::{AtomicBool, AtomicIsize, Ordering},
-        Arc
+        Arc, Mutex
     },
     time::Instant
 };
@@ -133,6 +135,17 @@ impl Clone for MsgBuffer {
 
 const HEX_CHARS: &[u8] = b"0123456789abcdef";
 
+/// Decode a hex string into bytes (used for node ids in config).
+pub fn from_hex(text: &str) -> Result<Vec<u8>, crate::error::NoDetail> {
+    if !text.len().is_multiple_of(2) {
+        return Err(crate::error::NoDetail);
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|_| crate::error::NoDetail))
+        .collect()
+}
+
 pub fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
@@ -241,18 +254,33 @@ pub fn get_internal_ip() -> Ipv4Addr {
 
 /// Detach from the controlling terminal (Unix `--daemon`).
 ///
-/// Uses `libc::daemon` instead of the unmaintained `daemonize` crate (#394).
-/// `daemon(3)` is deprecated on macOS but still the portable POSIX helper.
+/// Implemented with fork/setsid rather than `daemon(3)`: the latter is
+/// deprecated and was removed from newer `libc` releases on macOS.
 #[cfg(unix)]
-#[allow(deprecated)]
 pub fn unix_daemonize() -> io::Result<()> {
-    // nochdir=0: chdir to /; noclose=0: redirect stdin/stdout/stderr to /dev/null.
-    let rc = unsafe { libc::daemon(0, 0) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    unsafe {
+        match libc::fork() {
+            -1 => return Err(io::Error::last_os_error()),
+            0 => {}
+            _ => process::exit(0) // parent exits, child continues
+        }
+        if libc::setsid() == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::chdir(c"/".as_ptr()) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if devnull >= 0 {
+            for fd in [0, 1, 2] {
+                libc::dup2(devnull, fd);
+            }
+            if devnull > 2 {
+                libc::close(devnull);
+            }
+        }
     }
+    Ok(())
 }
 
 #[allow(unknown_lints, clippy::needless_pass_by_value)]
@@ -309,7 +337,39 @@ impl fmt::Display for Bytes {
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
+static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+static RELOAD_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 static FAIL_PANICS: AtomicBool = AtomicBool::new(false);
+/// Opt-in hex dump of wire messages (set by `--wire-log`).
+static WIRE_LOG: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable the wire hex dump. Off by default: dumps can expose payload
+/// contents and are written to the log file.
+pub fn set_wire_log(enabled: bool) {
+    WIRE_LOG.store(enabled, Ordering::Relaxed);
+}
+
+pub fn wire_log_enabled() -> bool {
+    WIRE_LOG.load(Ordering::Relaxed)
+}
+
+/// Emit a bounded hex dump of a wire message when `--wire-log` is enabled.
+/// `data` is the decrypted payload (or the plaintext before encryption).
+pub fn wire_log(direction: &str, peer: crate::util::SocketAddr, type_: u8, data: &[u8]) {
+    if !wire_log_enabled() {
+        return;
+    }
+    const MAX_DUMP: usize = 64;
+    let end = data.len().min(MAX_DUMP);
+    log::trace!(
+        "WIRE {} {} type={} len={} {}",
+        direction,
+        addr_nice(peer),
+        type_,
+        data.len(),
+        bytes_to_hex(&data[..end])
+    );
+}
 
 /// When true, `fail!` panics the current thread instead of exiting the process.
 /// Used by the GUI worker so a TUN error does not kill the window.
@@ -353,6 +413,28 @@ impl CtrlC {
         PAUSED.load(Ordering::Relaxed)
     }
 
+    /// Ask the datapath to reload policy config (used by tray menus on
+    /// platforms without SIGHUP).
+    pub fn request_reload() {
+        RELOAD_REQUESTED.store(true, Ordering::Relaxed);
+    }
+
+    /// True once if SIGHUP was received (clears the flag).
+    pub fn reload_requested() -> bool {
+        RELOAD_REQUESTED.swap(false, Ordering::Relaxed)
+    }
+
+    /// Remember the config path so the datapath can reload it on SIGHUP.
+    pub fn set_reload_path(path: PathBuf) {
+        if let Ok(mut guard) = RELOAD_PATH.lock() {
+            *guard = Some(path);
+        }
+    }
+
+    pub fn reload_path() -> Option<PathBuf> {
+        RELOAD_PATH.lock().ok().and_then(|guard| guard.clone())
+    }
+
     pub fn was_pressed(&mut self) -> bool {
         self.flag.swap(false, Ordering::Relaxed) || STOP_REQUESTED.swap(false, Ordering::Relaxed)
     }
@@ -366,6 +448,18 @@ impl Default for CtrlC {
         {
             let _ = flag::register(SIGTERM, Arc::clone(&flag));
             let _ = flag::register(SIGQUIT, Arc::clone(&flag));
+            // SIGHUP asks for a config reload (peers, ACL, grants, routes).
+            let reload = Arc::new(AtomicBool::new(false));
+            if flag::register(libc::SIGHUP, Arc::clone(&reload)).is_ok() {
+                thread::spawn(move || {
+                    while !STOP_REQUESTED.load(Ordering::Relaxed) {
+                        thread::sleep(std::time::Duration::from_millis(200));
+                        if reload.swap(false, Ordering::Relaxed) {
+                            RELOAD_REQUESTED.store(true, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
         }
         Self { flag }
     }
@@ -388,7 +482,7 @@ impl TimeSource for SystemTimeSource {
 }
 
 thread_local! {
-    static MOCK_TIME: AtomicIsize = AtomicIsize::new(0);
+    static MOCK_TIME: AtomicIsize = const { AtomicIsize::new(0) };
 }
 
 #[derive(Clone, Copy)]
@@ -442,6 +536,19 @@ pub fn to_base62(data: &[u8]) -> String {
         result.push(BASE62[*b as usize]);
     }
     result
+}
+
+/// Decode a fixed-size value from base62, restoring leading zero bytes that
+/// `to_base62` omits. Without this, roughly 1 in 256 generated keys (and 1 in
+/// 256 signatures) round-trips to the wrong length and is rejected.
+pub fn from_base62_fixed<const N: usize>(data: &str) -> Result<[u8; N], char> {
+    let bytes = from_base62(data)?;
+    if bytes.len() > N {
+        return Err('\0');
+    }
+    let mut out = [0u8; N];
+    out[N - bytes.len()..].copy_from_slice(&bytes);
+    Ok(out)
 }
 
 pub fn from_base62(data: &str) -> Result<Vec<u8>, char> {
@@ -527,4 +634,23 @@ fn base62() {
     assert_eq!(vec![62], from_base62("10").unwrap());
     assert_eq!(vec![1, 0], from_base62("48").unwrap());
     assert_eq!(b"Test".to_vec(), from_base62("1Xp7Ke").unwrap());
+}
+
+#[test]
+fn base62_fixed_roundtrips_leading_zeroes() {
+    // to_base62 drops leading zero bytes, so a naive from_base62 roundtrip of a
+    // 32-byte key with leading zeroes yields the wrong length. The fixed-size
+    // decoder must restore them.
+    assert_eq!(from_base62_fixed::<32>(&to_base62(&[0u8; 32])), Ok([0u8; 32]));
+    assert_eq!(from_base62_fixed::<32>(&to_base62(&[0u8; 31])), Ok([0u8; 32]));
+    let mut one = [0u8; 32];
+    one[31] = 1;
+    assert_eq!(from_base62_fixed::<32>(&to_base62(&one)), Ok(one));
+
+    // Exercise many random values, including ones with leading zeroes.
+    for _ in 0..5000 {
+        let value: [u8; 32] = rand::random();
+        let encoded = to_base62(&value);
+        assert_eq!(from_base62_fixed::<32>(&encoded), Ok(value), "roundtrip failed for {encoded}");
+    }
 }

@@ -16,6 +16,8 @@ pub const WIN_SERVICE: &str = "VpnCloud";
 pub const WIN_DISPLAY: &str = "VpnCloud P2P VPN";
 pub const WIN_DESC: &str = "Peer-to-peer mesh VPN over UDP.";
 pub const MAC_LABEL: &str = "ca.witherow.vpncloud";
+/// User-session LaunchAgent that shows the menu bar icon for the system service.
+pub const MAC_TRAY_LABEL: &str = "ca.witherow.vpncloud.tray";
 pub const BSD_LABEL: &str = "vpncloud";
 pub const LINUX_TEMPLATE: &str = "vpncloud@";
 pub const LINUX_WSPROXY: &str = "vpncloud-wsproxy";
@@ -158,6 +160,38 @@ mod manager {
         let mgr = LaunchdServiceManager::system();
         mgr.uninstall(ServiceUninstallCtx { label: label(MAC_LABEL) })
             .map_err(|e| map_err("Failed to uninstall LaunchDaemon", e))
+    }
+
+    /// LaunchAgent plist for the user-session menu bar application. It starts
+    /// at login; `KeepAlive` is intentionally absent so choosing Quit in the
+    /// menu leaves the icon gone until the next login.
+    pub fn tray_agent_plist(program: &Path, config: &Path) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{}</string>
+		<string>--tray</string>
+		<string>--tray-controls-service</string>
+		<string>--config</string>
+		<string>{}</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+</dict>
+</plist>
+"#,
+            MAC_TRAY_LABEL,
+            program.display(),
+            config.display()
+        )
     }
 
     fn rcd_script(program: &Path, config: &Path) -> String {
@@ -323,6 +357,21 @@ run_rc_command "$1"
             assert!(plist.contains("/etc/vpncloud/vpncloud.yaml"));
             assert!(plist.contains("KeepAlive"));
             assert!(!plist.contains("Disabled"));
+        }
+
+        #[test]
+        fn tray_agent_plist_runs_tray_with_service_control() {
+            let plist = tray_agent_plist(
+                Path::new("/usr/local/bin/vpncloud"),
+                Path::new("/usr/local/etc/vpncloud/vpncloud.yaml")
+            );
+            assert!(plist.contains(MAC_TRAY_LABEL));
+            assert!(plist.contains("--tray"));
+            assert!(plist.contains("--tray-controls-service"));
+            assert!(plist.contains("--config"));
+            assert!(plist.contains("/usr/local/etc/vpncloud/vpncloud.yaml"));
+            assert!(plist.contains("RunAtLoad"));
+            assert!(!plist.contains("KeepAlive"));
         }
 
         #[test]

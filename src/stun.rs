@@ -116,15 +116,9 @@ fn parse_mapped(val: &[u8], txid: &[u8; 12], xored: bool) -> Option<SocketAddr> 
 pub fn resolve_stun_servers(servers: &[String]) -> Vec<SocketAddr> {
     let mut out = Vec::new();
     for s in servers {
-        let host = if s.contains(']') || s.rfind(':').map(|i| s.as_bytes()[..i].contains(&b'.')).unwrap_or(false) {
-            s.clone()
-        } else if s.contains(':') && s.parse::<SocketAddr>().is_ok() {
-            s.clone()
-        } else if !s.contains(':') {
-            format!("{}:3478", s)
-        } else {
-            s.clone()
-        };
+        // Only bare hostnames need the default port; anything containing a
+        // colon (or a bracketed IPv6 literal) is already a full address.
+        let host = if !s.contains(':') && !s.contains(']') { format!("{}:3478", s) } else { s.clone() };
         match resolve(&host) {
             Ok(addrs) => {
                 if let Some(a) = addrs.into_iter().next() {

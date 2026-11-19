@@ -1,5 +1,8 @@
 # Datapath: bandwidth left on the table
 
+> Historical roadmap. All items below are complete or superseded. Current work is
+> tracked in `CHANGELOG.md` under Unreleased.
+
 vpn-bench (Dec 2025, **upstream** VpnCloud) saw ~413 Mbps TCP receive vs ~810–850 for WireGuard/Tailscale, with send 539 / receive 413 and hundreds of retransmits. That is a drain problem, not crypto.
 
 This list is the remaining work. Skipped items stay skipped (product shape).
@@ -30,7 +33,7 @@ After a UDP batch, decrypted DATA is written to TUN one-by-one. Queue and `send_
 Keep tests at 0. Production defaults to extra cores minus one, capped at 4 (one fat TCP flow still serializes on per-peer nonces; extra workers help with many peers).
 
 ### 6. `aws-lc-rs` instead of `ring` (Linux AES-GCM)
-Optional `--features aws-lc`. Possible tens of percent on AES-only bulk. ChaCha20 would not care. Noise still uses `ring` via `snow`.
+Superseded: crypto is now pure Rust (`aes-gcm`, `chacha20poly1305`, `ed25519-dalek`, `x25519-dalek`), and `ring`/AWS-LC were removed along with the `aws-lc` feature. Kept here for history only.
 
 ## Out of product shape (do not do)
 
@@ -47,4 +50,4 @@ Optional `--features aws-lc`. Possible tens of percent on AES-only bulk. ChaCha2
 | 3 | Linux TUN offload + `recv_multiple` | done (TUN `offload(true)` + `read_batch`) |
 | 4 | Linux TUN `send_multiple` after UDP batch | done (`tun_out` queue + `write_batch` with virtio header offset) |
 | 5 | Crypto-thread default | done (tests 0; otherwise extra cores-1, cap 4) |
-| 6 | aws-lc-rs | done (`--features aws-lc`; ring remains default) |
+| 6 | aws-lc-rs | superseded by pure-Rust crypto (no C dependency, no `aws-lc` feature) |

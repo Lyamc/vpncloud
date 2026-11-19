@@ -29,7 +29,7 @@
 //
 // The whole communication is sent via the crypto stream and is therefore encrypted and protected against tampering.
 
-use super::{EcdhPrivateKey, EcdhPublicKey, Key};
+use super::{EcdhPrivateKey, EcdhPublicKey, Key, ECDH_PUBLIC_KEY_LEN};
 use crate::{error::Error, util::MsgBuffer};
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use smallvec::{smallvec, SmallVec};
@@ -46,11 +46,17 @@ impl RotationMessage {
     pub fn read_from<R: Read>(mut r: R) -> Result<Self, io::Error> {
         let message_id = r.read_u64::<NetworkEndian>()?;
         let key_len = r.read_u8()? as usize;
+        if key_len != ECDH_PUBLIC_KEY_LEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid ECDH proposal key length"));
+        }
         let mut key_data = smallvec![0; key_len];
         r.read_exact(&mut key_data)?;
         let propose = EcdhPublicKey::new(key_data);
         let key_len = r.read_u8()? as usize;
         let confirm = if key_len > 0 {
+            if key_len != ECDH_PUBLIC_KEY_LEN {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid ECDH confirmation key length"));
+            }
             let mut key_data = smallvec![0; key_len];
             r.read_exact(&mut key_data)?;
             Some(EcdhPublicKey::new(key_data))
@@ -128,11 +134,12 @@ impl RotationState {
         EcdhPublicKey::new(vec)
     }
 
-    fn derive_key(private_key: EcdhPrivateKey, public_key: EcdhPublicKey) -> Key {
-        let shared = private_key.agree(public_key.bytes()).unwrap();
+    fn derive_key(private_key: EcdhPrivateKey, public_key: EcdhPublicKey) -> Option<Key> {
+        let mut shared = private_key.agree(public_key.bytes()).ok()?;
         let mut vec = Key::new();
         vec.extend_from_slice(&shared);
-        vec
+        super::prim::zeroize_bytes(&mut shared);
+        Some(vec)
     }
 
     pub fn handle_message(&mut self, msg: &[u8]) -> Result<Option<RotatedKey>, Error> {
@@ -149,12 +156,12 @@ impl RotationState {
         self.timeout = false;
         // Create key from proposal and store reply as pending
         let (private_key, public_key) = Self::create_key();
-        let key = Self::derive_key(private_key, msg.propose);
+        let key = Self::derive_key(private_key, msg.propose)?;
         self.pending = Some((key, public_key));
         // If proposed key has been confirmed, derive and use key
         if let Some(peer_key) = msg.confirm {
             if let Some(private_key) = self.proposed.take() {
-                let key = Self::derive_key(private_key, peer_key);
+                let key = Self::derive_key(private_key, peer_key)?;
                 return Some(RotatedKey { key, id: msg.message_id, use_for_sending: true });
             }
         }
@@ -236,6 +243,24 @@ mod tests {
         assert_eq!(msg.message_id, msg2.message_id);
         assert_eq!(msg.propose.bytes(), msg2.propose.bytes());
         assert_eq!(msg.confirm.map(|v| v.bytes().to_vec()), msg2.confirm.map(|v| v.bytes().to_vec()));
+    }
+
+    #[test]
+    fn test_malformed_key_lengths_are_rejected() {
+        // Signed/encrypted in transit, but parsing must reject bad lengths
+        // rather than letting a later `agree()` panic.
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u64.to_be_bytes());
+        data.push(31);
+        data.extend(std::iter::repeat(0u8).take(31));
+        assert!(RotationMessage::read_from(Cursor::new(&data)).is_err());
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u64.to_be_bytes());
+        data.push(32);
+        data.extend(std::iter::repeat(0u8).take(32));
+        data.push(33);
+        assert!(RotationMessage::read_from(Cursor::new(&data)).is_err());
     }
 
     #[test]

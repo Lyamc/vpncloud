@@ -173,7 +173,7 @@ impl<TS: TimeSource> BeaconSerializer<TS> {
         pos += 2;
         let v4count = data[pos] as usize;
         pos += 1;
-        if v4count * 6 > data.len() - pos || (data.len() - pos - v4count * 6) % 18 > 0 {
+        if v4count * 6 > data.len() - pos || !(data.len() - pos - v4count * 6).is_multiple_of(18) {
             return peers;
         }
         for _ in 0..v4count {
@@ -228,7 +228,7 @@ impl<TS: TimeSource> BeaconSerializer<TS> {
         let data = self.peerlist_encode(peers);
         let end = self.end();
         let beacon = format!("{}{}{}", begin, data, end);
-        debug!("Calling beacon command: {}", cmd);
+        debug!("Calling beacon command");
         let process = Command::new("sh")
             .args(["-c", cmd])
             .env("begin", begin)
@@ -281,7 +281,7 @@ impl<TS: TimeSource> BeaconSerializer<TS> {
     pub fn read_from_cmd(&self, cmd: &str, ttl_hours: Option<u16>) -> Result<(), io::Error> {
         let begin = self.begin();
         let end = self.end();
-        debug!("Calling beacon command: {}", cmd);
+        debug!("Calling beacon command");
         let process = Command::new("sh")
             .args(["-c", cmd])
             .env("begin", begin)

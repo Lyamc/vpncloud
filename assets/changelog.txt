@@ -1,3 +1,17 @@
+vpncloud (2.7.0-alpha.1) alpha; urgency=medium
+
+ * [added] Mixed TAP/TUN meshes with capability-gated wire formats, an L2/L3
+   bridge, local ARP proxy and stable per-IP synthetic MACs.
+ * [added] Per-peer abuse throttling, gossiped link quality with a suggested
+   relay, bounded/malicious-report resistance and sticky relay selection.
+ * [added] Multiple local overlay addresses, optional kernel route installation,
+   per-peer hop counts for relay/flood frames, and SIGHUP-reloadable claims.
+ * [added] Full settings GUI, macOS .dmg, opt-in wire logging and a one-command
+   `mask check` quality gate.
+ * [changed] Zero clippy warnings on every supported target.
+
+ -- Lyam Witherow <lyam@witherow.ca>  Thu, 19 Nov 2026 09:00:00 -0600
+
 vpncloud (2.6.0) stable; urgency=medium
 
  * [added] Opt-in QUIC, multipath, multi-queue TUN, in-process TCP, and switchable tunnel compression. Default UDP frames stay the same.

@@ -6,6 +6,20 @@ use thiserror::Error;
 
 use std::io;
 
+/// Failure with no additional detail. Used by primitives where the caller
+/// only needs success vs. failure; a named type keeps `Result` signatures
+/// self-documenting instead of leaking `()` into the public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NoDetail;
+
+impl std::fmt::Display for NoDetail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(formatter, "operation failed")
+    }
+}
+
+impl std::error::Error for NoDetail {}
+
 #[derive(Error, Debug)]
 pub enum Error {
     /// Crypto init error, this is recoverable

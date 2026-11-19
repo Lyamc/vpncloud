@@ -45,12 +45,38 @@ fn set_error(msg: &str) -> c_int {
     -1
 }
 
-/// Last error from `vpncloud_start`, or null.
+/// Last error from `vpncloud_start`, or null. The returned string is a heap
+/// copy that stays valid across later calls; release it with
+/// `vpncloud_free_error` when done. This avoids a dangling pointer if another
+/// error replaces the stored message.
 #[no_mangle]
 pub extern "C" fn vpncloud_last_error() -> *const c_char {
-    match LAST_ERROR.lock() {
-        Ok(guard) => guard.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null()),
+    let copy = match LAST_ERROR.lock() {
+        Ok(guard) => {
+            match guard.as_ref() {
+                Some(s) => {
+                    let bytes = s.as_bytes_with_nul();
+                    let ptr = unsafe { libc::malloc(bytes.len()) } as *mut u8;
+                    if ptr.is_null() {
+                        std::ptr::null()
+                    } else {
+                        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+                        ptr as *const c_char
+                    }
+                }
+                None => std::ptr::null()
+            }
+        }
         Err(_) => std::ptr::null()
+    };
+    copy
+}
+
+/// Free a string returned by `vpncloud_last_error`.
+#[no_mangle]
+pub extern "C" fn vpncloud_free_error(ptr: *const c_char) {
+    if !ptr.is_null() {
+        unsafe { libc::free(ptr as *mut _) };
     }
 }
 

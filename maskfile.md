@@ -179,6 +179,31 @@ gpg --armor --output vpncloud_${VERSION}_SHA256SUMS.txt.asc --detach-sig vpnclou
 cargo test --all-features
 ```
 
+## check
+
+> Run the full local quality gate: formatting, build, tests, lints, fuzz
+> targets and every installed cross-compilation target.
+
+```sh
+set -e
+cargo fmt --check
+cargo check --all-features
+cargo test --all-features
+cargo clippy --all-features --lib
+(cd fuzz && cargo check)
+for target in x86_64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-apple-darwin aarch64-apple-ios; do
+  if rustup target list --installed | grep -qx "$target"; then
+    if [ "$target" = "aarch64-apple-ios" ]; then
+      cargo check --features installer --target "$target"
+    else
+      cargo check --all-features --target "$target"
+    fi
+  else
+    echo "skipping $target (rustup target not installed)"
+  fi
+done
+```
+
 ## release
 
 > Release the project.

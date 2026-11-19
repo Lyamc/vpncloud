@@ -5,9 +5,18 @@
 //! Process-wide sent/received counters and last handshake time for the GUI.
 
 use std::{
-    sync::atomic::{AtomicI64, AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH}
+    sync::{
+        atomic::{AtomicI64, AtomicU64, Ordering},
+        Mutex, OnceLock
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH}
 };
+
+use serde::{Deserialize, Serialize};
+
+static START: OnceLock<Instant> = OnceLock::new();
+static PROMETHEUS: Mutex<String> = Mutex::new(String::new());
+static PEERS: Mutex<Vec<PeerStatus>> = Mutex::new(Vec::new());
 
 static SENT: AtomicU64 = AtomicU64::new(0);
 static RECV: AtomicU64 = AtomicU64::new(0);
@@ -48,4 +57,78 @@ pub fn snapshot() -> Snapshot {
         recv_bytes: RECV.load(Ordering::Relaxed),
         last_handshake_unix: LAST_HANDSHAKE.load(Ordering::Relaxed)
     }
+}
+
+/// A suggested relay path derived from gossiped peer quality.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelaySuggestion {
+    pub via_addr: String,
+    pub via_node: String,
+    pub dest_node: String,
+    pub estimated_rtt_ms: u32
+}
+
+/// Estimated quality of a remote node (first-hand or relayed).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QualityEntry {
+    pub node_id: String,
+    pub estimated_rtt_ms: u32
+}
+
+/// Serialized form written to `status_file` and read by `vpncloud status`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerStatus {
+    pub addr: String,
+    pub node_id: String,
+    pub rtt_ms: Option<u64>,
+    /// Number of payloads dropped by the per-peer rate limiter.
+    #[serde(default)]
+    pub throttled: u64,
+    /// Current rate penalty (0 = none, higher = stricter), if enabled.
+    #[serde(default)]
+    pub penalty: u8
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FullStatus {
+    pub device: String,
+    pub sent_bytes: u64,
+    pub recv_bytes: u64,
+    pub last_handshake_unix: i64,
+    pub uptime_secs: u64,
+    pub peer_count: usize,
+    pub peers: Vec<PeerStatus>,
+    /// Estimated RTT to every known node, best path first.
+    #[serde(default)]
+    pub quality: Vec<QualityEntry>,
+    /// Best relayed path found from gossiped quality, if any.
+    #[serde(default)]
+    pub suggested_relay: Option<RelaySuggestion>
+}
+
+/// Replace the Prometheus exposition text served by the metrics endpoint.
+pub fn set_prometheus(text: String) {
+    if let Ok(mut guard) = PROMETHEUS.lock() {
+        *guard = text;
+    }
+}
+
+pub fn prometheus() -> String {
+    PROMETHEUS.lock().map(|guard| guard.clone()).unwrap_or_default()
+}
+
+/// Replace the peer list shown by the desktop GUI.
+pub fn set_peers(peers: Vec<PeerStatus>) {
+    if let Ok(mut guard) = PEERS.lock() {
+        *guard = peers;
+    }
+}
+
+pub fn peers() -> Vec<PeerStatus> {
+    PEERS.lock().map(|guard| guard.clone()).unwrap_or_default()
+}
+
+/// Seconds since the process started (first call initializes the clock).
+pub fn uptime_secs() -> u64 {
+    START.get_or_init(Instant::now).elapsed().as_secs()
 }

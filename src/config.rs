@@ -4,7 +4,7 @@
 
 use super::{
     device::Type,
-    types::Mode,
+    types::{Mode, NetworkProfile},
     util::{run_cmd, Duration}
 };
 pub use crate::crypto::Config as CryptoConfig;
@@ -16,6 +16,7 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     fs, io,
+    io::Write,
     path::{Path, PathBuf},
     process, thread
 };
@@ -25,8 +26,7 @@ pub const DEFAULT_PORT: u16 = 3210;
 pub const DEFAULT_SOCKET_BUFFER: usize = 32 * 1024 * 1024;
 
 /// Public STUN servers used when `--stun-server` is not set. Two, so one outage is not fatal.
-pub const DEFAULT_STUN_SERVERS: [&str; 2] =
-    ["stun.l.google.com:19302", "stun1.l.google.com:19302"];
+pub const DEFAULT_STUN_SERVERS: [&str; 2] = ["stun.l.google.com:19302", "stun1.l.google.com:19302"];
 
 /// DATA crypto workers. Tests stay on the wait thread. Otherwise use extra cores, capped at 4.
 pub fn default_crypto_threads() -> usize {
@@ -40,25 +40,27 @@ pub fn default_crypto_threads() -> usize {
     }
 }
 
-/// System-wide config directory (`/usr/local/etc/vpncloud` on FreeBSD, `/etc/vpncloud` elsewhere).
+/// System-wide config directory. macOS/FreeBSD use `/usr/local/etc` because
+/// `/etc` is part of the sealed system volume on modern macOS (SIP).
 pub fn system_config_dir() -> &'static Path {
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
     {
         Path::new("/usr/local/etc/vpncloud")
     }
-    #[cfg(not(target_os = "freebsd"))]
+    #[cfg(not(any(target_os = "freebsd", target_os = "macos")))]
     {
         Path::new("/etc/vpncloud")
     }
 }
 
-/// System-wide binary path (`/usr/local/bin/vpncloud` on FreeBSD, `/usr/bin/vpncloud` elsewhere).
+/// System-wide binary path. macOS/FreeBSD use `/usr/local/bin` because
+/// `/usr/bin` is protected by SIP on modern macOS.
 pub fn system_bin_path() -> &'static Path {
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
     {
         Path::new("/usr/local/bin/vpncloud")
     }
-    #[cfg(not(target_os = "freebsd"))]
+    #[cfg(not(any(target_os = "freebsd", target_os = "macos")))]
     {
         Path::new("/usr/bin/vpncloud")
     }
@@ -66,11 +68,11 @@ pub fn system_bin_path() -> &'static Path {
 
 /// System-wide man page path.
 pub fn system_man_path() -> &'static Path {
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
     {
         Path::new("/usr/local/share/man/man1/vpncloud.1.gz")
     }
-    #[cfg(not(target_os = "freebsd"))]
+    #[cfg(not(any(target_os = "freebsd", target_os = "macos")))]
     {
         Path::new("/usr/share/man/man1/vpncloud.1.gz")
     }
@@ -148,19 +150,27 @@ pub struct Config {
     pub mode: Mode,
     pub switch_timeout: Duration,
     pub claims: Vec<String>,
+    /// Additional overlay IPs assigned locally and announced as /32 claims.
+    pub local_addresses: Vec<String>,
     pub auto_claim: bool,
     pub port_forwarding: bool,
     pub daemonize: bool,
     pub pid_file: Option<String>,
     pub stats_file: Option<String>,
+    /// Optional JSON status file refreshed every second for `vpncloud status`.
+    pub status_file: Option<String>,
+    /// Optional bind address for a read-only Prometheus metrics endpoint.
+    pub metrics_addr: Option<String>,
     pub statsd_server: Option<String>,
     pub statsd_prefix: Option<String>,
     pub user: Option<String>,
     pub group: Option<String>,
     pub hook: Option<String>,
     pub hooks: HashMap<String, String>,
-    /// Windows: show a system tray icon (Enable / Disable / Exit).
+    /// Windows/macOS: show a tray / menu bar icon with a config context menu.
     pub tray: bool,
+    /// macOS: the tray app controls the launchd service instead of running the VPN itself.
+    pub tray_controls_service: bool,
     /// Query STUN servers and publish the mapped address.
     pub stun: bool,
     pub stun_servers: Vec<String>,
@@ -168,6 +178,10 @@ pub struct Config {
     pub lan_only: bool,
     /// Max crypto-init packets per source IP per 10 seconds.
     pub init_rate_limit: u32,
+    /// Per-peer overlay token bucket rate in bytes/sec (0 disables). Peers that drain it are penalised.
+    pub per_peer_rate_limit: u64,
+    /// Install kernel routes for announced overlay claims (needs privileges).
+    pub install_routes: bool,
     /// Overlay ACL entries (`allow:10.0.0.0/8`, `deny:0.0.0.0/0`). Empty = allow all.
     pub acl: Vec<String>,
     /// Listen/connect with length-prefixed TCP when UDP is blocked.
@@ -194,8 +208,42 @@ pub struct Config {
     pub peer_names: Vec<String>,
     /// Allow the reverse of a flow this node originated. Drop the unsolicited reverse.
     pub stateful_filter: bool,
+    /// Opportunistically LZ4-compress DATA payloads before encryption.
+    pub compression: bool,
     /// Group name advertised in node info.
-    pub announce_group: Option<String>
+    pub announce_group: Option<String>,
+    /// Optional Ed25519 private key (base62) used to sign node announcements.
+    /// Enables per-node identity binding without changing the shared-key handshake.
+    pub node_key: Option<String>,
+    /// Per-node public keys as `node-id-hex=base62-public-key`. When present,
+    /// announcements from that node must be signed by the matching key.
+    pub trusted_node_keys: Vec<String>,
+    /// Require unique per-node keys and explicit node-id -> key trust bindings
+    /// instead of a shared password. Each node needs its own private-key and
+    /// every peer listed in trusted-node-keys.
+    pub per_node_keys: bool,
+    /// Network quality priority; sets defaults for MTU, jitter and pacing.
+    pub profile: NetworkProfile,
+    /// Cap the probed underlay MTU. Latency/consistency default to 1500,
+    /// throughput to 9000 (jumbo). `None` follows the profile.
+    pub max_underlay_mtu: Option<usize>,
+    /// Receive jitter buffer in milliseconds. Consistency defaults to 20.
+    /// `None` follows the profile.
+    pub jitter_ms: Option<u32>,
+    /// Migrate a peer to a new source address when its node id is recognised.
+    pub mobility: bool,
+    /// Stable node id (hex). If unset, derived from node-key or random.
+    pub node_id: Option<String>,
+    /// Redistribute broadcasts through the best-connected peer instead of
+    /// sending a separate copy to every peer. Helps nodes with poor upload.
+    pub flood_relay: bool,
+    /// Optional node id (hex) to use as the redistribution peer. If unset,
+    /// the lowest-RTT peer is chosen.
+    pub flood_relay_via: Option<String>,
+    /// On a TAP node, accept IP-only peers (TUN clients) and translate between
+    /// their raw IP packets and local Ethernet frames. ARP is answered locally.
+    /// Requires device type `tap`; ignored on TUN nodes.
+    pub l2_l3_bridge: bool
 }
 
 impl Default for Config {
@@ -223,11 +271,14 @@ impl Default for Config {
             mode: Mode::Normal,
             switch_timeout: 300,
             claims: vec![],
+            local_addresses: vec![],
             auto_claim: true,
             port_forwarding: true,
             daemonize: false,
             pid_file: None,
             stats_file: None,
+            status_file: None,
+            metrics_addr: None,
             statsd_server: None,
             statsd_prefix: None,
             user: None,
@@ -235,6 +286,7 @@ impl Default for Config {
             hook: None,
             hooks: HashMap::new(),
             tray: false,
+            tray_controls_service: false,
             stun: !cfg!(test),
             stun_servers: if cfg!(test) {
                 vec![]
@@ -243,6 +295,8 @@ impl Default for Config {
             },
             lan_only: false,
             init_rate_limit: 20,
+            per_peer_rate_limit: 20_000_000,
+            install_routes: false,
             acl: vec![],
             tcp_fallback: !cfg!(test),
             crypto_threads: default_crypto_threads(),
@@ -256,7 +310,19 @@ impl Default for Config {
             exit_allow: vec![],
             peer_names: vec![],
             stateful_filter: false,
-            announce_group: None
+            compression: crate::compress::enabled_by_default(),
+            announce_group: None,
+            node_key: None,
+            trusted_node_keys: Vec::new(),
+            per_node_keys: false,
+            profile: NetworkProfile::Balanced,
+            max_underlay_mtu: None,
+            jitter_ms: None,
+            mobility: true,
+            node_id: None,
+            flood_relay: false,
+            flood_relay_via: None,
+            l2_l3_bridge: false
         }
     }
 }
@@ -328,6 +394,9 @@ impl Config {
         if let Some(mut val) = file.claims {
             self.claims.append(&mut val);
         }
+        if let Some(mut val) = file.local_addresses {
+            self.local_addresses.append(&mut val);
+        }
         if let Some(val) = file.auto_claim {
             self.auto_claim = val;
         }
@@ -339,6 +408,12 @@ impl Config {
         }
         if let Some(val) = file.stats_file {
             self.stats_file = Some(val);
+        }
+        if let Some(val) = file.status_file {
+            self.status_file = Some(val);
+        }
+        if let Some(val) = file.metrics_addr {
+            self.metrics_addr = Some(val);
         }
         if let Some(statsd) = file.statsd {
             if let Some(val) = statsd.server {
@@ -388,6 +463,12 @@ impl Config {
         if let Some(val) = file.init_rate_limit {
             self.init_rate_limit = val;
         }
+        if let Some(val) = file.per_peer_rate_limit {
+            self.per_peer_rate_limit = val;
+        }
+        if let Some(val) = file.install_routes {
+            self.install_routes = val;
+        }
         if let Some(mut val) = file.acl {
             self.acl.append(&mut val);
         }
@@ -433,8 +514,44 @@ impl Config {
         if let Some(val) = file.stateful_filter {
             self.stateful_filter = val;
         }
+        if let Some(val) = file.compression {
+            self.compression = val;
+        }
         if let Some(val) = file.announce_group {
             self.announce_group = Some(val);
+        }
+        if let Some(val) = file.node_key {
+            self.node_key = Some(val);
+        }
+        if let Some(keys) = file.trusted_node_keys {
+            self.trusted_node_keys.extend(keys);
+        }
+        if let Some(val) = file.per_node_keys {
+            self.per_node_keys = val;
+        }
+        if let Some(val) = file.profile {
+            self.profile = val;
+        }
+        if let Some(val) = file.max_underlay_mtu {
+            self.max_underlay_mtu = Some(val);
+        }
+        if let Some(val) = file.jitter_ms {
+            self.jitter_ms = Some(val);
+        }
+        if let Some(val) = file.mobility {
+            self.mobility = val;
+        }
+        if let Some(val) = file.node_id {
+            self.node_id = Some(val);
+        }
+        if let Some(val) = file.flood_relay {
+            self.flood_relay = val;
+        }
+        if let Some(val) = file.flood_relay_via {
+            self.flood_relay_via = Some(val);
+        }
+        if let Some(val) = file.l2_l3_bridge {
+            self.l2_l3_bridge = val;
         }
     }
 
@@ -496,6 +613,7 @@ impl Config {
             self.switch_timeout = val;
         }
         self.claims.append(&mut args.claims);
+        self.local_addresses.append(&mut args.local_addresses);
         if args.no_auto_claim {
             self.auto_claim = false;
         }
@@ -510,6 +628,12 @@ impl Config {
         }
         if let Some(val) = args.stats_file {
             self.stats_file = Some(val);
+        }
+        if let Some(val) = args.status_file {
+            self.status_file = Some(val);
+        }
+        if let Some(val) = args.metrics_addr {
+            self.metrics_addr = Some(val);
         }
         if let Some(val) = args.statsd_server {
             self.statsd_server = Some(val);
@@ -552,6 +676,10 @@ impl Config {
         if args.no_tray {
             self.tray = false;
         }
+        #[cfg(target_os = "macos")]
+        if args.tray_controls_service {
+            self.tray_controls_service = true;
+        }
         if args.no_stun {
             self.stun = false;
         }
@@ -572,6 +700,15 @@ impl Config {
         }
         if let Some(val) = args.init_rate_limit {
             self.init_rate_limit = val;
+        }
+        if let Some(val) = args.per_peer_rate_limit {
+            self.per_peer_rate_limit = val;
+        }
+        if args.no_per_peer_rate_limit {
+            self.per_peer_rate_limit = 0;
+        }
+        if args.install_routes {
+            self.install_routes = true;
         }
         self.acl.append(&mut args.acl);
         if args.tcp_fallback {
@@ -608,8 +745,48 @@ impl Config {
         if args.stateful_filter {
             self.stateful_filter = true;
         }
+        if args.compression {
+            self.compression = true;
+        }
+        if args.no_compression {
+            self.compression = false;
+        }
         if let Some(val) = args.announce_group {
             self.announce_group = Some(val);
+        }
+        if let Some(val) = args.node_key {
+            self.node_key = Some(val);
+        }
+        self.trusted_node_keys.append(&mut args.trusted_node_keys);
+        if args.flood_relay {
+            self.flood_relay = true;
+        }
+        if args.no_flood_relay {
+            self.flood_relay = false;
+        }
+        if let Some(val) = args.flood_relay_via {
+            self.flood_relay_via = Some(val);
+        }
+        if args.l2_l3_bridge {
+            self.l2_l3_bridge = true;
+        }
+        if args.per_node_keys {
+            self.per_node_keys = true;
+        }
+        if let Some(val) = args.profile {
+            self.profile = val;
+        }
+        if let Some(val) = args.max_underlay_mtu {
+            self.max_underlay_mtu = Some(val);
+        }
+        if let Some(val) = args.jitter_ms {
+            self.jitter_ms = Some(val);
+        }
+        if args.no_mobility {
+            self.mobility = false;
+        }
+        if let Some(val) = args.node_id {
+            self.node_id = Some(val);
         }
     }
 
@@ -617,6 +794,7 @@ impl Config {
         ConfigFile {
             auto_claim: Some(self.auto_claim),
             claims: Some(self.claims),
+            local_addresses: if self.local_addresses.is_empty() { None } else { Some(self.local_addresses.clone()) },
             beacon: Some(ConfigFileBeacon {
                 store: self.beacon_store,
                 load: self.beacon_load,
@@ -645,6 +823,8 @@ impl Config {
             pid_file: self.pid_file,
             port_forwarding: Some(self.port_forwarding),
             stats_file: self.stats_file,
+            status_file: self.status_file,
+            metrics_addr: self.metrics_addr,
             statsd: Some(ConfigFileStatsd { server: self.statsd_server, prefix: self.statsd_prefix }),
             switch_timeout: Some(self.switch_timeout),
             hook: self.hook,
@@ -654,6 +834,8 @@ impl Config {
             stun_servers: Some(self.stun_servers),
             lan_only: Some(self.lan_only),
             init_rate_limit: Some(self.init_rate_limit),
+            per_peer_rate_limit: Some(self.per_peer_rate_limit),
+            install_routes: Some(self.install_routes),
             acl: if self.acl.is_empty() { None } else { Some(self.acl) },
             tcp_fallback: Some(self.tcp_fallback),
             crypto_threads: Some(self.crypto_threads),
@@ -667,9 +849,151 @@ impl Config {
             exit_allow: if self.exit_allow.is_empty() { None } else { Some(self.exit_allow) },
             peer_names: if self.peer_names.is_empty() { None } else { Some(self.peer_names) },
             stateful_filter: Some(self.stateful_filter),
+            compression: Some(self.compression),
             announce_group: self.announce_group,
+            node_key: self.node_key,
+            trusted_node_keys: if self.trusted_node_keys.is_empty() { None } else { Some(self.trusted_node_keys) },
+            per_node_keys: Some(self.per_node_keys),
+            profile: Some(self.profile),
+            max_underlay_mtu: self.max_underlay_mtu,
+            jitter_ms: self.jitter_ms,
+            mobility: Some(self.mobility),
+            node_id: self.node_id,
+            flood_relay: Some(self.flood_relay),
+            flood_relay_via: self.flood_relay_via,
+            l2_l3_bridge: Some(self.l2_l3_bridge),
             signature: None
         }
+    }
+
+    /// Cap for the underlay MTU after applying the profile.
+    pub fn effective_max_underlay_mtu(&self) -> usize {
+        self.max_underlay_mtu.unwrap_or(match self.profile {
+            NetworkProfile::Throughput | NetworkProfile::Balanced => 9000,
+            NetworkProfile::Latency | NetworkProfile::Consistency => 1500
+        })
+    }
+
+    /// Receive jitter buffer after applying the profile (milliseconds).
+    pub fn effective_jitter_ms(&self) -> u32 {
+        self.jitter_ms.unwrap_or(match self.profile {
+            NetworkProfile::Consistency => 20,
+            _ => 0
+        })
+    }
+
+    /// Config file representation with all secret values replaced, for
+    /// `vpncloud config --print` and diagnostics.
+    pub fn redacted_yaml(&self) -> String {
+        let mut file = self.clone().into_config_file();
+        if file.crypto.password.is_some() {
+            file.crypto.password = Some("<redacted>".into());
+        }
+        if file.crypto.private_key.is_some() {
+            file.crypto.private_key = Some("<redacted>".into());
+        }
+        if !file.crypto.trusted_keys.is_empty() {
+            file.crypto.trusted_keys = vec!["<redacted>".into()];
+        }
+        if let Some(ref mut beacon) = file.beacon {
+            if beacon.password.is_some() {
+                beacon.password = Some("<redacted>".into());
+            }
+        }
+        if file.hook.is_some() {
+            file.hook = Some("<redacted>".into());
+        }
+        if !file.hooks.is_empty() {
+            file.hooks.clear();
+            file.hooks.insert("(script)".into(), "<redacted>".into());
+        }
+        serde_norway::to_string(&file).unwrap_or_default()
+    }
+
+    /// Semantic validation beyond deserialization. Returns non-fatal warnings;
+    /// `Err` means the config cannot be used at all. Used by `check-config`.
+    pub fn validate(&self) -> Result<Vec<String>, String> {
+        let mut warnings = Vec::new();
+        if self.per_node_keys {
+            if self.crypto.private_key.is_none() {
+                return Err("per-node-keys requires a unique private-key (a shared password is not enough)".into());
+            }
+            if self.trusted_node_keys.is_empty() {
+                return Err("per-node-keys requires trusted-node-key entries (node-id=public-key)".into());
+            }
+            for entry in &self.trusted_node_keys {
+                let Some((id, key)) = entry.split_once('=') else {
+                    return Err(format!("invalid trusted-node-key '{}' (expected node-id=key)", entry));
+                };
+                if crate::util::from_hex(id).ok().and_then(|v| <[u8; 16]>::try_from(v.as_slice()).ok()).is_none() {
+                    return Err(format!("invalid node id in trusted-node-key '{}'", entry));
+                }
+                crate::util::from_base62_fixed::<32>(key)
+                    .map_err(|_| format!("invalid public key in trusted-node-key '{}'", entry))?;
+            }
+        }
+        if self.crypto.password.is_none() && self.crypto.private_key.is_none() {
+            return Err("no password or private key configured".into());
+        }
+        if let Ok((plain, _, algos)) = crate::crypto::Crypto::parse_algorithms(&self.crypto.algorithms) {
+            if plain {
+                warnings.push("unencrypted 'plain' algorithm allowed: traffic can be read on the wire".into());
+            }
+            if algos.is_empty() && !plain {
+                warnings.push("no AEAD algorithm selected".into());
+            }
+        } else {
+            return Err("invalid crypto.algorithms".into());
+        }
+        if let Some(ref ip) = self.ip {
+            let (addr, prefix) = ip.split_once('/').unwrap_or((ip, ""));
+            match addr.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(_)) if !prefix.is_empty() && prefix.parse::<u8>().map_or(true, |p| p > 32) => {
+                    return Err(format!("invalid IPv4 prefix in ip: {}", ip));
+                }
+                Ok(std::net::IpAddr::V6(_)) if !prefix.is_empty() && prefix.parse::<u8>().map_or(true, |p| p > 128) => {
+                    return Err(format!("invalid IPv6 prefix in ip: {}", ip));
+                }
+                Ok(_) => {}
+                Err(_) => return Err(format!("invalid ip address: {}", ip))
+            }
+        } else {
+            warnings.push("no overlay IP set; the interface will have no address".into());
+        }
+        if let Some(mtu) = self.mtu {
+            if !(68..=65535).contains(&mtu) {
+                return Err(format!("mtu {} out of range (68..=65535)", mtu));
+            }
+        }
+        if self.peers.is_empty() {
+            warnings.push("no peers configured; the node will not connect to anyone".into());
+        }
+        for peer in &self.peers {
+            let port_ok = if let Some(rest) = peer.strip_prefix('[') {
+                match rest.find(']') {
+                    Some(end) => {
+                        let after = &rest[end + 1..];
+                        after.is_empty() || after.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()).is_some()
+                    }
+                    None => false
+                }
+            } else if let Some((_, port)) = peer.rsplit_once(':') {
+                port.parse::<u16>().is_ok()
+            } else {
+                true // no port: the default port is added at runtime
+            };
+            if !port_ok {
+                return Err(format!("invalid peer address: {}", peer));
+            }
+        }
+        if self.compression {
+            warnings
+                .push("compression is enabled: it can leak plaintext length information (CRIME/BREACH-style)".into());
+        }
+        if self.daemonize && self.pid_file.is_none() {
+            warnings.push("daemonizing without a pid file makes the process harder to manage".into());
+        }
+        Ok(warnings)
     }
 
     pub fn get_keepalive(&self) -> Duration {
@@ -695,7 +1019,7 @@ impl Config {
         let script = script.unwrap();
         let mut cmd = process::Command::new("sh");
         cmd.arg("-c").arg(script).envs(envs).env("EVENT", event);
-        debug!("Running event script: {:?}", cmd);
+        debug!("Running event script for {}", event);
         if detach {
             thread::spawn(move || run_cmd(cmd));
         } else {
@@ -776,6 +1100,10 @@ pub struct Args {
     #[arg(long = "claim", value_delimiter = ',')]
     pub claims: Vec<String>,
 
+    /// Additional overlay IPs to assign and announce (repeatable)
+    #[arg(long = "local-address", value_delimiter = ',')]
+    pub local_addresses: Vec<String>,
+
     /// Do not automatically claim the device ip
     #[arg(long)]
     pub no_auto_claim: bool,
@@ -821,13 +1149,21 @@ pub struct Args {
     #[arg(long)]
     pub beacon_password: Option<String>,
 
-    /// Print debug information
-    #[arg(short, long, conflicts_with = "quiet")]
-    pub verbose: bool,
+    /// Print debug information (-vv adds trace-level wire logging)
+    #[arg(short, long, conflicts_with = "quiet", action = clap::ArgAction::Count)]
+    pub verbose: u8,
 
     /// Only print errors and warnings
     #[arg(short, long)]
     pub quiet: bool,
+
+    /// Set log level explicitly (off/error/warn/info/debug/trace)
+    #[arg(long, value_name = "LEVEL", conflicts_with_all = ["verbose", "quiet"])]
+    pub log_level: Option<String>,
+
+    /// Log a hex dump of the first bytes of every wire message (implies trace)
+    #[arg(long)]
+    pub wire_log: bool,
 
     /// An IP address (plus optional prefix length) for the interface
     #[arg(long)]
@@ -865,6 +1201,18 @@ pub struct Args {
     #[arg(long)]
     pub stats_file: Option<String>,
 
+    /// Write a JSON status snapshot to this file every second (for `vpncloud status`)
+    #[arg(long)]
+    pub status_file: Option<String>,
+
+    /// Bind a read-only Prometheus HTTP endpoint here (e.g. 127.0.0.1:9090)
+    #[arg(long)]
+    pub metrics_addr: Option<String>,
+
+    /// Emit logs as JSON lines instead of human text
+    #[arg(long)]
+    pub log_json: bool,
+
     /// Send statistics to this statsd server
     #[arg(long)]
     pub statsd_server: Option<String>,
@@ -894,13 +1242,18 @@ pub struct Args {
     #[arg(long)]
     pub hook: Vec<String>,
 
-    /// Windows: show a system tray icon (Enable / Disable / Exit)
+    /// Windows/macOS: show a tray / menu bar icon with a config context menu
     #[arg(long)]
     pub tray: bool,
 
-    /// Windows: do not show a system tray icon
+    /// Windows/macOS: do not show a tray / menu bar icon
     #[arg(long, conflicts_with = "tray")]
     pub no_tray: bool,
+
+    /// macOS: the tray app controls the installed launchd service instead of running the VPN
+    #[cfg(target_os = "macos")]
+    #[arg(long, hide = true, requires = "tray")]
+    pub tray_controls_service: bool,
 
     /// Enable STUN reflexive-address discovery (default)
     #[arg(long)]
@@ -923,6 +1276,15 @@ pub struct Args {
     /// Max handshake packets per source IP per 10 seconds
     #[arg(long = "init-rate-limit")]
     pub init_rate_limit: Option<u32>,
+    /// Per-peer overlay rate limit in bytes/sec (0 disables)
+    #[arg(long = "per-peer-rate-limit")]
+    pub per_peer_rate_limit: Option<u64>,
+    /// Disable the per-peer overlay rate limit
+    #[arg(long = "no-per-peer-rate-limit", conflicts_with = "per_peer_rate_limit")]
+    pub no_per_peer_rate_limit: bool,
+    /// Install kernel routes for announced overlay claims (needs privileges)
+    #[arg(long)]
+    pub install_routes: bool,
     /// Overlay ACL `allow:CIDR` / `deny:CIDR` with optional `:tcp|:udp|:icmp[:port[-port]]` (last match wins)
     #[arg(long = "acl")]
     pub acl: Vec<String>,
@@ -935,9 +1297,18 @@ pub struct Args {
     /// Worker threads for DATA encrypt/decrypt (0 = wait thread; default extra cores-1, max 4)
     #[arg(long = "crypto-threads")]
     pub crypto_threads: Option<usize>,
-    /// Refuse unsigned config files
+    /// Refuse unsigned config files. Verification keys must be supplied with
+    /// --verify-key / --verify-key-file; keys inside the config are not trusted.
     #[arg(long = "require-signed-config")]
     pub require_signed_config: bool,
+    /// Ed25519 public key (base62, optional :YYYY-MM-DD) used to verify the
+    /// --config signature. Repeatable. Kept separate from peer trusted keys.
+    #[arg(long = "verify-key", value_name = "KEY")]
+    pub verify_keys: Vec<String>,
+    /// File containing config-signature verification keys, one base62 key per
+    /// line (# comments allowed). Use a root-owned file for a real trust anchor.
+    #[arg(long = "verify-key-file", value_name = "PATH")]
+    pub verify_key_file: Option<String>,
     /// Linux: install seccomp blacklist after bind/TUN
     #[arg(long)]
     pub seccomp: bool,
@@ -968,9 +1339,53 @@ pub struct Args {
     /// Stateful filter: allow the reply to a flow this node opened
     #[arg(long = "stateful-filter")]
     pub stateful_filter: bool,
+    /// Opportunistically LZ4-compress DATA payloads before encryption (off by default).
+    /// Only used with peers that also advertise support. WARNING: compression before
+    /// encryption can leak plaintext length information (CRIME/BREACH-style oracles).
+    #[arg(long, conflicts_with = "no_compression")]
+    pub compression: bool,
+    /// Never compress tunnel payloads, overriding a config-file setting
+    #[arg(long, conflicts_with = "compression")]
+    pub no_compression: bool,
     /// Group name to advertise to peers
     #[arg(long = "announce-group")]
     pub announce_group: Option<String>,
+    /// Ed25519 private key (base62) used to sign node announcements
+    #[arg(long = "node-key")]
+    pub node_key: Option<String>,
+    /// Per-node public key as `node-id-hex=base62-public-key` (repeatable)
+    #[arg(long = "trusted-node-key", value_name = "NODE=KEY")]
+    pub trusted_node_keys: Vec<String>,
+    /// Require unique per-node keys and explicit trusted-node-key bindings
+    #[arg(long)]
+    pub per_node_keys: bool,
+    /// Network priority: latency, consistency, throughput, or balanced
+    #[arg(long, value_name = "PROFILE")]
+    pub profile: Option<NetworkProfile>,
+    /// Cap the probed underlay MTU (default: 1500 for latency/consistency, 9000 otherwise)
+    #[arg(long)]
+    pub max_underlay_mtu: Option<usize>,
+    /// Receive jitter buffer in milliseconds (default: 20 for consistency)
+    #[arg(long)]
+    pub jitter_ms: Option<u32>,
+    /// Disable migration of a peer to a new source address
+    #[arg(long)]
+    pub no_mobility: bool,
+    /// Stable node id (hex); otherwise derived from node-key or random
+    #[arg(long)]
+    pub node_id: Option<String>,
+    /// Redistribute broadcasts through the best-connected peer (helps poor upload)
+    #[arg(long, conflicts_with = "no_flood_relay")]
+    pub flood_relay: bool,
+    /// Pin the redistribution peer by node id (hex) instead of lowest RTT
+    #[arg(long, value_name = "NODE_ID")]
+    pub flood_relay_via: Option<String>,
+    /// Always send a separate broadcast copy to each peer
+    #[arg(long, conflicts_with = "flood_relay")]
+    pub no_flood_relay: bool,
+    /// TAP node: accept IP-only (TUN) peers and translate L2<->L3 locally
+    #[arg(long)]
+    pub l2_l3_bridge: bool,
 
     #[command(subcommand)]
     pub cmd: Option<Command>
@@ -978,12 +1393,52 @@ pub struct Args {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Validate a config file without starting the VPN
+    #[command(name = "check-config", alias = "checkconfig")]
+    CheckConfig {
+        /// Config file to validate
+        #[arg(long = "config", short)]
+        config_file: String,
+        /// Require and verify a config signature (uses --verify-key / --verify-key-file)
+        #[arg(long)]
+        verify_signature: bool
+    },
+
+    /// List or control per-network service instances
+    Network {
+        #[command(subcommand)]
+        action: NetworkAction
+    },
+
+    /// Run preflight checks (TUN access, config, port, clock, DNS) without starting the VPN
+    Doctor {
+        /// Config file to check (optional)
+        #[arg(long = "config", short)]
+        config_file: Option<String>
+    },
+
+    /// Show runtime status from the JSON status file
+    Status {
+        /// Read status from this file (default: status_file from the config)
+        #[arg(long)]
+        status_file: Option<String>,
+        /// Config file to read the status_file setting from
+        #[arg(long = "config", short)]
+        config_file: Option<String>,
+        /// Print the raw JSON status
+        #[arg(long)]
+        json: bool
+    },
+
     /// Generate and print a key-pair and exit
     #[command(name = "genkey", alias = "gen-key")]
     GenKey {
         /// The shared password to encrypt all traffic
         #[arg(short, long, env = "PASSWORD")]
-        password: Option<String>
+        password: Option<String>,
+        /// Write the key pair to this file instead of stdout (created 0600)
+        #[arg(long = "out", value_name = "PATH")]
+        out: Option<String>
     },
 
     /// Sign a config file with Ed25519 (private key or password)
@@ -1032,10 +1487,14 @@ pub enum Command {
         name: Option<String>,
 
         /// Path where the configuration file will be written/installed (overrides default
-        /// /etc/vpncloud/<name>.net, or /usr/local/etc/vpncloud/<name>.net on FreeBSD)
+        /// /etc/vpncloud/<name>.net, /usr/local/etc/vpncloud/<name>.net on macOS/FreeBSD)
         /// Example: --config /etc/vpncloud/myvpn.net
         #[arg(long = "config")]
-        config_file: Option<String>
+        config_file: Option<String>,
+
+        /// Print the effective config (secrets redacted) instead of launching the wizard
+        #[arg(long)]
+        print: bool
     },
 
     /// Install required utility files
@@ -1044,19 +1503,19 @@ pub enum Command {
         /// Remove installed files again
         #[arg(long)]
         uninstall: bool,
-        /// Windows: install a system tray icon (prompted if omitted)
+        /// Install a system tray / menu bar icon (prompted on Windows; macOS defaults to yes)
         #[arg(long)]
         tray: bool,
-        /// Windows: do not install a system tray icon
+        /// Do not install a tray / menu bar icon
         #[arg(long, conflicts_with = "tray")]
         no_tray: bool,
         /// Windows: start VpnCloud with Windows (registry Run key)
         #[arg(long)]
         autostart: bool,
-        /// Windows: register a system service (requires Administrator)
+        /// Register a system service (Windows service / macOS LaunchDaemon)
         #[arg(long)]
         service: bool,
-        /// Windows: do not register a system service
+        /// Do not register a system service
         #[arg(long, conflicts_with = "service")]
         no_service: bool
     },
@@ -1067,6 +1526,18 @@ pub enum Command {
         #[command(subcommand)]
         action: WindowsServiceAction
     }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum NetworkAction {
+    /// List configured networks
+    List,
+    /// Start a network's service instance
+    Start { name: String },
+    /// Stop a network's service instance
+    Stop { name: String },
+    /// Show whether a network's service is active
+    Status { name: String }
 }
 
 /// Windows Service Control Manager actions
@@ -1087,7 +1558,9 @@ pub enum WindowsServiceAction {
     /// Start the VpnCloud service
     Start,
     /// Stop the VpnCloud service
-    Stop
+    Stop,
+    /// Reload the reloadable policy config without restarting the service
+    Reload
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
@@ -1161,6 +1634,8 @@ pub struct ConfigFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claims: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_addresses: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_claim: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_forwarding: Option<bool>,
@@ -1168,6 +1643,10 @@ pub struct ConfigFile {
     pub pid_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics_addr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statsd: Option<ConfigFileStatsd>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1189,6 +1668,10 @@ pub struct ConfigFile {
     pub lan_only: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_rate_limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_peer_rate_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_routes: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acl: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1216,7 +1699,31 @@ pub struct ConfigFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stateful_filter: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub announce_group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted_node_keys: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_node_keys: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<NetworkProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_underlay_mtu: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jitter_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mobility: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flood_relay: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flood_relay_via: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l2_l3_bridge: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>
 }
@@ -1295,14 +1802,16 @@ pub fn parse_config_auto(raw: &str) -> Result<ConfigFile, String> {
     }
 }
 
-/// Read and parse a config file. Resolves YAML-over-TOML siblings when `path` is missing.
-pub fn load_config_file(path: &Path) -> Result<(PathBuf, ConfigFile), crate::error::Error> {
+/// Read a config file exactly once and return the resolved path, the raw bytes,
+/// and the parsed structure. Callers that verify signatures must use this so
+/// the bytes they verify are the bytes they execute (no TOCTOU re-read).
+pub fn load_config_file_with_raw(path: &Path) -> Result<(PathBuf, String, ConfigFile), crate::error::Error> {
     let resolved = resolve_config_path(path);
     let raw =
         fs::read_to_string(&resolved).map_err(|e| crate::error::Error::FileIo("Failed to open config file", e))?;
     let format = config_format_from_path(&resolved);
     match parse_config_contents(&raw, format) {
-        Ok(file) => Ok((resolved, file)),
+        Ok(file) => Ok((resolved, raw, file)),
         Err(err) => {
             Err(crate::error::Error::FileIo(
                 "Failed to parse config file",
@@ -1312,14 +1821,40 @@ pub fn load_config_file(path: &Path) -> Result<(PathBuf, ConfigFile), crate::err
     }
 }
 
+/// Read and parse a config file. Resolves YAML-over-TOML siblings when `path` is missing.
+pub fn load_config_file(path: &Path) -> Result<(PathBuf, ConfigFile), crate::error::Error> {
+    let (path, _, file) = load_config_file_with_raw(path)?;
+    Ok((path, file))
+}
+
+/// Create/truncate a file that will hold secrets, with owner-only permissions
+/// from creation and no symlink following (Unix). Used for config/key files.
+pub fn create_private_file(path: &Path) -> io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
 pub fn write_config_file(path: &Path, file: &ConfigFile) -> io::Result<()> {
     match config_format_from_path(path) {
         ConfigFormat::Toml => {
             let body = toml::to_string_pretty(file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            fs::write(path, body)
+            let mut fh = create_private_file(path)?;
+            fh.write_all(body.as_bytes())
         }
         ConfigFormat::Yaml => {
-            let fh = fs::File::create(path)?;
+            let fh = create_private_file(path)?;
             serde_norway::to_writer(fh, file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         }
     }
@@ -1612,6 +2147,50 @@ fn tray_yaml() {
 }
 
 #[test]
+fn validate_accepts_a_sane_config_and_flags_risks() {
+    let mut config = Config::default();
+    config.crypto.password = Some("secret".into());
+    config.ip = Some("10.0.0.1/24".into());
+    config.peers = vec!["192.0.2.1:3210".into()];
+    let warnings = config.validate().unwrap();
+    assert!(warnings.is_empty(), "{:?}", warnings);
+
+    config.compression = true;
+    config.peers.clear();
+    let warnings = config.validate().unwrap();
+    assert!(warnings.iter().any(|w| w.contains("compression")));
+    assert!(warnings.iter().any(|w| w.contains("peers")));
+}
+
+#[test]
+fn validate_rejects_bad_crypto_and_addresses() {
+    let mut config = Config::default();
+    assert!(config.validate().is_err());
+    config.crypto.password = Some("secret".into());
+    config.ip = Some("10.0.0.1/99".into());
+    assert!(config.validate().is_err());
+    config.ip = Some("10.0.0.1/24".into());
+    config.peers = vec!["host:notaport".into()];
+    assert!(config.validate().is_err());
+    config.peers.clear();
+    config.mtu = Some(10);
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn compression_is_opt_in_and_survives_config_roundtrip() {
+    assert!(!Config::default().compression);
+    let file: ConfigFile = serde_norway::from_str("compression: true\n").unwrap();
+    assert_eq!(file.compression, Some(true));
+    let mut config = Config::default();
+    config.merge_file(file);
+    assert!(config.compression);
+    let saved: ConfigFile =
+        serde_norway::from_str(&serde_norway::to_string(&config.into_config_file()).unwrap()).unwrap();
+    assert_eq!(saved.compression, Some(true));
+}
+
+#[test]
 fn parse_config_toml() {
     let toml = r#"
 ip = "10.0.1.1/16"
@@ -1707,13 +2286,13 @@ fn write_and_reload_toml() {
 
 #[test]
 fn system_config_dir_is_os_default() {
-    #[cfg(target_os = "freebsd")]
+    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
     {
         assert_eq!(system_config_dir(), Path::new("/usr/local/etc/vpncloud"));
         assert_eq!(system_bin_path(), Path::new("/usr/local/bin/vpncloud"));
         assert_eq!(system_man_path(), Path::new("/usr/local/share/man/man1/vpncloud.1.gz"));
     }
-    #[cfg(not(target_os = "freebsd"))]
+    #[cfg(not(any(target_os = "freebsd", target_os = "macos")))]
     {
         assert_eq!(system_config_dir(), Path::new("/etc/vpncloud"));
         assert_eq!(system_bin_path(), Path::new("/usr/bin/vpncloud"));

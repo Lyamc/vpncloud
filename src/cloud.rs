@@ -4,14 +4,14 @@
 
 use std::{
     cmp::{max, min},
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     fs::{self, File},
     hash::BuildHasherDefault,
     io::{self, Cursor, Seek, SeekFrom, Write},
     marker::PhantomData,
     mem,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    net::{Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::Path,
     str::FromStr,
     sync::{
@@ -29,20 +29,27 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::{
     beacon::BeaconSerializer,
-    config::{Config, DEFAULT_PEER_TIMEOUT, DEFAULT_PORT},
-    crypto::{is_init_message, Crypto, MessageResult, PeerCrypto},
+    config::{Config, DEFAULT_PEER_TIMEOUT},
+    crypto::{is_init_message, Crypto, Ed25519KeyPair, MessageResult, PeerCrypto},
     crypto_pool::{CryptoBoxHandle, CryptoDone, CryptoJob, CryptoPool},
     device::{Device, OffloadRead, Type},
     error::Error,
     gso::{GsoMeta, GSO_META_LEN},
+    identity::{relay_frame_key, resolve_node_id, stable_hash, MAX_E2E_SEEN, MAX_RELAY_SEEN},
     lan,
     messages::{
-        AddrList, NodeInfo, PeerInfo, TransitClaim, MESSAGE_TYPE_CLOSE, MESSAGE_TYPE_DATA, MESSAGE_TYPE_DATA_GSO,
-        MESSAGE_TYPE_KEEPALIVE, MESSAGE_TYPE_NODE_INFO, MESSAGE_TYPE_RELAY
+        AddrList, NodeInfo, PeerInfo, TransitClaim, FLOOD_HEADER_LEN, MESSAGE_TYPE_CLOSE, MESSAGE_TYPE_DATA,
+        MESSAGE_TYPE_DATA_COMPRESSED, MESSAGE_TYPE_DATA_GSO, MESSAGE_TYPE_DATA_GSO_COMPRESSED, MESSAGE_TYPE_FLOOD,
+        MESSAGE_TYPE_FLOOD_TTL, MESSAGE_TYPE_KEEPALIVE, MESSAGE_TYPE_NODE_INFO, MESSAGE_TYPE_RELAY,
+        MESSAGE_TYPE_RELAY_TTL
     },
     natpmp,
     net::{mapped_addr, parse_listen, Socket},
     payload::Protocol,
+    peers::{
+        configured_ipv6_host_claim, is_loopback_ip, resolve_peer_group, split_peer_group, ReconnectEntry,
+        MAX_RECONNECT_INTERVAL, RESOLVE_INTERVAL
+    },
     policy,
     poll::{Pollable, WaitImpl, WaitResult},
     port_forwarding::PortForwarding,
@@ -54,18 +61,62 @@ use crate::{
     util::{addr_nice, bytes_to_hex, resolve, CtrlC, Duration, MsgBuffer, StatsdMsg, Time, TimeSource}
 };
 
-fn is_loopback_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().map(|v4| v4.is_loopback()).unwrap_or(false)
+// Re-exported for config validation and doctor checks.
+pub use crate::peers::ensure_peer_port;
+
+/// Build the claim list from config, additional local IPs and auto-claim.
+/// Errors are returned so startup can fail and reload can warn-and-skip.
+fn build_claims<D: Device>(config: &Config, device: &D) -> (RangeList, Vec<[u8; 4]>, Vec<String>) {
+    let mut claims = RangeList::new();
+    let mut errors = Vec::new();
+    for s in &config.claims {
+        match Range::from_str(s) {
+            Ok(range) => claims.push(range),
+            Err(e) => errors.push(format!("Invalid subnet format {} ({})", s, e))
+        }
     }
+    let mut local_ips = Vec::new();
+    for s in &config.local_addresses {
+        match s.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                claims.push(Range { base: Address::from(ip), prefix_len: 32, metric: 0 });
+                local_ips.push(ip.octets());
+            }
+            Ok(std::net::IpAddr::V6(ip)) => {
+                claims.push(Range { base: Address::from(ip), prefix_len: 128, metric: 0 });
+            }
+            Err(e) => errors.push(format!("Invalid local-address '{}': {}", s, e))
+        }
+    }
+    if device.get_type() == Type::Tun && config.auto_claim {
+        let mut claimed = false;
+        match device.address() {
+            Ok(ip) => {
+                let range = Range { base: Address::from(ip), prefix_len: 32, metric: 0 };
+                info!("Auto-claiming {} due to interface address", range);
+                claims.push(range);
+                claimed = true;
+            }
+            Err(Error::DeviceIo(_, e)) if e.kind() == io::ErrorKind::AddrNotAvailable => {}
+            Err(Error::Device(_)) => {}
+            Err(e) => error!("{}", e)
+        }
+        if let Some(range) = configured_ipv6_host_claim(config.ip.as_deref()) {
+            info!("Auto-claiming {} due to interface address", range);
+            claims.push(range);
+            claimed = true;
+        }
+        if !claimed {
+            info!("No address set on interface.")
+        }
+    }
+    (claims, local_ips, errors)
 }
 
 pub type Hash = BuildHasherDefault<FnvHasher>;
-
-const MAX_RECONNECT_INTERVAL: u16 = 3600;
-const RESOLVE_INTERVAL: Time = 300;
 pub const STATS_INTERVAL: Time = 60;
+/// Initial hop count for relay and flood frames in TTL-capable meshes.
+pub const DEFAULT_WIRE_TTL: u8 = 16;
 const OWN_ADDRESS_RESET_INTERVAL: Time = 30;
 const SPACE_BEFORE: usize = 100;
 const BATCH_SIZE: usize = 128;
@@ -73,15 +124,19 @@ const BATCH_SIZE: usize = 128;
 /// eight segments, and flushing there makes the peer ACK every train. Sixteen
 /// is past that read, so the hold below collects another before the write.
 /// Stretching the hold itself added delay and cut goodput, so it stays.
+#[allow(dead_code)] // Linux-only pacing path
 const GRO_TRAIN: usize = 16;
 /// Longest a short batch may sit before it is written. The other direction is
 /// still read while this window is open.
+#[allow(dead_code)] // Linux-only pacing path
 const GRO_HOLD_NS: u64 = 150_000;
 /// UDP datagrams kept for a paced inject. One recvmmsg is [`BATCH_SIZE`].
 /// Above this the pacer writes without waiting so 64 KiB buffers cannot pile up.
+#[allow(dead_code)] // Linux-only pacing path
 const UDP_INJECT_QUEUE_CAP: usize = 160;
 
 /// A TUN batch is ready when it is full, the clock has run out, or no hold was armed.
+#[allow(dead_code)] // Linux-only pacing path
 pub(crate) fn gro_batch_ready(queued: usize, now_ns: u64, deadline_ns: u64) -> bool {
     queued >= GRO_TRAIN || deadline_ns == 0 || now_ns >= deadline_ns
 }
@@ -102,13 +157,14 @@ fn note_tun_flush(n: usize) {
             Err(cur) => max_batch = cur
         }
     }
-    if flush % 4000 == 0 {
+    if flush.is_multiple_of(4000) {
         info!("TUN write batches={flush} packets={packets} max={max_batch}");
     }
 }
 
 enum PeerCryptoSlot {
-    Direct(PeerCrypto<NodeInfo>),
+    /// Boxed so the enum stays small (`PeerCrypto<NodeInfo>` is ~16 KiB).
+    Direct(Box<PeerCrypto<NodeInfo>>),
     Shared(CryptoBoxHandle)
 }
 
@@ -117,7 +173,7 @@ impl PeerCryptoSlot {
         if shared {
             Self::Shared(Arc::new(Mutex::new(crypto)))
         } else {
-            Self::Direct(crypto)
+            Self::Direct(Box::new(crypto))
         }
     }
 
@@ -133,7 +189,7 @@ impl PeerCryptoSlot {
             Self::Direct(c) => Ok(f(c)),
             Self::Shared(h) => {
                 let mut g = h.lock().map_err(|_| Error::InvalidCryptoState("crypto lock"))?;
-                Ok(f(&mut *g))
+                Ok(f(&mut g))
             }
         }
     }
@@ -159,81 +215,26 @@ struct PeerData {
     /// When grants are enforced, false rejects this peer's group.
     group_ok: bool,
     /// Prefixes this peer was allowed to claim.
-    auth_claims: RangeList
-}
-
-#[derive(Clone)]
-pub struct ReconnectEntry {
-    address: Option<(Vec<String>, Time)>,
-    resolved: AddrList,
-    tries: u16,
-    timeout: u16,
-    next: Time,
-    final_timeout: Option<Time>,
-    /// When true, `resolved` is a priority list: try one address per interval, highest first.
-    prefer_order: bool,
-    try_index: usize
-}
-
-/// Append [`DEFAULT_PORT`] when the peer string has none.
-///
-/// A colon inside `[ipv6]` is not a port separator. `[fd00::2]:3210` stays as
-/// written; `[fd00::2]` and a bare address gain `:3210`.
-pub(crate) fn ensure_peer_port(addr: &str) -> String {
-    let addr = addr.trim();
-    let addr = addr.strip_prefix("ws://").or_else(|| addr.strip_prefix("wss://")).unwrap_or(addr);
-    if let Some(inner) = addr.strip_prefix('[') {
-        if let Some(bracket) = inner.find(']') {
-            let after = &inner[bracket + 1..];
-            if after.is_empty() {
-                return format!("[{}]:{}", &inner[..bracket], DEFAULT_PORT);
-            }
-            return addr.to_string();
-        }
-    }
-    if let Ok(ip) = addr.parse::<IpAddr>() {
-        return match ip {
-            IpAddr::V4(v4) => format!("{}:{}", v4, DEFAULT_PORT),
-            IpAddr::V6(v6) => format!("[{}]:{}", v6, DEFAULT_PORT)
-        };
-    }
-    if let Some((host, port)) = addr.rsplit_once(':') {
-        if !host.is_empty() && !port.is_empty() && !host.contains(':') && port.chars().all(|c| c.is_ascii_digit()) {
-            return addr.to_string();
-        }
-    }
-    format!("{}:{}", addr, DEFAULT_PORT)
-}
-
-fn split_peer_group(add: &str) -> Vec<String> {
-    add.split(',').map(str::trim).filter(|s| !s.is_empty()).map(ensure_peer_port).collect()
-}
-
-/// Host route for a configured IPv6 `--ip`. A /64 would match the peer as well.
-/// IPv4 keeps the interface /32 from `Device::address`.
-fn configured_ipv6_host_claim(spec: Option<&str>) -> Option<Range> {
-    let spec = spec?;
-    let ip_str = spec.split('/').next().unwrap_or(spec).trim();
-    let v6 = ip_str.parse::<Ipv6Addr>().ok()?;
-    Some(Range { base: Address::from(v6), prefix_len: 128, metric: 0 })
-}
-
-fn resolve_peer_group(names: &[String]) -> AddrList {
-    let mut resolved = smallvec![];
-    for name in names {
-        match resolve(name as &str) {
-            Ok(addrs) => resolved.extend(addrs),
-            Err(err) => warn!("Failed to resolve {}: {:?}", name, err)
-        }
-    }
-    let prefixes = lan::interface_prefixes();
-    lan::sort_lan_first(&mut resolved, &prefixes);
-    resolved
+    auth_claims: RangeList,
+    /// Peer advertised LZ4 decompression support in its NodeInfo.
+    compression: bool,
+    /// Wire formats this peer can receive (from NodeInfo / inferred from claims).
+    wire_caps: crate::wire::WireCaps,
+    /// Format used when sending DATA to this peer.
+    wire_format: crate::wire::WireFormat
 }
 
 pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     node_id: NodeId,
     config: Config,
+    /// RTTs reported by each peer about its own direct peers (gossipped).
+    peer_quality: HashMap<NodeId, Vec<(NodeId, u16)>>,
+    /// Additional overlay IPv4 addresses assigned to this node.
+    local_ips: Vec<[u8; 4]>,
+    /// Last chosen relay peer and when it was chosen, for hysteresis.
+    relay_sticky: Option<(SocketAddr, Time)>,
+    /// Optional kernel route installer for announced claims.
+    routes: crate::routes::RouteManager,
     learning: bool,
     broadcast: bool,
     peers: HashMap<SocketAddr, PeerData, Hash>,
@@ -274,10 +275,16 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     port_forwarding: Option<PortForwarding>,
     traffic: TrafficStats,
     init_limit: InitRateLimit,
+    /// Per-peer overlay token bucket with noisy-peer penalties.
+    peer_limit: crate::rate_limit::PeerRateLimit,
     stun_txid: [u8; 12],
     stun_reflexive: AddrList,
     beacon_serializer: BeaconSerializer<TS>,
     acl: crate::acl::Acl,
+    /// Consistency profile: frames with an absolute release time.
+    jitter_rx: VecDeque<(Time, MsgBuffer)>,
+    /// Per-peer advertised underlay MTUs, used to recompute the global minimum.
+    peer_mtus: HashMap<SocketAddr, usize, Hash>,
     /// Local underlay interface MTU. 0 until [`Self::set_local_underlay`].
     local_l2: usize,
     ipv6_underlay: bool,
@@ -290,6 +297,10 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     known_e2e: HashMap<NodeId, [u8; 32], Hash>,
     /// Reverse of `known_e2e`. A relay sealer is this key, not the previous hop.
     e2e_by_pub: HashMap<[u8; 32], NodeId, Hash>,
+    /// Which underlay peer first supplied each node's e2e key. A different
+    /// peer claiming the same node_id must not be able to overwrite the key
+    /// (that would let any mesh member hijack another node's identity).
+    e2e_owner: HashMap<NodeId, SocketAddr, Hash>,
     /// Per-node group and prefixes taken from `filter_announcement` only.
     origin_auth: HashMap<NodeId, policy::OriginAuth, Hash>,
     grants: policy::Grants,
@@ -299,6 +310,17 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     exit_node: Option<NodeId>,
     exit_allow: Vec<NodeId>,
     last_node_info_ns: u64,
+    /// Recently forwarded relay frames (dest, stable inner hash). Relay
+    /// frames carry no TTL, so this breaks loops between relays: a single
+    /// frame for an unknown dest would otherwise cycle forever, amplifying
+    /// one small packet into endless UDP traffic.
+    relay_seen: HashSet<(NodeId, u64)>,
+    /// Sealed e2e relay bodies already opened, per sealer, for replay defense.
+    e2e_seen: HashMap<[u8; 32], HashSet<u64>, Hash>,
+    e2e_seen_order: VecDeque<([u8; 32], u64)>,
+    /// Recently seen flood messages (origin, sequence) for loop prevention.
+    flood_seen: HashSet<(NodeId, u32)>,
+    flood_seq: u32,
     _dummy_p: PhantomData<P>,
     _dummy_ts: PhantomData<TS>
 }
@@ -319,36 +341,21 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             Mode::Switch => (true, true),
             Mode::Hub => (false, true)
         };
-        let mut claims = SmallVec::with_capacity(config.claims.len());
-        for s in &config.claims {
-            claims.push(try_fail!(Range::from_str(s), "Invalid subnet format: {} ({})", s));
+        let (claims, local_ips, claim_errors) = build_claims(config, &device);
+        for err in &claim_errors {
+            try_fail!(Err::<(), &str>(err), "Invalid claim: {}");
         }
-        if device.get_type() == Type::Tun && config.auto_claim {
-            let mut claimed = false;
-            match device.address() {
-                Ok(ip) => {
-                    let range = Range { base: Address::from(ip), prefix_len: 32, metric: 0 };
-                    info!("Auto-claiming {} due to interface address", range);
-                    claims.push(range);
-                    claimed = true;
-                }
-                Err(Error::DeviceIo(_, e)) if e.kind() == io::ErrorKind::AddrNotAvailable => {}
-                Err(Error::Device(_)) => {}
-                Err(e) => error!("{}", e)
-            }
-            if let Some(range) = configured_ipv6_host_claim(config.ip.as_deref()) {
-                info!("Auto-claiming {} due to interface address", range);
-                claims.push(range);
-                claimed = true;
-            }
-            if !claimed {
-                info!("No address set on interface.")
-            }
-        }
+        let device_ifname = device.ifname().to_string();
         let now = TS::now();
         let update_freq = config.get_keepalive() as u16;
-        let node_id = random();
-        let crypto = Crypto::new(node_id, &config.crypto).unwrap();
+        let node_id = resolve_node_id(config);
+        let mut crypto = Crypto::new(node_id, &config.crypto).unwrap();
+        if config.per_node_keys {
+            if let Err(err) = crypto.enable_per_node_keys(&config.trusted_node_keys) {
+                fail!("Invalid per-node-key configuration: {}", err);
+            }
+            info!("Per-node-key mode: session keys bound to authenticated node identities");
+        }
         let (e2e_secret, e2e_public) = policy::generate_e2e_keypair();
         let grants = try_fail!(policy::parse_grants(&config.grants), "Invalid grant: {}");
         let mut split_prefixes = RangeList::new();
@@ -391,6 +398,14 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 t
             },
             init_limit: InitRateLimit::new(config.init_rate_limit, 10),
+            peer_limit: crate::rate_limit::PeerRateLimit::new(
+                config.per_peer_rate_limit,
+                config.per_peer_rate_limit.max(1)
+            ),
+            peer_quality: HashMap::default(),
+            local_ips,
+            relay_sticky: None,
+            routes: crate::routes::RouteManager::new(config.install_routes, device_ifname),
             stun_txid: [0; 12],
             stun_reflexive: SmallVec::new(),
             beacon_serializer: BeaconSerializer::new(beacon_key),
@@ -413,11 +428,14 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             local_l2: 0,
             ipv6_underlay: false,
             peer_l2: None,
+            jitter_rx: VecDeque::new(),
+            peer_mtus: HashMap::default(),
             applied_l2: 0,
             e2e_secret,
             e2e_public,
             known_e2e: HashMap::default(),
             e2e_by_pub: HashMap::default(),
+            e2e_owner: HashMap::default(),
             origin_auth: HashMap::default(),
             grants,
             flows: policy::FlowTable::default(),
@@ -426,6 +444,11 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             exit_node,
             exit_allow,
             last_node_info_ns: 0,
+            relay_seen: HashSet::default(),
+            e2e_seen: HashMap::default(),
+            e2e_seen_order: VecDeque::new(),
+            flood_seen: HashSet::default(),
+            flood_seq: 0,
             _dummy_p: PhantomData,
             _dummy_ts: PhantomData
         };
@@ -436,6 +459,27 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     #[inline]
     pub fn ifname(&self) -> &str {
         self.device.ifname()
+    }
+
+    /// Wire formats we can receive. A bridge-enabled TAP node accepts both
+    /// Ethernet frames and raw IP packets.
+    fn local_wire_caps(&self) -> crate::wire::WireCaps {
+        if self.config.l2_l3_bridge && self.config.device_type == Type::Tap {
+            crate::wire::WireCaps::for_bridge()
+        } else {
+            crate::wire::WireCaps::for_device(self.config.device_type)
+        }
+    }
+
+    /// Format of payloads produced by the local device.
+    fn local_wire_format(&self) -> crate::wire::WireFormat {
+        crate::wire::WireFormat::from_device_type(self.config.device_type)
+    }
+
+    /// Hop counts are only used when every connected peer understands them;
+    /// otherwise the mesh stays on the legacy (dedup-only) frame format.
+    fn mesh_ttl_enabled(&self) -> bool {
+        !self.peers.is_empty() && self.peers.values().all(|peer| peer.wire_caps.has_ttl())
     }
 
     /// Sends the message to all peers
@@ -475,27 +519,108 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         Ok(())
     }
 
+    /// Convert a DATA payload between the local device format and a peer's
+    /// format. Returns false for L2-only payloads (e.g. ARP) that a TUN link
+    /// cannot carry.
+    fn convert_payload(
+        &self, msg: &mut MsgBuffer, from: crate::wire::WireFormat, to: crate::wire::WireFormat, peer_id: &NodeId
+    ) -> bool {
+        use crate::wire::{ethernet_header_len, synthetic_mac_for_ip, wrap_ip, WireFormat};
+        if from == to {
+            return true;
+        }
+        match (from, to) {
+            (WireFormat::Ethernet, WireFormat::Ethernet) | (WireFormat::Ip, WireFormat::Ip) => true,
+            (WireFormat::Ethernet, WireFormat::Ip) => {
+                let Some(off) = ethernet_header_len(msg.message()) else {
+                    return false;
+                };
+                let len = msg.len() - off;
+                msg.message_mut().copy_within(off..off + len, 0);
+                msg.set_length(len);
+                true
+            }
+            (WireFormat::Ip, WireFormat::Ethernet) => {
+                // Use a MAC derived from the peer and destination IP so each
+                // announced address has a distinct Ethernet identity.
+                let dst_ip = if msg.message().len() >= 20 && msg.message()[0] >> 4 == 4 {
+                    [msg.message()[16], msg.message()[17], msg.message()[18], msg.message()[19]]
+                } else {
+                    [0u8; 4]
+                };
+                let src_mac = synthetic_mac_for_ip(peer_id, dst_ip);
+                let Some(frame) = wrap_ip(msg.message(), src_mac, self.device.mac_address()) else {
+                    return false;
+                };
+                msg.clone_from(&frame);
+                true
+            }
+        }
+    }
+
     #[inline]
     fn send_msg(&mut self, addr: SocketAddr, type_: u8, msg: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
         debug!("Sending msg with {} bytes to {}", msg.len(), addr);
+        crate::util::wire_log("OUT", addr, type_, msg.message());
+        let is_data = type_ == MESSAGE_TYPE_DATA || type_ == MESSAGE_TYPE_DATA_GSO;
+        if is_data && type_ != MESSAGE_TYPE_DATA_GSO {
+            let (target, peer_id, caps) = match self.peers.get(&addr) {
+                Some(peer) => (peer.wire_format, peer.node_id, peer.wire_caps),
+                None => return Err(Error::Message("Sending to node that is not a peer"))
+            };
+            let local = self.local_wire_format();
+            if target != local {
+                if !self.convert_payload(msg, local, target, &peer_id) {
+                    self.traffic.count_dropped_payload(msg.len());
+                    warn!("Dropping L2-only payload for IP-only peer {}", addr_nice(addr));
+                    return Ok(());
+                }
+            } else if !caps.is_unknown() && !caps.can(local) {
+                // No mutually supported format. Fail loudly instead of
+                // letting the peer misparse the payload.
+                self.traffic.count_dropped_payload(msg.len());
+                warn!(
+                    "Dropping DATA to {}: peer does not accept {:?} payloads (tun vs tap mismatch)",
+                    addr_nice(addr),
+                    local
+                );
+                return Ok(());
+            }
+        }
+        let compress =
+            self.config.compression && is_data && self.peers.get(&addr).map(|p| p.compression).unwrap_or(false);
+        let wire_type = if compress {
+            match crate::compress::maybe_compress(msg.message()) {
+                Some(compressed) => {
+                    let compressed_type = if type_ == MESSAGE_TYPE_DATA {
+                        MESSAGE_TYPE_DATA_COMPRESSED
+                    } else {
+                        MESSAGE_TYPE_DATA_GSO_COMPRESSED
+                    };
+                    msg.clone_from(&compressed);
+                    compressed_type
+                }
+                None => type_
+            }
+        } else {
+            type_
+        };
         if !self.peers.contains_key(&addr) {
             return Err(Error::Message("Sending to node that is not a peer"));
         }
-        if type_ == MESSAGE_TYPE_DATA || type_ == MESSAGE_TYPE_DATA_GSO {
-            if self.peers.get(&addr).and_then(|p| p.crypto.shared_handle()).is_some() {
-                let mut owned = self.take_spare();
-                mem::swap(msg, &mut owned);
-                self.pending_encrypt.entry(addr).or_default().push((type_, owned));
-                msg.clear();
-                return Ok(());
-            }
+        if is_data && self.peers.get(&addr).and_then(|p| p.crypto.shared_handle()).is_some() {
+            let mut owned = self.take_spare();
+            mem::swap(msg, &mut owned);
+            self.pending_encrypt.entry(addr).or_default().push((wire_type, owned));
+            msg.clear();
+            return Ok(());
         }
         self.peers
             .get_mut(&addr)
             .ok_or(Error::Message("Sending to node that is not a peer"))?
             .crypto
-            .with_mut(|c| c.send_message(type_, msg))??;
+            .with_mut(|c| c.send_message(wire_type, msg))??;
         self.send_to(addr, msg)
     }
 
@@ -619,8 +744,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 note_tun_flush(n);
                 // The written prefix is what just hit the TUN. A short count
                 // below a chunk is the TUN queue blocking, not a finished inject.
-                let udp = n > 0
-                    && pkts.first().is_some_and(|b| crate::payload::udp_segment(b.message()).is_some());
+                let udp = n > 0 && pkts.first().is_some_and(|b| crate::payload::udp_segment(b.message()).is_some());
                 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 let blocked = udp && n < crate::device::UDP_INJECT_CHUNK;
                 #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
@@ -640,8 +764,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             }
             Ok(n) => {
                 note_tun_flush(n);
-                let udp = n > 0
-                    && pkts.first().is_some_and(|b| crate::payload::udp_segment(b.message()).is_some());
+                let udp = n > 0 && pkts.first().is_some_and(|b| crate::payload::udp_segment(b.message()).is_some());
                 for buf in pkts {
                     self.buf_spare.push(buf);
                 }
@@ -676,13 +799,13 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
     }
 
-    fn arm_udp_inject_gap(&mut self, packets: usize, started_ns: u64) {
+    fn arm_udp_inject_gap(&mut self, packets: usize, _started_ns: u64) {
         self.udp_gap_budget = packets;
         self.udp_gap_deadline_ns = 0;
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-        if packets > 0 && started_ns > 0 {
+        if packets > 0 && _started_ns > 0 {
             let ns = (packets as u64).saturating_mul(crate::device::UDP_INJECT_PACKET_NS);
-            self.udp_gap_deadline_ns = started_ns.saturating_add(ns.min(crate::device::UDP_INJECT_GAP_NS));
+            self.udp_gap_deadline_ns = _started_ns.saturating_add(ns.min(crate::device::UDP_INJECT_GAP_NS));
         }
     }
 
@@ -694,7 +817,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     fn pace_udp_inject(&mut self) -> bool {
         #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         {
-            return false;
+            false
         }
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
@@ -882,7 +1005,17 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             let group = auth.group.clone();
             transit.push(TransitClaim { node_id, addr, claim, group });
         }
-        NodeInfo {
+        // Gossip first-hand RTTs to our direct peers so others can estimate
+        // end-to-end paths and suggest relays. Legacy peers skip this part.
+        let mut peer_rtts: Vec<(NodeId, u16)> = self
+            .peers
+            .values()
+            .filter(|peer| peer.rtt_us != u64::MAX)
+            .take(NodeInfo::MAX_PEER_QUALITY)
+            .map(|peer| (peer.node_id, (peer.rtt_us / 1000).min(u16::MAX as u64) as u16))
+            .collect();
+        peer_rtts.sort_by_key(|(id, _)| *id);
+        let mut info = NodeInfo {
             node_id: self.node_id,
             peers,
             claims: self.claims.clone(),
@@ -892,34 +1025,73 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             group: self.config.announce_group.clone(),
             e2e_public: Some(self.e2e_public),
             peer_e2e,
-            transit
+            transit,
+            // All builds in this version can decompress LZ4; advertising the
+            // capability lets opt-in peers compress toward us.
+            compression: true,
+            // Advertise the DATA payload formats we can receive. Legacy peers
+            // skip this part; their format is inferred from their claims.
+            wire_caps: self.local_wire_caps().bits(),
+            peer_rtts,
+            node_signature: None
+        };
+        if let Some(ref key) = self.config.node_key {
+            let seed = match crate::util::from_base62_fixed::<32>(key) {
+                Ok(seed) => seed,
+                Err(_) => {
+                    warn!("Invalid node-key in config; announcements will be unsigned");
+                    return info;
+                }
+            };
+            match Ed25519KeyPair::from_seed(&seed) {
+                Ok(pair) => info.node_signature = Some(pair.sign(&info.identity_bytes())),
+                Err(_) => warn!("Invalid node-key in config; announcements will be unsigned")
+            }
         }
+        info
     }
 
-    /// Remember the local NIC MTU and size the tunnel for it. A later peer
-    /// advertisement can only lower this.
+    /// Remember the local NIC MTU (capped by the profile) and size the tunnel
+    /// for it. Updates can both lower and raise it as links change.
     pub fn set_local_underlay(&mut self, l2_mtu: usize, ipv6: bool) {
         if !(68..=65535).contains(&l2_mtu) {
             return;
         }
-        self.local_l2 = l2_mtu;
+        self.local_l2 = l2_mtu.min(self.config.effective_max_underlay_mtu());
         self.ipv6_underlay = ipv6;
         self.apply_underlay_limit();
     }
 
-    fn note_peer_underlay(&mut self, mtu: Option<u16>) {
+    /// Track one peer's advertised underlay MTU and recompute the global
+    /// minimum. Per-peer state is required so a departing low-MTU peer (or a
+    /// mobile peer switching to a fatter link) can let the tunnel MTU recover.
+    fn note_peer_underlay(&mut self, addr: SocketAddr, mtu: Option<u16>) {
         let Some(mtu) = mtu else {
             return;
         };
-        let mtu = mtu as usize;
+        let mtu = (mtu as usize).min(self.config.effective_max_underlay_mtu());
         if !(68..=65535).contains(&mtu) {
             return;
         }
-        let next = self.peer_l2.map_or(mtu, |cur| cur.min(mtu));
-        if self.peer_l2 == Some(next) {
+        if self.peer_mtus.get(&addr) == Some(&mtu) {
             return;
         }
-        self.peer_l2 = Some(next);
+        self.peer_mtus.insert(addr, mtu);
+        self.recompute_peer_l2();
+    }
+
+    fn remove_peer_mtu(&mut self, addr: SocketAddr) {
+        if self.peer_mtus.remove(&addr).is_some() {
+            self.recompute_peer_l2();
+        }
+    }
+
+    fn recompute_peer_l2(&mut self) {
+        let next = self.peer_mtus.values().copied().min();
+        if self.peer_l2 == next {
+            return;
+        }
+        self.peer_l2 = next;
         self.apply_underlay_limit();
     }
 
@@ -928,7 +1100,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             return;
         }
         let l2 = crate::mtu::limiting_l2(self.local_l2, self.peer_l2);
-        if self.applied_l2 == l2 || (self.applied_l2 != 0 && l2 > self.applied_l2) {
+        if self.applied_l2 == l2 {
             return;
         }
         match self.device.set_path_budget(self.config.mtu, l2, self.ipv6_underlay) {
@@ -996,6 +1168,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 // Same as the timeout path. Leaving the claim in place makes the
                 // next lookup miss the direct peer and relay that prefix elsewhere.
                 self.table.remove_claims(addr);
+                self.remove_peer_mtu(addr);
                 self.connect_sock(addr)?;
             }
         }
@@ -1066,7 +1239,273 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         Ok(())
     }
 
+    fn is_data_type(&self, type_: u8) -> bool {
+        matches!(
+            type_,
+            MESSAGE_TYPE_DATA | MESSAGE_TYPE_DATA_COMPRESSED | MESSAGE_TYPE_DATA_GSO | MESSAGE_TYPE_DATA_GSO_COMPRESSED
+        )
+    }
+
+    /// Send a broadcast through one well-connected peer for redistribution.
+    /// The weak sender emits one copy instead of one per peer.
+    fn send_flood(&mut self, type_: u8, data: &mut MsgBuffer) -> Result<(), Error> {
+        // Flood envelopes are converted per peer by `broadcast_msg`/`send_msg`,
+        // but the relay path assumes one wire format for the whole mesh. With
+        // mixed TAP/TUN peers, fall back to per-peer delivery so each payload
+        // can be translated to the receiver's format.
+        let local = self.local_wire_format();
+        if self.peers.values().any(|peer| peer.wire_format != local) {
+            return self.broadcast_msg(type_, data);
+        }
+        // Use a pinned redistribution peer when configured and connected;
+        // otherwise lowest RTT is a rough proxy for "well connected".
+        let via = self
+            .config
+            .flood_relay_via
+            .as_ref()
+            .and_then(|id| crate::util::from_hex(id).ok())
+            .and_then(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
+            .and_then(|id| self.peers.iter().find(|(_, peer)| peer.node_id == id).map(|(addr, _)| *addr))
+            .or_else(|| self.peers.iter().min_by_key(|(_, peer)| peer.rtt_us).map(|(addr, _)| *addr));
+        let Some(via) = via else {
+            return self.broadcast_msg(type_, data);
+        };
+        let seq = self.flood_seq.wrapping_add(1);
+        self.flood_seq = seq;
+        if self.flood_seen.len() > 8192 {
+            self.flood_seen.clear();
+        }
+        self.flood_seen.insert((self.node_id, seq));
+        let payload = data.message().to_vec();
+        let mut frame = self.take_spare();
+        frame.clone_from(&payload);
+        frame.prepend_zero(FLOOD_HEADER_LEN);
+        let head = frame.message_mut();
+        head[..16].copy_from_slice(&self.node_id);
+        head[16..20].copy_from_slice(&seq.to_le_bytes());
+        let flood_type = if self.mesh_ttl_enabled() {
+            let mut framed = frame.message().to_vec();
+            framed.insert(FLOOD_HEADER_LEN, DEFAULT_WIRE_TTL);
+            frame.clone_from(&framed);
+            MESSAGE_TYPE_FLOOD_TTL
+        } else {
+            MESSAGE_TYPE_FLOOD
+        };
+        debug!(
+            "Flooding {} bytes via {} (origin {}, seq {})",
+            payload.len(),
+            addr_nice(via),
+            bytes_to_hex(&self.node_id),
+            seq
+        );
+        self.send_msg(via, flood_type, &mut frame)?;
+        self.buf_spare.push(frame);
+        Ok(())
+    }
+
+    /// Apply the safely reloadable parts of a config after SIGHUP. Device,
+    /// crypto and listen settings need a restart and are ignored here.
+    fn reload_config(&mut self) {
+        let Some(path) = CtrlC::reload_path() else {
+            warn!("SIGHUP received but no config path is known");
+            return;
+        };
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                warn!("Config reload failed to read {}: {}", path.display(), e);
+                return;
+            }
+        };
+        let format = crate::config::config_format_from_path(&path);
+        let file = match crate::config::parse_config_contents(&raw, format) {
+            Ok(file) => file,
+            Err(e) => {
+                warn!("Config reload failed to parse {}: {}", path.display(), e);
+                return;
+            }
+        };
+        let mut new = Config::default();
+        new.merge_file(file);
+        // Enforce the same signature policy as the initial load. Without this,
+        // a signed config could be swapped for an unsigned/tampered one and
+        // accepted on SIGHUP, bypassing --require-signed-config.
+        let verify_keys = crate::config_verify::reload_verify_keys();
+        if let Err(e) = crate::config_verify::verify_loaded_config(&new, Some(&raw), &verify_keys) {
+            warn!("Config reload rejected (signature): {}", e);
+            return;
+        }
+        if let Err(e) = new.validate() {
+            warn!("Config reload rejected: {}", e);
+            return;
+        }
+        // Claims and auto-claim are safe to reload: they only change what we
+        // announce, and peers install the new ranges from our next NodeInfo.
+        let (claims, local_ips, claim_errors) = build_claims(&new, &self.device);
+        for err in claim_errors {
+            warn!("Config reload skipped claim: {}", err);
+        }
+        self.claims = claims;
+        self.local_ips = local_ips;
+        self.config.claims = new.claims.clone();
+        self.config.local_addresses = new.local_addresses.clone();
+        self.config.auto_claim = new.auto_claim;
+        let mut desired = self.table.all_claims();
+        desired.extend(self.claims.iter().copied());
+        self.routes.sync(&desired);
+        match crate::acl::Acl::parse(&new.acl) {
+            Ok(acl) => {
+                self.acl = acl;
+                self.config.acl = new.acl;
+            }
+            Err(e) => {
+                warn!("Invalid ACL in reload: {}", e);
+                return;
+            }
+        }
+        match policy::parse_grants(&new.grants) {
+            Ok(grants) => self.grants = grants,
+            Err(e) => warn!("Invalid grants in reload: {}", e)
+        }
+        let mut split = RangeList::new();
+        for s in &new.split {
+            match Range::from_str(s) {
+                Ok(range) => split.push(range),
+                Err(e) => warn!("Invalid split prefix {}: {}", s, e)
+            }
+        }
+        self.split_prefixes = split;
+        self.names = policy::parse_peer_names(&new.peer_names);
+        self.config.stateful_filter = new.stateful_filter;
+        self.config.full_tunnel = new.full_tunnel;
+        // The datapath routes on the parsed NodeIds, not the config strings.
+        // Re-derive them exactly as `Cloud::new` does, including the fallback
+        // that allows only the exit node when no allow-list is configured.
+        let exit_node = new.exit_node.as_deref().and_then(policy::parse_node_id);
+        let mut exit_allow: Vec<NodeId> = new.exit_allow.iter().filter_map(|s| policy::parse_node_id(s)).collect();
+        if exit_allow.is_empty() {
+            if let Some(id) = exit_node {
+                exit_allow.push(id);
+            }
+        }
+        self.exit_node = exit_node;
+        self.exit_allow = exit_allow;
+        self.config.exit_node = new.exit_node;
+        self.config.exit_allow = new.exit_allow;
+        for peer in &new.peers {
+            let with_port = ensure_peer_port(peer);
+            if let Ok(mut addrs) = with_port.to_socket_addrs() {
+                if let Some(addr) = addrs.next() {
+                    let addr = mapped_addr(addr);
+                    if !self.peers.contains_key(&addr) {
+                        let _ = self.connect_sock(addr);
+                    }
+                }
+            }
+        }
+        // Announce immediately so peers install/drop routes without waiting
+        // for the next housekeeping interval.
+        let mut buffer = MsgBuffer::new(SPACE_BEFORE);
+        let info = self.create_node_info();
+        info.encode(&mut buffer);
+        if let Err(e) = self.broadcast_msg(MESSAGE_TYPE_NODE_INFO, &mut buffer) {
+            warn!("Failed to announce reloaded config: {}", e);
+        }
+        info!("Reloaded policy config from {}", path.display());
+    }
+
+    /// Aggregate first-hand and gossiped RTTs into a quality table, and pick
+    /// the best relayed path when a destination is not a direct peer.
+    pub(crate) fn quality_snapshot(
+        &self
+    ) -> (Vec<crate::runtime_status::QualityEntry>, Option<crate::runtime_status::RelaySuggestion>) {
+        let mut best: HashMap<NodeId, u32> = HashMap::new();
+        for peer in self.peers.values() {
+            if peer.rtt_us != u64::MAX {
+                best.insert(peer.node_id, (peer.rtt_us / 1000) as u32);
+            }
+        }
+        // Collect all candidate paths per destination, then take the median
+        // estimate so a single peer reporting a bogus RTT cannot skew the
+        // suggestion (a cheap alternative to signing every report).
+        let mut candidates: HashMap<NodeId, Vec<(u32, SocketAddr, NodeId)>> = HashMap::new();
+        for (addr, peer) in &self.peers {
+            if peer.rtt_us == u64::MAX {
+                continue;
+            }
+            let Some(reports) = self.peer_quality.get(&peer.node_id) else {
+                continue;
+            };
+            let our_ms = (peer.rtt_us / 1000) as u32;
+            for (dest, reported_ms) in reports {
+                if *dest == self.node_id || self.peers.values().any(|p| p.node_id == *dest) {
+                    continue;
+                }
+                // 2 ms accounts for the extra decrypt/forward hop.
+                let estimate = our_ms.saturating_add(*reported_ms as u32).saturating_add(2);
+                candidates.entry(*dest).or_default().push((estimate, *addr, peer.node_id));
+            }
+        }
+        let mut suggestion: Option<crate::runtime_status::RelaySuggestion> = None;
+        for (dest, mut list) in candidates {
+            list.sort_by_key(|(rtt, addr, _)| (*rtt, *addr));
+            let median = list[list.len() / 2].0;
+            let chosen = list
+                .into_iter()
+                .min_by_key(|(rtt, addr, _)| (rtt.abs_diff(median), *addr))
+                .expect("non-empty candidate list");
+            if best.get(&dest).is_none_or(|current| chosen.0 < *current) {
+                best.insert(dest, chosen.0);
+                suggestion = Some(crate::runtime_status::RelaySuggestion {
+                    via_addr: addr_nice(chosen.1).to_string(),
+                    via_node: crate::util::bytes_to_hex(&chosen.2),
+                    dest_node: crate::util::bytes_to_hex(&dest),
+                    estimated_rtt_ms: chosen.0
+                });
+            }
+        }
+        let mut quality: Vec<(NodeId, u32)> = best.into_iter().collect();
+        quality.sort_by_key(|(id, rtt)| (*rtt, *id));
+        let entries = quality
+            .into_iter()
+            .map(|(id, rtt)| {
+                crate::runtime_status::QualityEntry { node_id: crate::util::bytes_to_hex(&id), estimated_rtt_ms: rtt }
+            })
+            .collect();
+        (entries, suggestion)
+    }
+
+    /// Refresh the JSON status file, Prometheus text, and GUI peer list.
+    fn write_status_file(&self) {
+        let peers = self
+            .peers
+            .iter()
+            .map(|(addr, p)| {
+                let rate = self.peer_limit.state(*addr);
+                crate::runtime_status::PeerStatus {
+                    addr: addr_nice(*addr).to_string(),
+                    node_id: crate::util::bytes_to_hex(&p.node_id),
+                    rtt_ms: if p.rtt_us == u64::MAX { None } else { Some(p.rtt_us / 1000) },
+                    throttled: rate.throttled,
+                    penalty: rate.penalty
+                }
+            })
+            .collect();
+        let mut status = crate::status_report::build(self.device.ifname(), peers);
+        let (quality, suggested_relay) = self.quality_snapshot();
+        status.quality = quality;
+        status.suggested_relay = suggested_relay;
+        crate::runtime_status::set_prometheus(crate::status_report::prometheus(&status));
+        crate::runtime_status::set_peers(status.peers.clone());
+        if let Some(ref path) = self.config.status_file {
+            if let Err(e) = crate::status_report::write_json(Path::new(path), &status) {
+                debug!("Failed to write status file {}: {}", path, e);
+            }
+        }
+    }
+
     fn housekeep(&mut self) -> Result<(), Error> {
+        self.flush_jitter();
         let now = TS::now();
         let mut buffer = MsgBuffer::new(SPACE_BEFORE);
         let mut del: SmallVec<[SocketAddr; 3]> = SmallVec::new();
@@ -1077,12 +1516,20 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         }
         for addr in del {
             info!("Forgot peer {} due to timeout", addr_nice(addr));
-            self.peers.remove(&addr);
+            if let Some(peer) = self.peers.remove(&addr) {
+                self.peer_quality.remove(&peer.node_id);
+            }
             self.table.remove_claims(addr);
+            self.remove_peer_mtu(addr);
+            self.peer_limit.remove(addr);
             self.connect_sock(addr)?; // Try to reconnect
         }
         self.table.housekeep();
+        let mut desired = self.table.all_claims();
+        desired.extend(self.claims.iter().copied());
+        self.routes.sync(&desired);
         self.init_limit.housekeep(now);
+        self.peer_limit.housekeep(TS::now());
         self.crypto_housekeep()?;
         if self.config.tcp_fallback {
             for addr in self.pending_inits.keys().copied().collect::<SmallVec<[SocketAddr; 4]>>() {
@@ -1110,6 +1557,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             self.next_peers = now + Time::from(interval);
         }
         self.reconnect_to_peers()?;
+        self.write_status_file();
         if self.next_stats_out < now {
             // Write out the statistics
             self.write_out_stats().map_err(|err| Error::FileIo("Failed to write stats file", err))?;
@@ -1299,23 +1747,38 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     fn relay_hops(&self) -> Vec<policy::RelayHop> {
         self.peers
             .iter()
-            .map(|(addr, peer)| policy::RelayHop {
-                node_id: peer.node_id,
-                addr: *addr,
-                rtt_us: peer.rtt_us,
-                alive: true
+            .map(|(addr, peer)| {
+                policy::RelayHop { node_id: peer.node_id, addr: *addr, rtt_us: peer.rtt_us, alive: true }
             })
             .collect()
     }
 
-    fn pick_relay(&self, except: SocketAddr) -> Option<SocketAddr> {
-        match policy::choose_delivery(false, &self.relay_hops(), except) {
+    fn pick_relay(&mut self, except: SocketAddr) -> Option<SocketAddr> {
+        let hops = self.relay_hops();
+        let best = match policy::choose_delivery(false, &hops, except) {
             policy::Delivery::Relay(addr) => Some(addr),
             _ => None
+        };
+        // Keep the previous relay while it is still close to the best one:
+        // flapping between near-equal hops costs more than a few ms of RTT.
+        if let Some((sticky, chosen_at)) = self.relay_sticky {
+            if sticky != except && TS::now().saturating_sub(chosen_at) < 60 {
+                if let Some(sticky_hop) = hops.iter().find(|h| h.addr == sticky) {
+                    let best_rtt = best.and_then(|addr| hops.iter().find(|h| h.addr == addr).map(|h| h.rtt_us));
+                    let threshold = best_rtt.map(|rtt| rtt.saturating_mul(120) / 100 + 5_000).unwrap_or(u64::MAX);
+                    if sticky_hop.rtt_us <= threshold {
+                        return Some(sticky);
+                    }
+                }
+            }
         }
+        self.relay_sticky = best.map(|addr| (addr, TS::now()));
+        best
     }
 
-    fn send_relay(&mut self, via: SocketAddr, dest: NodeId, inner: u8, msg: &mut MsgBuffer) -> Result<(), Error> {
+    fn send_relay(
+        &mut self, via: SocketAddr, dest: NodeId, inner: u8, msg: &mut MsgBuffer, ttl: Option<u8>
+    ) -> Result<(), Error> {
         let plain = msg.message().to_vec();
         let Some(pk) = self.known_e2e.get(&dest).copied() else {
             debug!("Dropping relay: no end-to-end key for destination");
@@ -1327,14 +1790,111 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             self.traffic.count_dropped_payload(plain.len());
             return Ok(());
         };
-        let frame = policy::encode_relay(&dest, inner, &body);
+        let mut frame = policy::encode_relay(&dest, inner, &body);
+        if let Some(ttl) = ttl {
+            // Insert the hop count after the destination and inner type.
+            frame.insert(17, ttl);
+        }
         msg.clear();
         msg.clone_from(&frame);
         debug!("Relaying type {} for node via {}", inner, addr_nice(via));
-        self.send_msg(via, MESSAGE_TYPE_RELAY, msg)
+        let relay_type = if ttl.is_some() { MESSAGE_TYPE_RELAY_TTL } else { MESSAGE_TYPE_RELAY };
+        self.send_msg(via, relay_type, msg)
     }
 
-    fn handle_relay(&mut self, src: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
+    /// Receive a redistributed broadcast: deliver locally once, then forward
+    /// to every other peer. The flood header carries (origin, sequence) so
+    /// nodes can ignore frames they have already handled.
+    fn handle_flood(&mut self, src: SocketAddr, data: &mut MsgBuffer, ttl_enabled: bool) -> Result<(), Error> {
+        let header_len = FLOOD_HEADER_LEN + usize::from(ttl_enabled);
+        if data.message().len() < header_len + 20 {
+            debug!("Dropping truncated flood frame");
+            self.traffic.count_invalid_protocol(data.len());
+            return Ok(());
+        }
+        let mut origin = [0u8; 16];
+        origin.copy_from_slice(&data.message()[..16]);
+        let seq = u32::from_le_bytes(data.message()[16..20].try_into().unwrap());
+        if ttl_enabled {
+            let ttl = data.message()[FLOOD_HEADER_LEN];
+            if ttl <= 1 {
+                debug!("Dropping flood frame with exhausted hop count");
+                self.traffic.count_dropped_payload(data.len());
+                return Ok(());
+            }
+        }
+        if self.flood_seen.contains(&(origin, seq)) {
+            debug!("Dropping duplicate flood frame from {}", bytes_to_hex(&origin));
+            return Ok(());
+        }
+        if self.flood_seen.len() > 8192 {
+            self.flood_seen.clear();
+        }
+        self.flood_seen.insert((origin, seq));
+
+        // Keep the full frame (header + payload) for re-flooding before the
+        // payload handler swaps and clears the buffer.
+        let mut full = data.message().to_vec();
+        if ttl_enabled {
+            full[FLOOD_HEADER_LEN] -= 1;
+        }
+        data.skip(header_len);
+        self.handle_payload_from(src, data, None)?;
+
+        let addrs: Vec<SocketAddr> = self.peers.keys().copied().filter(|addr| *addr != src).collect();
+        for addr in addrs {
+            let mut frame = self.take_spare();
+            frame.clone_from(&full);
+            let forward_type = if ttl_enabled { MESSAGE_TYPE_FLOOD_TTL } else { MESSAGE_TYPE_FLOOD };
+            if let Err(e) = self.send_msg(addr, forward_type, &mut frame) {
+                debug!("Flood forward to {} failed: {}", addr_nice(addr), e);
+            }
+            self.buf_spare.push(frame);
+        }
+        Ok(())
+    }
+
+    fn handle_relay(&mut self, src: SocketAddr, data: &mut MsgBuffer, ttl_enabled: bool) -> Result<(), Error> {
+        // The inner message type travels in the relay frame and is supplied by
+        // the peer. Never let it select a control-plane message (CLOSE,
+        // NODE_INFO, ...) after the end-to-end seal is opened.
+        if data.message().len() < 17 || !policy::is_relayable_type(data.message()[16]) {
+            debug!("Dropping relay with non-data inner message type");
+            self.traffic.count_invalid_protocol(data.len());
+            return Ok(());
+        }
+        // In TTL-capable meshes the frame carries a hop count at offset 17.
+        // Strip it before the loop key/decision so the key stays stable across
+        // hops and older logic sees the legacy layout.
+        let next_ttl = if ttl_enabled {
+            if data.message().len() < 18 {
+                self.traffic.count_invalid_protocol(data.len());
+                return Ok(());
+            }
+            let ttl = data.message()[17];
+            if ttl <= 1 {
+                debug!("Dropping relay frame with exhausted hop count");
+                self.traffic.count_dropped_payload(data.len());
+                return Ok(());
+            }
+            let stripped = {
+                let mut v = data.message().to_vec();
+                v.remove(17);
+                v
+            };
+            data.clone_from(&stripped);
+            Some(ttl - 1)
+        } else {
+            None
+        };
+        // Drop frames we already forwarded so a single packet for an unknown
+        // destination cannot loop between hops.
+        let key = relay_frame_key(data.message());
+        if self.relay_seen.contains(&key) {
+            debug!("Dropping already-seen relay frame (loop)");
+            self.traffic.count_dropped_payload(data.len());
+            return Ok(());
+        }
         let hops = self.relay_hops();
         let decision = policy::decide_relay(&self.node_id, data.message(), &hops, Some(src));
         match decision {
@@ -1348,6 +1908,13 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                     self.traffic.count_dropped_payload(inner.len());
                     return Ok(());
                 };
+                // A malicious relay cannot alter the sealed body without
+                // breaking the AEAD, but it can replay a captured one.
+                if !self.accept_e2e_body(sealer, &inner) {
+                    debug!("Dropping replayed e2e relay body");
+                    self.traffic.count_dropped_payload(inner.len());
+                    return Ok(());
+                }
                 let mut buf = self.take_spare();
                 buf.clone_from(&plain);
                 let result = self.handle_message(src, MessageResult::Message(inner_type), &mut buf, Some(sealer));
@@ -1355,10 +1922,18 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 result
             }
             policy::RelayDecision::Forward { via, dest, inner_type, inner } => {
-                let frame = policy::encode_relay(&dest, inner_type, &inner);
+                if self.relay_seen.len() >= MAX_RELAY_SEEN {
+                    self.relay_seen.clear();
+                }
+                self.relay_seen.insert(key);
+                let mut frame = policy::encode_relay(&dest, inner_type, &inner);
+                if let Some(ttl) = next_ttl {
+                    frame.insert(17, ttl);
+                }
                 let mut buf = self.take_spare();
                 buf.clone_from(&frame);
-                let result = self.send_msg(via, MESSAGE_TYPE_RELAY, &mut buf);
+                let forward_type = if next_ttl.is_some() { MESSAGE_TYPE_RELAY_TTL } else { MESSAGE_TYPE_RELAY };
+                let result = self.send_msg(via, forward_type, &mut buf);
                 self.buf_spare.push(buf);
                 result
             }
@@ -1387,7 +1962,8 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 {
                     self.send_msg(addr, type_, data)?;
                 } else if let Some(via) = self.pick_relay(addr) {
-                    self.send_relay(via, dest_id, type_, data)?;
+                    let ttl = self.mesh_ttl_enabled().then_some(DEFAULT_WIRE_TTL);
+                    self.send_relay(via, dest_id, type_, data, ttl)?;
                     self.connect_sock(addr)?;
                 } else {
                     warn!("Destination for {} not found in peers: {}", dst, addr_nice(addr));
@@ -1397,7 +1973,11 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             }
             None => {
                 if self.broadcast {
-                    self.broadcast_msg(type_, data)?;
+                    if self.config.flood_relay && self.peers.len() > 1 && self.is_data_type(type_) {
+                        self.send_flood(type_, data)?;
+                    } else {
+                        self.broadcast_msg(type_, data)?;
+                    }
                 } else {
                     self.traffic.count_dropped_payload(data.len());
                 }
@@ -1419,7 +1999,8 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             self.traffic.count_dropped_payload(data.len());
             return Ok(());
         }
-        let (src, dst) = P::parse(data.message())?;
+        // GSO aggregates always carry raw IP, regardless of the local device.
+        let (src, dst) = crate::wire::WireFormat::Ip.parse(data.message())?;
         self.traffic.count_out_payload(dst, src, data.len());
         if data.get_start() < GSO_META_LEN {
             return Err(Error::Message("No headroom for GSO metadata"));
@@ -1440,15 +2021,24 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             self.traffic.count_invalid_protocol(data.len());
             return Err(Error::Message("Invalid GSO message"));
         }
+        if self.local_wire_format() != crate::wire::WireFormat::Ip {
+            self.traffic.count_dropped_payload(data.len());
+            debug!("Dropping GSO aggregate: local device is not TUN");
+            return Ok(());
+        }
+        let gso_len = data.len();
+        if !self.peer_rate_allowed(peer, gso_len) {
+            return Ok(());
+        }
         let (src, dst) = {
             let ip = &data.message()[GSO_META_LEN..];
-            let (src, dst) = P::parse(ip)?;
+            // GSO aggregates always carry raw IP, even from TUN-only peers.
+            let (src, dst) = crate::wire::WireFormat::Ip.parse(ip)?;
             if !self.ingress_allowed(peer, ip, src, sealer) {
                 return Ok(());
             }
             if !self.acl.is_empty() {
-                let tap = self.config.device_type == Type::Tap;
-                let l4 = crate::payload::overlay_l4(ip, tap);
+                let l4 = crate::payload::overlay_l4(ip, false);
                 let match_src = l4.ip_src.unwrap_or(src);
                 if !self.acl.allows(match_src, l4.proto, l4.dport) {
                     debug!("ACL dropped GSO src {} proto {:?} dport {:?}", match_src, l4.proto, l4.dport);
@@ -1494,9 +2084,42 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         Ok(())
     }
 
+    /// On a TAP bridge, answer local ARP requests so IP-only peers do not need
+    /// to carry L2 broadcast traffic. Our own overlay IP gets the interface
+    /// MAC; routable peer IPs get a stable synthetic MAC derived from node id.
+    fn arp_for_local(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        use crate::wire::{arp_reply, synthetic_mac_for_ip};
+        if frame.len() < 42 || u16::from_be_bytes([frame[12], frame[13]]) != 0x0806 {
+            return None;
+        }
+        let arp = &frame[14..];
+        if u16::from_be_bytes([arp[6], arp[7]]) != 1 {
+            return None;
+        }
+        let ip = [arp[24], arp[25], arp[26], arp[27]];
+        // Our own primary address uses the real interface MAC.
+        if self.device.address().ok() == Some(std::net::Ipv4Addr::from(ip)) {
+            return arp_reply(frame, ip, self.device.mac_address());
+        }
+        // Additional local IPs get a distinct per-IP synthetic MAC.
+        if self.local_ips.contains(&ip) {
+            return arp_reply(frame, ip, synthetic_mac_for_ip(&self.node_id, ip));
+        }
+        // Remote IPs use the owning node's per-IP synthetic MAC.
+        let dest = Address::from(std::net::Ipv4Addr::from(ip));
+        let (_, node_id) = self.table.lookup(dest)?;
+        arp_reply(frame, ip, synthetic_mac_for_ip(&node_id, ip))
+    }
+
     pub fn handle_interface_data(&mut self, data: &mut MsgBuffer) -> Result<(), Error> {
         // HOT PATH
-        let (src, dst) = P::parse(data.message())?;
+        if self.config.l2_l3_bridge && self.local_wire_format() == crate::wire::WireFormat::Ethernet {
+            if let Some(reply) = self.arp_for_local(data.message()) {
+                let _ = self.device.write(&reply);
+                return Ok(());
+            }
+        }
+        let (src, dst) = self.local_wire_format().parse(data.message())?;
         if !self.names.is_empty() {
             if let Some(mut resp) = policy::answer_dns(data.message(), &self.names) {
                 crate::payload::fix_ipv4_checksums(&mut resp);
@@ -1532,6 +2155,19 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             ],
             true
         );
+        // A known node reappearing from a new address (phone switching WiFi ->
+        // cellular) replaces its old entry immediately. Otherwise the stale
+        // address keeps the route and blackholes packets until its timeout.
+        if self.config.mobility {
+            let old = self.peers.iter().find(|(a, peer)| **a != addr && peer.node_id == info.node_id).map(|(a, _)| *a);
+            if let Some(old) = old {
+                info!("Peer {} moved from {} to {}", bytes_to_hex(&info.node_id), addr_nice(old), addr_nice(addr));
+                self.peers.remove(&old);
+                self.pending_inits.remove(&old);
+                self.table.remove_claims(old);
+                self.remove_peer_mtu(old);
+            }
+        }
         if let Some(init) = self.pending_inits.remove(&addr) {
             self.peers.insert(addr, PeerData {
                 addrs: info.addrs.clone(),
@@ -1542,7 +2178,10 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 timeout: TS::now() + self.config.peer_timeout as Time,
                 rtt_us: u64::MAX,
                 group_ok: true,
-                auth_claims: RangeList::new()
+                auth_claims: RangeList::new(),
+                compression: false,
+                wire_caps: crate::wire::WireCaps::default(),
+                wire_format: crate::wire::WireFormat::from_device_type(self.config.device_type)
             });
             self.update_peer_info(addr, Some(info))?;
         } else {
@@ -1554,7 +2193,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     fn remove_peer(&mut self, addr: SocketAddr) {
         if let Some(peer) = self.peers.remove(&addr) {
             info!("Closing connection to {}", addr_nice(addr));
+            self.peer_quality.remove(&peer.node_id);
             self.table.remove_claims(addr);
+            self.remove_peer_mtu(addr);
             self.config.call_hook(
                 "peer_disconnected",
                 vec![
@@ -1591,14 +2232,15 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             }
         }
         for (addr, node_id, group, claims) in grouped {
-            let decision = policy::filter_announcement(
-                &self.grants,
-                &policy::Announcement { claims: claims.iter().copied().collect(), group: group.clone() }
-            );
-            self.origin_auth.insert(
-                node_id,
-                policy::OriginAuth { group_ok: decision.group_ok, claims: decision.claims.clone(), group: group.clone() }
-            );
+            let decision = policy::filter_announcement(&self.grants, &policy::Announcement {
+                claims: claims.iter().copied().collect(),
+                group: group.clone()
+            });
+            self.origin_auth.insert(node_id, policy::OriginAuth {
+                group_ok: decision.group_ok,
+                claims: decision.claims.clone(),
+                group: group.clone()
+            });
             let mut kept = RangeList::new();
             kept.extend(policy::installable_claims(&decision).iter().copied());
             if kept.is_empty() {
@@ -1640,6 +2282,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
 
     fn update_peer_info(&mut self, addr: SocketAddr, info: Option<NodeInfo>) -> Result<(), Error> {
         let peer_mtu = info.as_ref().and_then(|info| info.underlay_mtu);
+        let local_caps = self.local_wire_caps();
         if let Some(peer) = self.peers.get_mut(&addr) {
             peer.last_seen = TS::now();
             peer.timeout = TS::now() + self.config.peer_timeout as Time;
@@ -1654,6 +2297,17 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                 }
                 let prefixes = lan::interface_prefixes();
                 lan::sort_lan_first(&mut peer.addrs, &prefixes);
+                peer.compression = info.compression;
+                let peer_caps = crate::wire::WireCaps::from_bits(info.wire_caps);
+                peer.wire_caps = peer_caps;
+                peer.wire_format = local_caps.choose_format(peer_caps, &info.claims);
+                if peer_caps.is_unknown() {
+                    debug!(
+                        "Peer {} did not advertise wire formats; inferred {:?} from its claims",
+                        addr_nice(addr),
+                        peer.wire_format
+                    );
+                }
             }
             if self.last_node_info_ns > 0 {
                 if let Some(now) = crate::net::mono_now() {
@@ -1667,24 +2321,41 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             return Ok(());
         }
         if let Some(info) = info {
+            // Remember this peer's first-hand quality reports for aggregation.
+            // Bound them so a single peer cannot inject huge or fabricated
+            // values, and ignore reports about us.
+            const MAX_GOSSIP_RTT_MS: u16 = 5_000;
+            let bounded: Vec<(NodeId, u16)> = info
+                .peer_rtts
+                .iter()
+                .copied()
+                .filter(|(id, rtt)| *id != self.node_id && *rtt <= MAX_GOSSIP_RTT_MS)
+                .take(NodeInfo::MAX_PEER_QUALITY)
+                .collect();
+            self.peer_quality.insert(info.node_id, bounded);
+            if !self.verify_node_identity(&info) {
+                warn!(
+                    "Rejecting unsigned/unverified announcement for node {} from {}",
+                    crate::util::bytes_to_hex(&info.node_id),
+                    addr_nice(addr)
+                );
+                return Ok(());
+            }
             if let Some(pk) = info.e2e_public {
-                self.remember_e2e(info.node_id, pk);
+                self.remember_e2e(info.node_id, pk, addr);
             }
             for (id, pk) in &info.peer_e2e {
-                self.remember_e2e_if_new(*id, *pk);
+                self.remember_e2e_if_new(*id, *pk, addr);
             }
-            let decision = policy::filter_announcement(
-                &self.grants,
-                &policy::Announcement { claims: info.claims.iter().copied().collect(), group: info.group.clone() }
-            );
-            self.origin_auth.insert(
-                info.node_id,
-                policy::OriginAuth {
-                    group_ok: decision.group_ok,
-                    claims: decision.claims.clone(),
-                    group: info.group.clone()
-                }
-            );
+            let decision = policy::filter_announcement(&self.grants, &policy::Announcement {
+                claims: info.claims.iter().copied().collect(),
+                group: info.group.clone()
+            });
+            self.origin_auth.insert(info.node_id, policy::OriginAuth {
+                group_ok: decision.group_ok,
+                claims: decision.claims.clone(),
+                group: info.group.clone()
+            });
             if self.grants.enforcing {
                 if let Some(peer) = self.peers.get_mut(&addr) {
                     peer.group_ok = decision.group_ok;
@@ -1700,22 +2371,45 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             debug!("Received {} peers from {}: {:?}", info.peers.len(), addr_nice(addr), info.peers);
             self.connect_to_peers(&info.peers)?;
         }
-        self.note_peer_underlay(peer_mtu);
+        self.note_peer_underlay(addr, peer_mtu);
         Ok(())
+    }
+
+    /// Total throttle events across all peers (for tests).
+    #[cfg(test)]
+    pub(crate) fn peer_limit_state_total(&self) -> u64 {
+        self.peers.keys().map(|addr| self.peer_limit.state(*addr).throttled).sum()
+    }
+
+    /// Charge a payload to the peer's token bucket. Exhausted peers are
+    /// throttled and penalised; the drop is counted in traffic stats.
+    fn peer_rate_allowed(&mut self, peer: SocketAddr, bytes: usize) -> bool {
+        if self.peer_limit.allow(peer, bytes, TS::now()) {
+            return true;
+        }
+        self.traffic.count_dropped_payload(bytes);
+        let state = self.peer_limit.state(peer);
+        debug!("Throttling peer {} (penalty {}, throttled {} events)", addr_nice(peer), state.penalty, state.throttled);
+        false
     }
 
     fn handle_payload_from(
         &mut self, peer: SocketAddr, data: &mut MsgBuffer, sealer: Option<[u8; 32]>
     ) -> Result<(), Error> {
         // HOT PATH
-        let (src, dst) = P::parse(data.message())?;
+        let len = data.len();
+        if !self.peer_rate_allowed(peer, len) {
+            return Ok(());
+        }
+        let peer_format = self.peers.get(&peer).map(|p| p.wire_format).unwrap_or_else(|| self.local_wire_format());
+        let peer_id = self.peers.get(&peer).map(|p| p.node_id).unwrap_or([0; 16]);
+        let (src, dst) = peer_format.parse(data.message())?;
         if !self.ingress_allowed(peer, data.message(), src, sealer) {
             self.traffic.count_dropped_payload(data.len());
             return Ok(());
         }
         if !self.acl.is_empty() {
-            let tap = self.config.device_type == Type::Tap;
-            let l4 = crate::payload::overlay_l4(data.message(), tap);
+            let l4 = crate::payload::overlay_l4(data.message(), peer_format == crate::wire::WireFormat::Ethernet);
             let match_src = l4.ip_src.unwrap_or(src);
             if !self.acl.allows(match_src, l4.proto, l4.dport) {
                 debug!("ACL dropped overlay src {} proto {:?} dport {:?}", match_src, l4.proto, l4.dport);
@@ -1729,11 +2423,32 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
             let nid = self.peers.get(&peer).map(|p| p.node_id).unwrap_or([0; 16]);
             self.table.cache(src, peer, nid);
         }
-        let tcp_data = crate::payload::ipv4_tcp_data(data.message());
-        let tcp = tcp_data || crate::payload::ipv4_tcp_segment(data.message());
+        let ip_view = if peer_format == crate::wire::WireFormat::Ethernet {
+            crate::wire::strip_ethernet(data.message()).unwrap_or(&[])
+        } else {
+            data.message()
+        };
+        let tcp_data = crate::payload::ipv4_tcp_data(ip_view);
+        let tcp = tcp_data || crate::payload::ipv4_tcp_segment(ip_view);
+        // Translate into the format the local interface expects. IP-only
+        // peers are wrapped in an Ethernet header on a TAP bridge node.
+        if peer_format != self.local_wire_format()
+            && !self.convert_payload(data, peer_format, self.local_wire_format(), &peer_id)
+        {
+            self.traffic.count_dropped_payload(data.len());
+            debug!("Dropping payload that cannot be represented in the local wire format");
+            return Ok(());
+        }
         let mut owned = self.take_spare();
         mem::swap(data, &mut owned);
-        self.tun_out.push(owned);
+        let jitter = self.config.effective_jitter_ms();
+        if jitter > 0 {
+            // Consistency profile: hold each frame for a fixed delay so the
+            // spacing delivered to the TUN is more predictable than arrival.
+            self.jitter_rx.push_back((TS::now() + jitter as Time, owned));
+        } else {
+            self.tun_out.push(owned);
+        }
         if tcp_data {
             self.arm_gro_hold();
         } else if !tcp {
@@ -1772,6 +2487,54 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     }
 
     /// The opened source has to match the sealer's own record. Another node's prefix does not count.
+    /// Look up a configured per-node public key (`node-id-hex=base62-key`).
+    fn trusted_node_key(&self, node_id: &NodeId) -> Option<[u8; 32]> {
+        let id_hex = crate::util::bytes_to_hex(node_id);
+        for entry in &self.config.trusted_node_keys {
+            if let Some((id, key)) = entry.split_once('=') {
+                if id == id_hex {
+                    return crate::util::from_base62_fixed::<32>(key).ok();
+                }
+            }
+        }
+        None
+    }
+
+    /// Verify a node announcement against its configured key. Nodes without a
+    /// configured key fall back to the shared-key trust model.
+    fn verify_node_identity(&self, info: &NodeInfo) -> bool {
+        let Some(pk) = self.trusted_node_key(&info.node_id) else {
+            return true;
+        };
+        let Some(sig) = info.node_signature else {
+            return false;
+        };
+        Ed25519KeyPair::verify(&pk, &info.identity_bytes(), &sig).is_ok()
+    }
+
+    /// Record a freshly opened e2e-sealed body. Returns false when the same
+    /// body was already seen from this sealer (a replay).
+    fn accept_e2e_body(&mut self, sealer: [u8; 32], body: &[u8]) -> bool {
+        let body_hash = stable_hash(body);
+        let seen = self.e2e_seen.entry(sealer).or_default();
+        if seen.contains(&body_hash) {
+            return false;
+        }
+        seen.insert(body_hash);
+        self.e2e_seen_order.push_back((sealer, body_hash));
+        if self.e2e_seen_order.len() > MAX_E2E_SEEN {
+            if let Some((old_sealer, old_hash)) = self.e2e_seen_order.pop_front() {
+                if let Some(set) = self.e2e_seen.get_mut(&old_sealer) {
+                    set.remove(&old_hash);
+                    if set.is_empty() {
+                        self.e2e_seen.remove(&old_sealer);
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn relay_source_allowed(&self, sealer: [u8; 32], src: Address) -> bool {
         let Some(origin_id) = self.e2e_by_pub.get(&sealer).copied() else {
             return false;
@@ -1779,26 +2542,39 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         policy::relay_origin_allowed(self.origin_auth.get(&origin_id), src)
     }
 
-    fn remember_e2e(&mut self, id: NodeId, pk: [u8; 32]) {
+    fn remember_e2e(&mut self, id: NodeId, pk: [u8; 32], from: SocketAddr) {
+        // A different underlay peer claiming an existing node_id must not be
+        // able to replace its e2e key: that would let any mesh member hijack
+        // another node's identity and read traffic relayed toward it. Only the
+        // peer that introduced the binding may rotate it.
+        if let (Some(prev), Some(owner)) = (self.known_e2e.get(&id).copied(), self.e2e_owner.get(&id).copied()) {
+            if prev != pk && owner != from {
+                warn!(
+                    "Ignoring e2e key change for node {} from {} (owner is {}): possible identity spoofing",
+                    bytes_to_hex(&id),
+                    addr_nice(from),
+                    addr_nice(owner)
+                );
+                return;
+            }
+        }
         if let Some(prev) = self.known_e2e.insert(id, pk) {
             if prev != pk {
                 self.e2e_by_pub.remove(&prev);
             }
         }
         self.e2e_by_pub.insert(pk, id);
+        self.e2e_owner.insert(id, from);
     }
 
-    fn remember_e2e_if_new(&mut self, id: NodeId, pk: [u8; 32]) {
+    fn remember_e2e_if_new(&mut self, id: NodeId, pk: [u8; 32], from: SocketAddr) {
         if self.known_e2e.contains_key(&id) {
             return;
         }
-        self.remember_e2e(id, pk);
+        self.remember_e2e(id, pk, from);
     }
 
     fn arm_gro_hold(&mut self) {
-        if !self.defer_tun_flush || self.gro_deadline_ns != 0 {
-            return;
-        }
         #[cfg(target_os = "linux")]
         if let Some(now) = crate::net::mono_now() {
             self.gro_deadline_ns = now.saturating_add(GRO_HOLD_NS);
@@ -1812,10 +2588,20 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         #[cfg(target_os = "linux")]
         {
             let now = crate::net::mono_now().unwrap_or(u64::MAX);
-            return !gro_batch_ready(self.tun_out.len(), now, self.gro_deadline_ns);
+            !gro_batch_ready(self.tun_out.len(), now, self.gro_deadline_ns)
         }
         #[cfg(not(target_os = "linux"))]
         false
+    }
+
+    /// Release jitter-buffered frames whose fixed delay has elapsed.
+    fn flush_jitter(&mut self) {
+        let now = TS::now();
+        while self.jitter_rx.front().map(|(deadline, _)| *deadline <= now).unwrap_or(false) {
+            if let Some((_, frame)) = self.jitter_rx.pop_front() {
+                self.tun_out.push(frame);
+            }
+        }
     }
 
     /// Write the TUN batch unless a short train is still gathering.
@@ -1830,6 +2616,14 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         result
     }
 
+    /// Expand an LZ4 DATA frame in place. The payload is already authenticated
+    /// (this runs after AEAD decryption), so only a known peer can supply it.
+    fn inflate(data: &mut MsgBuffer) -> Result<(), Error> {
+        let plain = crate::compress::decompress(data.message()).map_err(Error::Message)?;
+        data.clone_from(&plain);
+        Ok(())
+    }
+
     fn handle_message(
         &mut self, src: SocketAddr, msg_result: MessageResult<NodeInfo>, data: &mut MsgBuffer, sealer: Option<[u8; 32]>
     ) -> Result<(), Error> {
@@ -1837,16 +2631,28 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         match msg_result {
             MessageResult::Message(type_) => {
                 // HOT PATH
+                crate::util::wire_log("IN", src, type_, data.message());
                 match type_ {
                     MESSAGE_TYPE_DATA => {
                         // HOT PATH
+                        self.handle_payload_from(src, data, sealer)?
+                    }
+                    MESSAGE_TYPE_DATA_COMPRESSED => {
+                        Self::inflate(data)?;
                         self.handle_payload_from(src, data, sealer)?
                     }
                     MESSAGE_TYPE_DATA_GSO => {
                         // HOT PATH
                         self.handle_gso_payload_from(src, data, sealer)?
                     }
-                    MESSAGE_TYPE_RELAY => self.handle_relay(src, data)?,
+                    MESSAGE_TYPE_DATA_GSO_COMPRESSED => {
+                        Self::inflate(data)?;
+                        self.handle_gso_payload_from(src, data, sealer)?
+                    }
+                    MESSAGE_TYPE_FLOOD => self.handle_flood(src, data, false)?,
+                    MESSAGE_TYPE_FLOOD_TTL => self.handle_flood(src, data, true)?,
+                    MESSAGE_TYPE_RELAY => self.handle_relay(src, data, false)?,
+                    MESSAGE_TYPE_RELAY_TTL => self.handle_relay(src, data, true)?,
                     MESSAGE_TYPE_NODE_INFO => {
                         // COLD PATH
                         let info = match NodeInfo::decode(Cursor::new(data.message())) {
@@ -2366,7 +3172,8 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
     pub fn run(&mut self) {
         pin_datapath_thread();
         let mut ctrlc = CtrlC::new();
-        let mut waiter = try_fail!(WaitImpl::new(&self.socket, &self.device, 1000), "Failed to setup poll: {}");
+        let poll_ms = self.config.effective_jitter_ms().max(1);
+        let waiter = try_fail!(WaitImpl::new(&self.socket, &self.device, poll_ms), "Failed to setup poll: {}");
         let mut buffer = MsgBuffer::new(SPACE_BEFORE);
         let mut poll_error = false;
         self.defer_tun_flush = true;
@@ -2374,6 +3181,9 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
         // mio is edge-triggered. On every wakeup, drain both the TUN and the UDP
         // socket until they would block so a single edge cannot leave packets stuck.
         for evt in waiter {
+            if CtrlC::reload_requested() {
+                self.reload_config();
+            }
             match evt {
                 WaitResult::Error(err) => {
                     if poll_error {
@@ -2383,6 +3193,7 @@ impl<D: Device + Pollable, P: Protocol, S: Socket + Pollable, TS: TimeSource> Ge
                     poll_error = true;
                 }
                 WaitResult::Timeout => {
+                    self.flush_jitter();
                     let _ = self.flush_tun_out_due();
                     let _ = self.flush_gso_out();
                     let _ = self.flush_outbox();
@@ -2548,10 +3359,108 @@ impl<P: Protocol> GenericCloud<MockDevice, P, MockSocket, MockTimeSource> {
     }
 
     #[cfg(test)]
+    pub fn test_peer_throttled(&self, _addr: &SocketAddr) -> u64 {
+        self.peer_limit_state_total()
+    }
+
+    #[cfg(test)]
+    pub fn test_claims(&self) -> Vec<Range> {
+        self.claims.to_vec()
+    }
+
+    #[cfg(test)]
+    pub fn test_arp_reply(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        self.arp_for_local(frame)
+    }
+
+    #[cfg(test)]
+    pub fn test_inject_quality(&mut self, reporter: NodeId, reports: Vec<(NodeId, u16)>) {
+        self.peer_quality.insert(reporter, reports);
+    }
+
+    #[cfg(test)]
+    pub fn test_pick_relay(&mut self, except: SocketAddr) -> Option<SocketAddr> {
+        self.pick_relay(except)
+    }
+
+    #[cfg(test)]
+    pub fn test_set_peer_caps(&mut self, addr: &SocketAddr, bits: u8) {
+        if let Some(peer) = self.peers.get_mut(addr) {
+            peer.wire_caps = crate::wire::WireCaps::from_bits(bits);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_set_peer_rtt(&mut self, addr: &SocketAddr, rtt_us: u64) {
+        if let Some(peer) = self.peers.get_mut(addr) {
+            peer.rtt_us = rtt_us;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_quality_snapshot(
+        &self
+    ) -> (Vec<crate::runtime_status::QualityEntry>, Option<crate::runtime_status::RelaySuggestion>) {
+        self.quality_snapshot()
+    }
+
+    #[cfg(test)]
+    pub fn test_note_peer_underlay(&mut self, addr: &SocketAddr, mtu: Option<u16>) {
+        self.note_peer_underlay(*addr, mtu);
+    }
+
+    #[cfg(test)]
+    pub fn test_remove_peer_mtu(&mut self, addr: &SocketAddr) {
+        self.remove_peer_mtu(*addr);
+    }
+
+    #[cfg(test)]
+    pub fn test_own_node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    #[cfg(test)]
+    pub fn test_peer_node_id(&self, addr: &SocketAddr) -> Option<NodeId> {
+        self.peers.get(addr).map(|peer| peer.node_id)
+    }
+
+    #[cfg(test)]
+    pub fn config_for_test_mut(&mut self) -> &mut Config {
+        &mut self.config
+    }
+
+    #[cfg(test)]
+    pub fn test_verify_node_identity(&self, info: &crate::messages::NodeInfo) -> bool {
+        self.verify_node_identity(info)
+    }
+
+    #[cfg(test)]
+    pub fn test_acl_allows(&self, addr: &str) -> bool {
+        use std::str::FromStr;
+        self.acl.allows(crate::types::Address::from_str(addr).unwrap(), None, None)
+    }
+
+    #[cfg(test)]
+    pub fn test_reload_config(&mut self) {
+        self.reload_config();
+    }
+
+    #[cfg(test)]
+    pub fn test_exit_target(&self) -> (Option<NodeId>, Vec<NodeId>) {
+        (self.exit_node, self.exit_allow.clone())
+    }
+
+    #[cfg(test)]
+    pub fn test_accept_e2e_body(&mut self, sealer: [u8; 32], body: &[u8]) -> bool {
+        self.accept_e2e_body(sealer, body)
+    }
+
+    #[cfg(test)]
     pub fn test_forget_e2e(&mut self, id: &NodeId) {
         if let Some(pk) = self.known_e2e.remove(id) {
             self.e2e_by_pub.remove(&pk);
         }
+        self.e2e_owner.remove(id);
     }
 
     #[cfg(test)]
@@ -2562,312 +3471,15 @@ impl<P: Protocol> GenericCloud<MockDevice, P, MockSocket, MockTimeSource> {
     }
 }
 
-#[cfg(test)]
-mod gro_hold_tests {
-    use super::gro_batch_ready;
-
-    #[test]
-    fn gro_batch_waits_for_a_train_and_then_flushes() {
-        let start = 1_000_000u64;
-        let deadline = start + super::GRO_HOLD_NS;
-        // One socket read is about eight segments. Flushing there ACKs every
-        // eight. The train has to outlast that read; the deadline still writes
-        // a short batch, and an unarmed hold still writes immediately.
-        assert!(super::GRO_TRAIN > 8);
-        assert!(!gro_batch_ready(1, start, deadline));
-        assert!(!gro_batch_ready(8, start, deadline));
-        assert!(!gro_batch_ready(super::GRO_TRAIN - 1, start, deadline));
-        assert!(gro_batch_ready(super::GRO_TRAIN, start, deadline));
-        assert!(gro_batch_ready(8, deadline, deadline));
-        assert!(gro_batch_ready(3, 0, 0));
-    }
-}
+// Re-exported so existing callers and unit tests keep their paths.
+pub(crate) use crate::affinity::pin_datapath_thread;
+#[cfg(target_os = "linux")]
+pub(crate) use crate::affinity::pin_reader_thread;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use crate::affinity::{
+    datapath_cpus, fast_cluster, online_cpu_freqs, parse_cpu_list, reader_slot, set_thread_affinity
+};
 
 #[cfg(test)]
-mod ensure_peer_port_tests {
-    use super::ensure_peer_port;
-
-    #[test]
-    fn bracketed_ipv6_keeps_an_explicit_port() {
-        assert_eq!(ensure_peer_port("[fd00:88::2]:3210"), "[fd00:88::2]:3210");
-        assert_eq!(ensure_peer_port("wss://[fd00:88::2]:3210"), "[fd00:88::2]:3210");
-        assert_eq!(ensure_peer_port("[fd00:88::2]"), "[fd00:88::2]:3210");
-        assert_eq!(ensure_peer_port("fd00:88::2"), "[fd00:88::2]:3210");
-    }
-
-    #[test]
-    fn ipv4_and_hostnames_gain_a_port_once() {
-        assert_eq!(ensure_peer_port("192.168.88.2"), "192.168.88.2:3210");
-        assert_eq!(ensure_peer_port("192.168.88.2:3210"), "192.168.88.2:3210");
-        assert_eq!(ensure_peer_port("example.com"), "example.com:3210");
-        assert_eq!(ensure_peer_port("example.com:3210"), "example.com:3210");
-        assert_eq!(ensure_peer_port("ws://example.com"), "example.com:3210");
-    }
-}
-
-#[cfg(test)]
-mod ipv6_claim_tests {
-    use super::configured_ipv6_host_claim;
-    use crate::types::Address;
-    use std::str::FromStr;
-
-    #[test]
-    fn ipv6_overlay_claims_the_host_not_the_prefix() {
-        let range = configured_ipv6_host_claim(Some("fd00:8::1/64")).unwrap();
-        assert_eq!(range.prefix_len, 128);
-        assert!(range.matches(Address::from_str("fd00:8::1").unwrap()));
-        assert!(!range.matches(Address::from_str("fd00:8::2").unwrap()));
-        assert!(configured_ipv6_host_claim(Some("10.8.0.1/24")).is_none());
-        assert!(configured_ipv6_host_claim(None).is_none());
-    }
-}
-
-/// CPUs in the fastest frequency cluster, lowest id first. Empty when every
-/// CPU reports the same maximum, so a uniform machine is left unpinned.
-pub(crate) fn fast_cluster(freqs: &[(usize, u64)]) -> Vec<usize> {
-    let Some(max) = freqs.iter().map(|(_, freq)| *freq).max() else {
-        return Vec::new();
-    };
-    let Some(min) = freqs.iter().map(|(_, freq)| *freq).min() else {
-        return Vec::new();
-    };
-    if max == 0 || max == min {
-        return Vec::new();
-    }
-    let mut cpus: Vec<usize> = freqs.iter().filter(|(_, freq)| *freq == max).map(|(cpu, _)| *cpu).collect();
-    cpus.sort_unstable();
-    cpus.dedup();
-    cpus
-}
-
-#[cfg(target_os = "linux")]
-fn online_cpu_freqs() -> Vec<(usize, u64)> {
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some(rest) = name.strip_prefix("cpu") else {
-            continue;
-        };
-        let Ok(cpu) = rest.parse::<usize>() else {
-            continue;
-        };
-        let Ok(text) = fs::read_to_string(entry.path().join("cpufreq/cpuinfo_max_freq")) else {
-            continue;
-        };
-        let Ok(freq) = text.trim().parse::<u64>() else {
-            continue;
-        };
-        out.push((cpu, freq));
-    }
-    out
-}
-
-#[cfg(target_os = "linux")]
-fn set_thread_affinity(cpus: &[usize]) -> bool {
-    if cpus.is_empty() || cpus.iter().any(|cpu| *cpu >= 1024) {
-        return false;
-    }
-    let mut mask = [0u64; 16];
-    for cpu in cpus {
-        mask[cpu / 64] |= 1u64 << (cpu % 64);
-    }
-    let rc = unsafe {
-        libc::sched_setaffinity(0, std::mem::size_of_val(&mask), mask.as_ptr() as *const libc::cpu_set_t)
-    };
-    rc == 0
-}
-
-/// One sibling group inside the fast cluster. Two processes with different
-/// pids land on different physical cores. Pinning both to every fast CPU let
-/// the scheduler park them on the interrupt core together.
-#[cfg(target_os = "linux")]
-pub(crate) fn datapath_cpus(groups: &[Vec<usize>], slot: usize) -> Vec<usize> {
-    if groups.is_empty() {
-        return Vec::new();
-    }
-    groups[slot % groups.len()].clone()
-}
-
-/// A different physical core from [`datapath_cpus`] for the same pid, so the
-/// TUN read overlaps encryption instead of sharing one core.
-#[cfg(target_os = "linux")]
-pub(crate) fn reader_slot(ngroups: usize, main_slot: usize) -> usize {
-    if ngroups < 2 {
-        return main_slot;
-    }
-    (main_slot + ngroups / 2) % ngroups
-}
-
-#[cfg(target_os = "linux")]
-fn sibling_groups(cluster: &[usize]) -> Vec<Vec<usize>> {
-    let members: std::collections::BTreeSet<usize> = cluster.iter().copied().collect();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut groups = Vec::new();
-    for cpu in cluster {
-        if !seen.insert(*cpu) {
-            continue;
-        }
-        let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
-        let text = fs::read_to_string(path).unwrap_or_default();
-        let mut group: Vec<usize> = parse_cpu_list(&text).into_iter().filter(|cpu| members.contains(cpu)).collect();
-        if group.is_empty() {
-            group.push(*cpu);
-        }
-        group.sort_unstable();
-        group.dedup();
-        for cpu in &group {
-            seen.insert(*cpu);
-        }
-        groups.push(group);
-    }
-    groups
-}
-
-#[cfg(target_os = "linux")]
-fn parse_cpu_list(list: &str) -> Vec<usize> {
-    let mut out = Vec::new();
-    for part in list.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if let Some((start, end)) = part.split_once('-') {
-            let Ok(start) = start.parse::<usize>() else {
-                continue;
-            };
-            let Ok(end) = end.parse::<usize>() else {
-                continue;
-            };
-            if end >= start && end - start < 4096 {
-                out.extend(start..=end);
-            }
-        } else if let Ok(cpu) = part.parse::<usize>() {
-            out.push(cpu);
-        }
-    }
-    out
-}
-
-/// Hybrid chips report the same capacity for a 4.7 GHz core and a 3.5 GHz
-/// core, so the scheduler will park this thread on the slow cluster. Pin this
-/// thread to every fast CPU. One sibling group was slower: the thread stayed
-/// on a busy core. Leaving out the interrupt cores was slower too. A uniform
-/// machine is left alone.
-#[cfg(target_os = "linux")]
-fn pin_datapath_thread() {
-    let cpus = fast_cluster(&online_cpu_freqs());
-    if cpus.is_empty() {
-        return;
-    }
-    if set_thread_affinity(&cpus) {
-        info!("Pinned datapath thread to cpus {cpus:?}");
-    }
-}
-
-/// The TUN prefetch thread inherits the datapath pin. Move it to another fast
-/// core so the read is not fighting the encrypt loop for the same core.
-#[cfg(target_os = "linux")]
-pub(crate) fn pin_reader_thread() {
-    let groups = sibling_groups(&fast_cluster(&online_cpu_freqs()));
-    if groups.len() < 2 {
-        return;
-    }
-    let slot = reader_slot(groups.len(), std::process::id() as usize);
-    let cpus = datapath_cpus(&groups, slot);
-    if set_thread_affinity(&cpus) {
-        info!("Pinned TUN read thread to cpus {cpus:?}");
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pin_datapath_thread() {}
-
-#[cfg(test)]
-mod affinity_tests {
-    use super::fast_cluster;
-
-    #[test]
-    fn fast_cluster_skips_a_uniform_machine() {
-        assert!(fast_cluster(&[]).is_empty());
-        assert!(fast_cluster(&[(0, 0), (1, 0)]).is_empty());
-        assert!(fast_cluster(&[(0, 4700), (1, 4700), (2, 4700)]).is_empty());
-    }
-
-    #[test]
-    fn fast_cluster_is_every_cpu_at_the_top_frequency() {
-        assert_eq!(fast_cluster(&[(0, 4700), (12, 3500), (2, 4700)]), vec![0, 2]);
-        assert_eq!(fast_cluster(&[(3, 2000), (8, 4000), (1, 4000)]), vec![1, 8]);
-    }
-
-    #[test]
-    fn datapath_cpus_are_one_sibling_group() {
-        let groups = vec![vec![0, 1], vec![2, 3], vec![4, 5]];
-        assert_eq!(super::datapath_cpus(&groups, 0), vec![0, 1]);
-        assert_eq!(super::datapath_cpus(&groups, 1), vec![2, 3]);
-        assert_eq!(super::datapath_cpus(&groups, 5), vec![4, 5]);
-        assert!(super::datapath_cpus(&[], 3).is_empty());
-        assert_eq!(super::reader_slot(4, 1), 3);
-        assert_ne!(1 % 4, super::reader_slot(4, 1));
-        assert_eq!(super::reader_slot(1, 0), 0);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn datapath_thread_pins_only_when_a_slower_cluster_exists() {
-        let freqs = super::online_cpu_freqs();
-        let want = fast_cluster(&freqs);
-        let before = allowed_cpus();
-        let _restore = AffinityGuard(before.clone());
-        super::pin_datapath_thread();
-        let after = allowed_cpus();
-        if want.is_empty() {
-            assert_eq!(after, before, "uniform machine changed affinity");
-        } else {
-            assert_eq!(after, want, "freqs {freqs:?}");
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    struct AffinityGuard(Vec<usize>);
-
-    #[cfg(target_os = "linux")]
-    impl Drop for AffinityGuard {
-        fn drop(&mut self) {
-            let _ = super::set_thread_affinity(&self.0);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn allowed_cpus() -> Vec<usize> {
-        let text = std::fs::read_to_string("/proc/thread-self/status").expect("status");
-        for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("Cpus_allowed_list:") {
-                return parse_cpu_list(rest);
-            }
-        }
-        panic!("Cpus_allowed_list missing:\n{text}");
-    }
-
-    #[cfg(target_os = "linux")]
-    fn parse_cpu_list(list: &str) -> Vec<usize> {
-        let mut out = Vec::new();
-        for part in list.split(',') {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
-            }
-            if let Some((start, end)) = part.split_once('-') {
-                let start: usize = start.parse().expect(start);
-                let end: usize = end.parse().expect(end);
-                out.extend(start..=end);
-            } else {
-                out.push(part.parse().expect(part));
-            }
-        }
-        out
-    }
-}
+#[path = "cloud_tests.rs"]
+mod cloud_tests;

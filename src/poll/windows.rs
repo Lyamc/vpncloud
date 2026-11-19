@@ -33,9 +33,12 @@ use windows_sys::Win32::{
 const SOCKET_SLOT: u32 = WAIT_OBJECT_0;
 const DEVICE_SLOT: u32 = WAIT_OBJECT_0 + 1;
 
+/// Callback used to pull a packet from the TUN/TAP device.
+type RecvFn = Arc<dyn Fn(&mut [u8]) -> io::Result<usize> + Send + Sync>;
+
 /// Source of a blocking TUN/TAP read used by the waiter thread.
 pub struct WindowsDeviceSource {
-    pub recv: Arc<dyn Fn(&mut [u8]) -> io::Result<usize> + Send + Sync>,
+    pub recv: RecvFn,
     pub queue: Arc<Mutex<VecDeque<Vec<u8>>>>
 }
 
@@ -116,7 +119,9 @@ impl WaitImpl {
                                 queue_t.lock().expect("device queue").push_back(buf[..n].to_vec());
                                 let _ = SetEvent(ev_bits as HANDLE);
                             }
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted => {
+                            Err(e)
+                                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted =>
+                            {
                                 thread::sleep(Duration::from_millis(5));
                             }
                             Err(_) => {

@@ -49,6 +49,11 @@ impl<TS: TimeSource> ClaimTable<TS> {
         self.cache.clear()
     }
 
+    /// All currently installed claims, used to reconcile optional kernel routes.
+    pub fn all_claims(&self) -> Vec<Range> {
+        self.claims.iter().map(|entry| entry.claim).collect()
+    }
+
     pub fn set_claims(&mut self, peer: SocketAddr, node_id: NodeId, mut claims: RangeList) {
         let mut removed_claim = false;
         for entry in &mut self.claims {

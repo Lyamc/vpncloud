@@ -130,3 +130,21 @@ impl OldConfigFile {
         }
     }
 }
+
+#[cfg(test)]
+mod fixture_tests {
+    use super::*;
+
+    #[test]
+    fn converts_the_checked_in_v1_fixture() {
+        let raw = include_str!("../tests/fixtures/old_v1.net");
+        let old: OldConfigFile = serde_norway::from_str(raw).expect("fixture parses as v1");
+        let converted = old.convert();
+        assert_eq!(converted.device.as_ref().and_then(|d| d.type_), Some(Type::Tap));
+        assert_eq!(converted.device.as_ref().and_then(|d| d.name.as_deref()), Some("vpncloud%d"));
+        assert_eq!(converted.listen.as_deref(), Some("3210"));
+        assert_eq!(converted.peers.as_ref().map(|p| p.len()), Some(2));
+        assert_eq!(converted.crypto.password.as_deref(), Some("legacy-secret"));
+        assert_eq!(converted.peer_timeout, Some(600));
+    }
+}

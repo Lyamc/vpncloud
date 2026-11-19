@@ -1,0 +1,12 @@
+# VpnCloud 1.x config fixture for migrate-config tests
+listen: 3210
+peers:
+  - 192.0.2.1:3210
+  - 192.0.2.2:3210
+shared-key: legacy-secret
+subnets:
+  - 10.0.0.0/8
+device-type: tap
+device-name: vpncloud%d
+peer-timeout: 600
+port-forwarding: true

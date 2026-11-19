@@ -59,10 +59,19 @@ impl GsoMeta {
         matches!(kind, GSO_TCPV4 | GSO_TCPV6 | GSO_UDP_L4) && self.gso_size > 0
     }
 
-    /// True when this header describes a segmented aggregate of at least an IP header.
-    /// `hdr_len` from the kernel is not trusted: it can be the first segment's full length.
+    /// True when this header describes a segmented aggregate of at least an IP
+    /// header. `hdr_len` from the kernel is not trusted: it can be the first
+    /// segment's full length, so it is treated as an upper bound only.
     pub fn sane(self, payload_len: usize) -> bool {
-        self.segmented() && payload_len >= 20
+        if !self.segmented() || payload_len < 20 {
+            return false;
+        }
+        let size = self.gso_size as usize;
+        size > 0
+            && size <= payload_len
+            && self.hdr_len as usize <= payload_len
+            && self.csum_start as usize <= payload_len
+            && self.csum_offset as usize <= payload_len
     }
 }
 
@@ -89,5 +98,11 @@ mod tests {
         let mut bad = meta;
         bad.gso_size = 0;
         assert!(!bad.segmented());
+        let mut bad = meta;
+        bad.gso_size = 2000;
+        assert!(!bad.sane(1500));
+        let mut bad = meta;
+        bad.csum_start = 1600;
+        assert!(!bad.sane(1500));
     }
 }

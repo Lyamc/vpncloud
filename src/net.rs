@@ -237,7 +237,9 @@ pub fn parse_listen(addr: &str, default_port: u16) -> SocketAddr {
 }
 
 #[cfg(unix)]
-static SOCKET_PROTECT: Mutex<Option<fn(RawFd) -> io::Result<()>>> = Mutex::new(None);
+type ProtectFn = fn(RawFd) -> io::Result<()>;
+#[cfg(unix)]
+static SOCKET_PROTECT: Mutex<Option<ProtectFn>> = Mutex::new(None);
 
 /// Install a hook invoked on every newly bound UDP socket (Android `VpnService.protect`).
 #[cfg(unix)]
@@ -289,7 +291,7 @@ impl Socket for UdpSocket {
             if n == 0 {
                 return Err(io::Error::new(ErrorKind::WouldBlock, "empty recvmmsg"));
             }
-            return Ok(addr);
+            Ok(addr)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -348,7 +350,7 @@ fn dont_fragment(fd: RawFd) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn enable_udp_gro(fd: RawFd) {
     let on: libc::c_int = 1;
     unsafe {
@@ -402,10 +404,10 @@ fn gro_segment_size(hdr: &libc::msghdr) -> usize {
                 let data = libc::CMSG_DATA(cmsg);
                 let cmsg_len = (*cmsg).cmsg_len as usize;
                 if cmsg_len >= libc::CMSG_LEN(4) as usize {
-                    return u32::from(*(data as *const u32)) as usize;
+                    return (*(data as *const u32)) as usize;
                 }
                 if cmsg_len >= libc::CMSG_LEN(2) as usize {
-                    return u16::from(*(data as *const u16)) as usize;
+                    return (*(data as *const u16)) as usize;
                 }
                 return 0;
             }
@@ -463,17 +465,19 @@ fn linux_mmsghdr(msg_hdr: libc::msghdr) -> libc::mmsghdr {
 }
 
 #[cfg(target_os = "linux")]
+type PendingSegments = VecDeque<(SocketAddr, Vec<u8>)>;
+
+#[cfg(target_os = "linux")]
 thread_local! {
     static RECV_MMSG: RefCell<RecvMmsgScratch> =
-        RefCell::new(RecvMmsgScratch { names: Vec::new(), iov: Vec::new(), hdrs: Vec::new(), cbufs: Vec::new() });
+        const { RefCell::new(RecvMmsgScratch { names: Vec::new(), iov: Vec::new(), hdrs: Vec::new(), cbufs: Vec::new() }) };
     static SEND_MMSG: RefCell<SendMmsgScratch> =
-        RefCell::new(SendMmsgScratch { names: Vec::new(), iov: Vec::new(), hdrs: Vec::new() });
-    static GSO_CONCAT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+        const { RefCell::new(SendMmsgScratch { names: Vec::new(), iov: Vec::new(), hdrs: Vec::new() }) };
+    static GSO_CONCAT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     // UDP GRO can turn one recvmmsg slot into dozens of segments. Segments that do not
     // fit in this batch are kept per socket and returned on the next receive, in order.
     // A single queue would hand socket A's tail to socket B.
-    static GRO_PENDING: RefCell<HashMap<RawFd, VecDeque<(SocketAddr, Vec<u8>)>>> =
-        RefCell::new(HashMap::new());
+    static GRO_PENDING: RefCell<HashMap<RawFd, PendingSegments>> = RefCell::new(HashMap::new());
 }
 
 /// Run `f` only when this socket already has a spilled GRO tail. An empty map
@@ -510,6 +514,8 @@ fn store_gro_pending(fd: RawFd, pending: VecDeque<(SocketAddr, Vec<u8>)>) {
 /// Split datagrams that carry a UDP_GRO segment size. Older segments in `pending` come first.
 /// Returns how many segments were written into `bufs`. The rest stay in `pending`.
 #[cfg(target_os = "linux")]
+// Parallel GRO size and buffer arrays are walked together.
+#[allow(clippy::needless_range_loop)]
 fn take_segments(
     bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr], got: usize, gro_sizes: &[usize],
     pending: &mut VecDeque<(SocketAddr, Vec<u8>)>
@@ -538,7 +544,7 @@ fn take_segments(
         let total = bufs[0].len();
         if gro > 0 && gro < total {
             let addr = addrs[0];
-            let nsegs = (total + gro - 1) / gro;
+            let nsegs = total.div_ceil(gro);
             let produce = nsegs.min(cap);
             for s in produce..nsegs {
                 let start = s * gro;
@@ -594,6 +600,8 @@ fn take_segments(
 }
 
 #[cfg(target_os = "linux")]
+// iovec/msghdr arrays are filled in lockstep with the packet buffers.
+#[allow(clippy::needless_range_loop)]
 fn linux_recvmmsg(fd: RawFd, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -> io::Result<usize> {
     let n = bufs.len().min(addrs.len()).min(128);
     if n == 0 {
@@ -657,10 +665,12 @@ fn linux_recvmmsg(fd: RawFd, bufs: &mut [MsgBuffer], addrs: &mut [SocketAddr]) -
 }
 
 /// Ethernet preamble+SFD (8) + header (14) + FCS (4) + interframe gap (12).
+#[allow(dead_code)] // Linux UDP pacing
 const ETH_ON_WIRE: u64 = 38;
 
 /// Bytes a UDP payload occupies on the wire, including the IP header that
 /// `send_addr` will actually use. An IPv4-mapped peer is sent as IPv4.
+#[allow(dead_code)] // Linux UDP pacing
 pub(crate) fn datagram_on_wire(addr: SocketAddr, payload_len: usize) -> u64 {
     let ip_hdr = match send_addr(addr) {
         SocketAddr::V4(_) => 20,
@@ -670,12 +680,14 @@ pub(crate) fn datagram_on_wire(addr: SocketAddr, payload_len: usize) -> u64 {
     payload_len as u64 + ip_hdr + 8 + ETH_ON_WIRE
 }
 
+#[allow(dead_code)] // Linux UDP pacing
 fn packets_on_wire(packets: &[(&SocketAddr, &[u8])]) -> u64 {
     packets.iter().map(|(addr, data)| datagram_on_wire(**addr, data.len())).sum()
 }
 
 /// Nanoseconds of line time for `on_wire_bytes` at `bits_per_sec`. Zero when
 /// pacing is disabled.
+#[allow(dead_code)] // Linux UDP pacing
 pub(crate) fn airtime_ns(on_wire_bytes: u64, bits_per_sec: u64) -> u64 {
     if bits_per_sec == 0 || on_wire_bytes == 0 {
         return 0;
@@ -702,6 +714,17 @@ thread_local! {
 #[cfg(target_os = "linux")]
 pub(crate) fn mono_now() -> Option<u64> {
     mono_ns()
+}
+
+/// Monotonic nanosecond clock for non-Linux platforms. Only relative values
+/// are used (RTT bookkeeping and pacing deadlines), so an epoch anchored at
+/// the first call is sufficient and avoids depending on OS-specific APIs.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn mono_now() -> Option<u64> {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    Some(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX))
 }
 
 #[cfg(target_os = "linux")]
@@ -996,7 +1019,7 @@ fn std_to_sockaddr(addr: SocketAddr) -> (libc::sockaddr_storage, u32) {
 }
 
 thread_local! {
-    static MOCK_SOCKET_NAT: AtomicBool = AtomicBool::new(false);
+    static MOCK_SOCKET_NAT: AtomicBool = const { AtomicBool::new(false) };
 }
 
 pub struct MockSocket {

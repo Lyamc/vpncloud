@@ -364,5 +364,4 @@ mod tests {
         assert!(two_small <= max_gso(1500, Underlay::V4));
         assert!(two_small <= max_gso(1500, Underlay::V6));
     }
-
 }

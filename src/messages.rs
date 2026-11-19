@@ -16,24 +16,38 @@ use std::{
 };
 
 pub const MESSAGE_TYPE_DATA: u8 = 0;
+/// DATA with an LZ4-compressed payload (4-byte uncompressed size prepended).
+pub const MESSAGE_TYPE_DATA_COMPRESSED: u8 = 5;
 pub const MESSAGE_TYPE_NODE_INFO: u8 = 1;
 pub const MESSAGE_TYPE_KEEPALIVE: u8 = 2;
 pub const MESSAGE_TYPE_RELAY: u8 = 3;
 /// One kernel GSO/USO aggregate. Payload is [`crate::gso::GSO_META_LEN`] bytes of
 /// virtio header fields followed by the unmodified super-packet.
 pub const MESSAGE_TYPE_DATA_GSO: u8 = 4;
+/// GSO aggregate with an LZ4-compressed body (GSO metadata after decompression).
+pub const MESSAGE_TYPE_DATA_GSO_COMPRESSED: u8 = 6;
+/// Broadcast DATA frame with a (origin node id, sequence) header. Receivers
+/// write it to their device and re-flood to their other peers, so a node with
+/// poor upload only sends one copy instead of one per peer.
+pub const MESSAGE_TYPE_FLOOD: u8 = 7;
+/// Relay/flood variants that carry a hop-count byte. Only sent to peers that
+/// advertised TTL support; the type itself makes the layout unambiguous.
+pub const MESSAGE_TYPE_RELAY_TTL: u8 = 8;
+pub const MESSAGE_TYPE_FLOOD_TTL: u8 = 9;
+/// Length of the flood header: 16-byte origin node id + 4-byte sequence.
+pub const FLOOD_HEADER_LEN: usize = 20;
 pub const MESSAGE_TYPE_CLOSE: u8 = 0xff;
 
 pub type AddrList = SmallVec<[SocketAddr; 4]>;
 pub type PeerList = SmallVec<[PeerInfo; 16]>;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PeerInfo {
     pub node_id: Option<NodeId>,
     pub addrs: AddrList
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NodeInfo {
     pub node_id: NodeId,
     pub peers: PeerList,
@@ -49,7 +63,20 @@ pub struct NodeInfo {
     /// Public keys of nodes this node has learned, so peers can seal toward them.
     pub peer_e2e: Vec<(NodeId, [u8; 32])>,
     /// Prefixes this node can reach only by relaying. `addr` is the far node's underlay address.
-    pub transit: Vec<TransitClaim>
+    pub transit: Vec<TransitClaim>,
+    /// This node can decompress LZ4 DATA frames. Unknown to older peers, which
+    /// skip the part and therefore never receive compressed traffic from us.
+    pub compression: bool,
+    /// Bitmask of wire formats this node can receive (see [`crate::wire::WireCaps`]).
+    /// Zero for legacy peers that do not advertise the part; their format is
+    /// inferred from their claims.
+    pub wire_caps: u8,
+    /// RTTs this node measured to its own direct peers, as `(node_id, rtt_ms)`.
+    /// Gossiped so others can estimate end-to-end paths and suggest relays.
+    pub peer_rtts: Vec<(NodeId, u16)>,
+    /// Optional Ed25519 signature over [`NodeInfo::identity_bytes`], enabling
+    /// per-node identity binding for e2e keys and claims.
+    pub node_signature: Option<[u8; 64]>
 }
 
 /// A prefix owned by a node that is not the sender. The receiver installs it
@@ -64,18 +91,43 @@ pub struct TransitClaim {
 }
 
 impl NodeInfo {
+    const MAX_CLAIMS: usize = 4096;
+    // Decoder caps. The sender already limits itself to 20 peers, 16 e2e keys
+    // and 32 transit claims; mirror those bounds on receive so one malicious
+    // authenticated NodeInfo cannot make us open thousands of handshakes.
+    const MAX_PEERS: usize = 20;
+    const MAX_PEER_E2E: usize = 16;
+    pub const MAX_PEER_QUALITY: usize = 16;
+    const MAX_TRANSIT: usize = 32;
     const PART_ADDRS: u8 = 5;
     const PART_CLAIMS: u8 = 2;
     const PART_CLAIM_METRICS: u8 = 6;
-    const PART_END: u8 = 0;
-    const PART_NODEID: u8 = 4;
-    const PART_PEERS: u8 = 1;
-    const PART_PEER_TIMEOUT: u8 = 3;
-    const PART_UNDERLAY_MTU: u8 = 7;
-    const PART_GROUP: u8 = 8;
+    const PART_COMPRESSION: u8 = 12;
     const PART_E2E: u8 = 9;
+    const PART_END: u8 = 0;
+    const PART_GROUP: u8 = 8;
+    const PART_NODEID: u8 = 4;
+    const PART_NODE_SIGNATURE: u8 = 13;
+    const PART_PEERS: u8 = 1;
     const PART_PEER_E2E: u8 = 10;
+    /// Measured RTTs to this node's direct peers: 16-byte node id + u16 BE ms.
+    const PART_PEER_QUALITY: u8 = 15;
+    const PART_PEER_TIMEOUT: u8 = 3;
     const PART_TRANSIT: u8 = 11;
+    const PART_UNDERLAY_MTU: u8 = 7;
+    /// Bitmask of supported DATA payload formats (Ethernet / IP / preference).
+    const PART_WIRE_FORMAT: u8 = 14;
+
+    /// Canonical bytes signed by the node's optional signing key: node id and
+    /// e2e public key (the identity binding that relays rely on).
+    pub fn identity_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(NODE_ID_BYTES + 32);
+        out.extend_from_slice(&self.node_id);
+        if let Some(pk) = self.e2e_public {
+            out.extend_from_slice(&pk);
+        }
+        out
+    }
 
     fn read_addr_list<R: Read>(r: &mut Take<R>) -> Result<AddrList, io::Error> {
         let flags = r.read_u8()?;
@@ -106,6 +158,9 @@ impl NodeInfo {
     fn decode_peer_list_part<R: Read>(r: &mut Take<R>) -> Result<PeerList, io::Error> {
         let mut peers = smallvec![];
         while r.limit() > 0 {
+            if peers.len() >= Self::MAX_PEERS {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "too many peers in NodeInfo"));
+            }
             let flags = r.read_u8()?;
             let has_node_id = (flags & 0x80) != 0;
             let mut node_id = None;
@@ -123,6 +178,9 @@ impl NodeInfo {
     fn decode_claims_part<R: Read>(mut r: &mut Take<R>) -> Result<RangeList, Error> {
         let mut claims = smallvec![];
         while r.limit() > 0 {
+            if claims.len() >= Self::MAX_CLAIMS {
+                return Err(Error::Message("too many claims in NodeInfo"));
+            }
             claims.push(Range::read_from(&mut r)?);
         }
         Ok(claims)
@@ -139,6 +197,10 @@ impl NodeInfo {
         let mut e2e_public = None;
         let mut peer_e2e = Vec::new();
         let mut transit = Vec::new();
+        let mut compression = false;
+        let mut wire_caps = 0u8;
+        let mut peer_rtts = Vec::new();
+        let mut node_signature = None;
         loop {
             let part = r.read_u8().map_err(|_| Error::Message("Truncated message"))?;
             if part == Self::PART_END {
@@ -154,7 +216,7 @@ impl NodeInfo {
                 Self::PART_CLAIM_METRICS => {
                     let mut metrics = vec![0u8; part_len];
                     rp.read_exact(&mut metrics).map_err(|_| Error::Message("Truncated message"))?;
-                    for (c, m) in claims.iter_mut().zip(metrics.into_iter()) {
+                    for (c, m) in claims.iter_mut().zip(metrics) {
                         c.metric = m;
                     }
                 }
@@ -191,7 +253,10 @@ impl NodeInfo {
                 Self::PART_PEER_E2E => {
                     let mut data = vec![0; part_len];
                     rp.read_exact(&mut data).map_err(|_| Error::Message("Truncated message"))?;
-                    for chunk in data.chunks_exact(48) {
+                    if data.len() / 48 > Self::MAX_PEER_E2E {
+                        return Err(Error::Message("too many peer e2e keys in NodeInfo"));
+                    }
+                    for chunk in data.as_chunks::<48>().0 {
                         let mut id = [0u8; 16];
                         let mut pk = [0u8; 32];
                         id.copy_from_slice(&chunk[..16]);
@@ -201,6 +266,33 @@ impl NodeInfo {
                 }
                 Self::PART_TRANSIT => {
                     transit = Self::decode_transit(&mut rp)?;
+                }
+                Self::PART_COMPRESSION => {
+                    compression = rp.read_u8().map_err(|_| Error::Message("Truncated message"))? != 0;
+                }
+                Self::PART_WIRE_FORMAT => {
+                    wire_caps = rp.read_u8().map_err(|_| Error::Message("Truncated message"))? & 0x0f;
+                }
+                Self::PART_PEER_QUALITY => {
+                    let mut data = vec![0; part_len];
+                    rp.read_exact(&mut data).map_err(|_| Error::Message("Truncated message"))?;
+                    if data.len() / 18 > Self::MAX_PEER_QUALITY {
+                        return Err(Error::Message("too many peer quality entries in NodeInfo"));
+                    }
+                    for chunk in data.as_chunks::<18>().0 {
+                        let mut id = [0u8; NODE_ID_BYTES];
+                        id.copy_from_slice(&chunk[..NODE_ID_BYTES]);
+                        let rtt = u16::from_be_bytes([chunk[NODE_ID_BYTES], chunk[NODE_ID_BYTES + 1]]);
+                        peer_rtts.push((id, rtt));
+                    }
+                }
+                Self::PART_NODE_SIGNATURE => {
+                    if part_len != 64 {
+                        return Err(Error::Message("Invalid node signature length"));
+                    }
+                    let mut sig = [0u8; 64];
+                    rp.read_exact(&mut sig).map_err(|_| Error::Message("Truncated message"))?;
+                    node_signature = Some(sig);
                 }
                 _ => {
                     let mut data = vec![0; part_len];
@@ -223,13 +315,20 @@ impl NodeInfo {
             group,
             e2e_public,
             peer_e2e,
-            transit
+            transit,
+            compression,
+            wire_caps,
+            peer_rtts,
+            node_signature
         })
     }
 
     fn decode_transit<R: Read>(r: &mut Take<R>) -> Result<Vec<TransitClaim>, Error> {
         let mut out = Vec::new();
         while r.limit() > 0 {
+            if out.len() >= Self::MAX_TRANSIT {
+                return Err(Error::Message("too many transit claims in NodeInfo"));
+            }
             let mut node_id = [0u8; NODE_ID_BYTES];
             r.read_exact(&mut node_id).map_err(|_| Error::Message("Truncated message"))?;
             let family = r.read_u8().map_err(|_| Error::Message("Truncated message"))?;
@@ -428,6 +527,26 @@ impl NodeInfo {
                     Ok(())
                 })?;
             }
+            if self.compression {
+                Self::encode_part(&mut cursor, Self::PART_COMPRESSION, |cursor| cursor.write_u8(1))?;
+            }
+            if self.wire_caps != 0 {
+                Self::encode_part(&mut cursor, Self::PART_WIRE_FORMAT, |cursor| {
+                    cursor.write_u8(self.wire_caps & 0x0f)
+                })?;
+            }
+            if !self.peer_rtts.is_empty() {
+                Self::encode_part(&mut cursor, Self::PART_PEER_QUALITY, |cursor| {
+                    for (id, rtt) in self.peer_rtts.iter().take(Self::MAX_PEER_QUALITY) {
+                        cursor.write_all(id)?;
+                        cursor.write_u16::<NetworkEndian>(*rtt)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            if let Some(sig) = self.node_signature {
+                Self::encode_part(&mut cursor, Self::PART_NODE_SIGNATURE, |cursor| cursor.write_all(&sig))?;
+            }
             cursor.write_u8(Self::PART_END)?;
             len = cursor.position() as usize;
         }
@@ -465,7 +584,11 @@ mod tests {
             group: None,
             e2e_public: None,
             peer_e2e: Vec::new(),
-            transit: Vec::new()
+            transit: Vec::new(),
+            compression: false,
+            wire_caps: 0,
+            peer_rtts: Vec::new(),
+            node_signature: None
         }
     }
 
@@ -476,13 +599,21 @@ mod tests {
         info.transit.push(TransitClaim {
             node_id: [9; NODE_ID_BYTES],
             addr: "192.0.2.8:3210".parse::<SocketAddr>().unwrap(),
-            claim: Range { base: crate::types::Address::from_ipv4("10.9.0.0".parse().unwrap()), prefix_len: 16, metric: 40 },
+            claim: Range {
+                base: crate::types::Address::from_ipv4("10.9.0.0".parse().unwrap()),
+                prefix_len: 16,
+                metric: 40
+            },
             group: Some("eng".to_string())
         });
         info.transit.push(TransitClaim {
             node_id: [8; NODE_ID_BYTES],
             addr: "[2001:db8::8]:3211".parse::<SocketAddr>().unwrap(),
-            claim: Range { base: crate::types::Address::from_ipv4("10.8.0.0".parse().unwrap()), prefix_len: 16, metric: 10 },
+            claim: Range {
+                base: crate::types::Address::from_ipv4("10.8.0.0".parse().unwrap()),
+                prefix_len: 16,
+                metric: 10
+            },
             group: None
         });
         let mut buf = MsgBuffer::new(0);
@@ -497,6 +628,117 @@ mod tests {
         sample(None).encode(&mut buf);
         let decoded = NodeInfo::decode(buf.message()).expect("decode");
         assert!(decoded.transit.is_empty());
+    }
+
+    #[test]
+    fn peer_list_decode_is_capped() {
+        // Each peer with flags=0 is a single byte on the wire.
+        let mut data = vec![0u8; NodeInfo::MAX_PEERS + 1];
+        let mut take = (&data[..]).take(data.len() as u64);
+        assert!(NodeInfo::decode_peer_list_part(&mut take).is_err());
+        data.truncate(NodeInfo::MAX_PEERS);
+        let mut take = (&data[..]).take(data.len() as u64);
+        assert_eq!(NodeInfo::decode_peer_list_part(&mut take).unwrap().len(), NodeInfo::MAX_PEERS);
+    }
+
+    #[test]
+    fn node_signature_roundtrips_and_detects_tampering() {
+        use crate::crypto::{Crypto, Ed25519KeyPair};
+        let (_privk, pubk) = Crypto::generate_keypair(None);
+        let mut info = sample(None);
+        info.e2e_public = Some([42u8; 32]);
+        let seed = crate::util::from_base62_fixed::<32>(&_privk).unwrap();
+        let pair = Ed25519KeyPair::from_seed(&seed).unwrap();
+        info.node_signature = Some(pair.sign(&info.identity_bytes()));
+
+        let mut buf = MsgBuffer::new(0);
+        info.encode(&mut buf);
+        let decoded = NodeInfo::decode(buf.message()).expect("decode");
+        assert_eq!(decoded.node_signature, info.node_signature);
+        let pk_bytes: [u8; 32] = crate::util::from_base62_fixed::<32>(&pubk).unwrap();
+        assert!(Ed25519KeyPair::verify(&pk_bytes, &decoded.identity_bytes(), decoded.node_signature.as_ref().unwrap())
+            .is_ok());
+        // Tampering with the e2e key breaks the signature.
+        let mut tampered = decoded.clone();
+        tampered.e2e_public = Some([43u8; 32]);
+        assert!(Ed25519KeyPair::verify(
+            &pk_bytes,
+            &tampered.identity_bytes(),
+            tampered.node_signature.as_ref().unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn message_type_ids_are_distinct() {
+        let types = [
+            MESSAGE_TYPE_DATA,
+            MESSAGE_TYPE_NODE_INFO,
+            MESSAGE_TYPE_KEEPALIVE,
+            MESSAGE_TYPE_RELAY,
+            MESSAGE_TYPE_DATA_GSO,
+            MESSAGE_TYPE_DATA_COMPRESSED,
+            MESSAGE_TYPE_DATA_GSO_COMPRESSED,
+            MESSAGE_TYPE_FLOOD,
+            MESSAGE_TYPE_RELAY_TTL,
+            MESSAGE_TYPE_FLOOD_TTL,
+            MESSAGE_TYPE_CLOSE
+        ];
+        let mut unique = types.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), types.len(), "message type constants must not collide");
+        // Data-range types must stay outside the relay whitelist.
+        assert!(types.iter().filter(|t| **t <= MESSAGE_TYPE_FLOOD_TTL).count() == 10);
+    }
+
+    #[test]
+    fn compression_capability_roundtrips() {
+        let mut buf = MsgBuffer::new(0);
+        sample(None).encode(&mut buf);
+        let decoded = NodeInfo::decode(buf.message()).expect("decode");
+        assert!(!decoded.compression);
+        buf.clear();
+        let mut info = sample(None);
+        info.compression = true;
+        info.encode(&mut buf);
+        let decoded = NodeInfo::decode(buf.message()).expect("decode");
+        assert!(decoded.compression);
+    }
+
+    #[test]
+    fn wire_format_capability_roundtrips_and_old_messages_omit_it() {
+        let mut buf = MsgBuffer::new(0);
+        sample(None).encode(&mut buf);
+        let decoded = NodeInfo::decode(buf.message()).expect("decode");
+        assert_eq!(decoded.wire_caps, 0, "legacy peers omit the part");
+        buf.clear();
+        let mut info = sample(None);
+        info.wire_caps = crate::wire::WireCaps::for_bridge().bits();
+        info.encode(&mut buf);
+        let decoded = NodeInfo::decode(buf.message()).expect("decode");
+        assert_eq!(decoded.wire_caps, info.wire_caps);
+        // An unknown part from a future version must be skipped, not fail decode.
+        buf.clear();
+        let mut info = sample(None);
+        info.wire_caps = 0x07;
+        info.encode(&mut buf);
+        let decoded = NodeInfo::decode(buf.message()).expect("decode");
+        assert_eq!(decoded.wire_caps, 0x07);
+    }
+
+    #[test]
+    fn peer_quality_roundtrips_and_old_messages_omit_it() {
+        let mut buf = MsgBuffer::new(0);
+        sample(None).encode(&mut buf);
+        let decoded = NodeInfo::decode(buf.message()).expect("decode");
+        assert!(decoded.peer_rtts.is_empty(), "legacy peers omit the part");
+        buf.clear();
+        let mut info = sample(None);
+        info.peer_rtts = vec![([3u8; NODE_ID_BYTES], 12), ([4u8; NODE_ID_BYTES], 34)];
+        info.encode(&mut buf);
+        let decoded = NodeInfo::decode(buf.message()).expect("decode");
+        assert_eq!(decoded.peer_rtts, info.peer_rtts);
     }
 
     #[test]

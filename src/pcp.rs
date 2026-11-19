@@ -15,7 +15,9 @@ pub const MAP_OPCODE: u8 = 1;
 pub const REQUEST_LEN: usize = 60;
 pub const RESPONSE_LEN: usize = 60;
 
-pub fn encode_map_request(nonce: &[u8; 12], protocol: u8, internal_port: u16, suggested_port: u16, lifetime: u32, client_ip: Ipv4Addr) -> [u8; REQUEST_LEN] {
+pub fn encode_map_request(
+    nonce: &[u8; 12], protocol: u8, internal_port: u16, suggested_port: u16, lifetime: u32, client_ip: Ipv4Addr
+) -> [u8; REQUEST_LEN] {
     let mut buf = [0u8; REQUEST_LEN];
     buf[0] = PCP_VERSION;
     buf[1] = MAP_OPCODE;
@@ -88,13 +90,15 @@ pub fn obtain_mapping(internal_port: u16, lifetime: u32) -> io::Result<Mapping> 
     let mut buf = [0u8; 128];
     let (n, src) = server.recv_from(&mut buf)?;
     let assigned = internal_port.wrapping_add(1000);
-    let reply = respond_map(&buf[..n], assigned, Ipv4Addr::new(203, 0, 113, 8)).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a pcp map"))?;
+    let reply = respond_map(&buf[..n], assigned, Ipv4Addr::new(203, 0, 113, 8))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a pcp map"))?;
     server.send_to(&reply, src)?;
     let (n, _) = client.recv_from(&mut buf)?;
     if crate::natpmp::parse_udp_mapping(&buf[..n]).is_some() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "pcp parsed as nat-pmp"));
     }
-    let (port, ip, life, got_nonce) = parse_map_response(&buf[..n]).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pcp response"))?;
+    let (port, ip, life, got_nonce) =
+        parse_map_response(&buf[..n]).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pcp response"))?;
     if got_nonce != nonce {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "nonce"));
     }

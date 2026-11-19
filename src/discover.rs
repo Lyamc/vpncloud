@@ -50,7 +50,13 @@ fn pin_loopback(sock: &UdpSocket) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
     let addr = u32::from(Ipv4Addr::LOCALHOST).to_be();
     let rc = unsafe {
-        libc::setsockopt(sock.as_raw_fd(), libc::IPPROTO_IP, libc::IP_MULTICAST_IF, &addr as *const u32 as *const libc::c_void, 4)
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_MULTICAST_IF,
+            &addr as *const u32 as *const libc::c_void,
+            4
+        )
     };
     if rc != 0 {
         Err(io::Error::last_os_error())
@@ -76,7 +82,8 @@ pub fn learn_unconfigured(preconfigured: &[SocketAddr]) -> io::Result<SocketAddr
     }
     let body = announce(learned);
 
-    let joined = listener.join_multicast_v4(&GROUP, &Ipv4Addr::LOCALHOST).is_ok() || listener.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED).is_ok();
+    let joined = listener.join_multicast_v4(&GROUP, &Ipv4Addr::LOCALHOST).is_ok()
+        || listener.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED).is_ok();
     if joined {
         let _ = pin_loopback(&announcer);
         let _ = announcer.set_multicast_loop_v4(true);
@@ -102,7 +109,7 @@ pub fn learn_unconfigured(preconfigured: &[SocketAddr]) -> io::Result<SocketAddr
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[allow(unused_imports)] use super::*;
 
     #[cfg(target_os = "linux")]
     #[test]

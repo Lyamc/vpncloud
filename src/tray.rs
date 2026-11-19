@@ -5,8 +5,7 @@
 //! Windows system tray: Enable / Disable / Open config / Exit.
 
 use std::{
-    env,
-    mem,
+    env, mem,
     process::Command,
     ptr,
     sync::Mutex,
@@ -17,17 +16,13 @@ use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
-        Shell::{
-            Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-            NOTIFYICONDATAW
-        },
+        Shell::{Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW},
         WindowsAndMessaging::{
-            AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-            DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW,
-            PostQuitMessage, RegisterClassW, SetForegroundWindow, TrackPopupMenu,
-            TranslateMessage, CS_HREDRAW, CS_VREDRAW, IDI_APPLICATION, MF_GRAYED, MF_SEPARATOR,
-            MF_STRING, MSG, TPM_RIGHTBUTTON, TPM_RETURNCMD, WM_DESTROY, WM_LBUTTONDBLCLK,
-            WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_OVERLAPPEDWINDOW
+            AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+            DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, MessageBoxW, PostQuitMessage, RegisterClassW,
+            SetForegroundWindow, TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, IDI_APPLICATION,
+            MB_ICONWARNING, MB_OK, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DESTROY,
+            WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_OVERLAPPEDWINDOW
         }
     }
 };
@@ -39,9 +34,13 @@ const ID_ENABLE: usize = 1;
 const ID_DISABLE: usize = 2;
 const ID_OPEN_CONFIG: usize = 3;
 const ID_EXIT: usize = 4;
+const ID_RELOAD: usize = 5;
+const ID_SETTINGS: usize = 6;
+const ID_VIEW_LOG: usize = 7;
 const TRAY_ID: u32 = 1;
 
 struct TrayRuntime {
+    #[allow(dead_code)] // kept with the runtime for symmetry with the worker
     config: Config,
     worker: Option<JoinHandle<()>>
 }
@@ -117,6 +116,12 @@ fn show_menu(hwnd: HWND) {
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         let open = wide("Open config folder");
         AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, open.as_ptr());
+        let reload = wide("Reload config");
+        AppendMenuW(menu, MF_STRING, ID_RELOAD, reload.as_ptr());
+        let view = wide("View log");
+        AppendMenuW(menu, MF_STRING, ID_VIEW_LOG, view.as_ptr());
+        let settings = wide("Settings...");
+        AppendMenuW(menu, MF_STRING, ID_SETTINGS, settings.as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         let exit = wide("Exit");
         AppendMenuW(menu, MF_STRING, ID_EXIT, exit.as_ptr());
@@ -138,6 +143,12 @@ fn show_menu(hwnd: HWND) {
                 info!("Tray: VPN disabled");
             }
             ID_OPEN_CONFIG => open_config_folder(),
+            ID_RELOAD => {
+                CtrlC::request_reload();
+                info!("Tray: config reload requested");
+            }
+            ID_VIEW_LOG => open_log_file(),
+            ID_SETTINGS => open_settings(),
             ID_EXIT => {
                 CtrlC::request_stop();
                 DestroyWindow(hwnd);
@@ -153,6 +164,36 @@ fn open_config_folder() {
         .filter(|p| p.exists())
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| ".".into()));
     let _ = Command::new("explorer").arg(dir).spawn();
+}
+
+fn open_log_file() {
+    let path = env::var_os("LOCALAPPDATA")
+        .map(|p| std::path::PathBuf::from(p).join("VpnCloud").join("vpncloud.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("vpncloud.log"));
+    if path.exists() {
+        let _ = Command::new("notepad").arg(path).spawn();
+    } else {
+        show_message("No log file yet. Start VpnCloud with --log-file to enable logging.");
+    }
+}
+
+fn open_settings() {
+    let exe = env::current_exe().ok();
+    let gui = exe.as_ref().and_then(|p| p.parent()).map(|dir| dir.join("vpncloud-gui.exe"));
+    match gui.filter(|p| p.exists()) {
+        Some(path) => {
+            let _ = Command::new(path).spawn();
+        }
+        None => show_message("The settings app (vpncloud-gui.exe) was not found next to vpncloud.exe.")
+    }
+}
+
+fn show_message(text: &str) {
+    let title = wide("VpnCloud");
+    let body = wide(text);
+    unsafe {
+        MessageBoxW(ptr::null_mut(), body.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+    }
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -180,6 +221,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 /// Block on the tray message loop. The VPN worker runs on a background thread.
 pub fn run(config: Config) {
     info!("Starting Windows system tray (Enable / Disable / Exit)");
+    // The tray can be launched from a shortcut with no console, so offer the
+    // driver download through a native dialog instead of a console prompt.
+    match crate::win_driver::ensure(config.device_type, crate::win_driver::Ui::MessageBox) {
+        Ok(true) | Ok(false) => {}
+        Err(e) => error!("Driver setup failed: {}", e)
+    }
     let worker = spawn_worker(config.clone());
     *RUNTIME.lock().expect("tray runtime") = Some(TrayRuntime { config, worker: Some(worker) });
 

@@ -7,20 +7,22 @@ use iai::{black_box, main};
 use smallvec::smallvec;
 use vpncloud::crypto::AeadAlgo;
 
-use std::str::FromStr;
-use std::net::{SocketAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::{
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
+    str::FromStr
+};
 
 include!(".code.rs");
 
-pub use error::Error;
-use util::{MockTimeSource, MsgBuffer};
 use config::Config;
-use types::{Address, Range};
-use device::Type;
-use table::ClaimTable;
-use payload::{Packet, Frame, Protocol};
 use crypto::core::{create_dummy_pair, EXTRA_LEN};
-use tests::common::{TunSimulator, TapSimulator};
+use device::Type;
+pub use error::Error;
+use payload::{Frame, Packet, Protocol};
+use table::ClaimTable;
+use tests::common::{TapSimulator, TunSimulator};
+use types::{Address, Range};
+use util::{MockTimeSource, MsgBuffer};
 
 fn udp_send() {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -147,9 +149,16 @@ fn full_communication_tap_switch() {
 }
 
 iai::main!(
-    udp_send, 
-    decode_ipv4, decode_ipv6, decode_ethernet, decode_ethernet_with_vlan, 
-    lookup_cold, lookup_warm, 
-    crypto_chacha20, crypto_aes128, crypto_aes256,
-    full_communication_tun_router, full_communication_tap_switch
+    udp_send,
+    decode_ipv4,
+    decode_ipv6,
+    decode_ethernet,
+    decode_ethernet_with_vlan,
+    lookup_cold,
+    lookup_warm,
+    crypto_chacha20,
+    crypto_aes128,
+    crypto_aes256,
+    full_communication_tun_router,
+    full_communication_tap_switch
 );
